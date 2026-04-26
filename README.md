@@ -55,6 +55,16 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
+## Test corpus
+
+`tests/data/audio/` is scanned at test time. Drop any number of files
+(`.wav`, `.flac`, `.mp3`, `.ogg`, `.m4a`, `.aac`, `.opus`, `.aiff`)
+into it and the corpus test will open and fully decode each one.
+The directory is `.gitignore`d for audio extensions so files stay
+local; use `git add -f` if you ever want to commit a small fixture.
+If the directory is empty, the corpus test prints a warning and passes
+(a synthetic sine-wave test still exercises the decoder unconditionally).
+
 ## Layout
 
 ```

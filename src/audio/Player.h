@@ -18,10 +18,15 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <thread>
 
-// Forward-declare PortAudio stream so the header doesn't pull <portaudio.h>.
+// Forward-declare PortAudio types so the header doesn't pull <portaudio.h>.
+// IMPORTANT: declared at *global* scope. If we put `struct PaStreamCallbackTimeInfo;`
+// inside namespace fiddler::audio, C++ treats it as a fresh declaration in
+// that namespace and Pa_OpenStream rejects our callback as a different type.
 typedef void PaStream;
+struct PaStreamCallbackTimeInfo;
 
 namespace fiddler::audio {
 
@@ -50,7 +55,7 @@ public:
 private:
     static int paCallback(const void* input, void* output,
                           unsigned long frameCount,
-                          const struct PaStreamCallbackTimeInfo* timeInfo,
+                          const PaStreamCallbackTimeInfo* timeInfo,
                           unsigned long statusFlags,
                           void* userData);
 
@@ -59,6 +64,12 @@ private:
     Decoder                    decoder_;
     std::unique_ptr<RingBuffer> ring_;
     PaStream*                  stream_ = nullptr;
+
+    // Protects decoder_ and ring_ against concurrent access by the
+    // decoder thread and the GUI thread (during seek). The PortAudio
+    // callback NEVER takes this mutex — it stays lock-free via the
+    // ring buffer's atomic read/write positions.
+    mutable std::mutex         mutex_;
 
     std::thread                decoderThread_;
     std::atomic<bool>          decoderRunning_{false};

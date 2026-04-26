@@ -10,6 +10,7 @@ class QAction;
 class QPushButton;
 class QSlider;
 class QLabel;
+class QTimer;
 
 namespace fiddler::audio { class Player; }
 
@@ -26,6 +27,7 @@ private slots:
     void onPlayPause();
     void onStop();
     void onSeek(int positionMs);
+    void updatePosition();
 
 private:
     void buildMenus();
@@ -35,11 +37,12 @@ private:
     // from PortAudio/FFmpeg includes.
     std::unique_ptr<audio::Player> player_;
 
-    QAction*     openAction_   = nullptr;
-    QPushButton* playButton_   = nullptr;
-    QPushButton* stopButton_   = nullptr;
+    QAction*     openAction_     = nullptr;
+    QPushButton* playButton_     = nullptr;
+    QPushButton* stopButton_     = nullptr;
     QSlider*     positionSlider_ = nullptr;
-    QLabel*      statusLabel_  = nullptr;
+    QLabel*      statusLabel_    = nullptr;
+    QTimer*      positionTimer_  = nullptr;
 };
 
 } // namespace fiddler::ui

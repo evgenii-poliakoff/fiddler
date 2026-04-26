@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <vector>
 
 // FFmpeg forward declarations — at global namespace scope so they refer
 // to the real ::AVFormatContext etc., not a fresh declaration inside
@@ -20,6 +21,8 @@
 // them confined to Decoder.cpp.
 struct AVFormatContext;
 struct AVCodecContext;
+struct AVPacket;
+struct AVFrame;
 struct SwrContext;
 
 namespace fiddler::audio {
@@ -65,7 +68,15 @@ private:
     AVFormatContext* formatCtx_  = nullptr;
     AVCodecContext*  codecCtx_   = nullptr;
     SwrContext*      swr_        = nullptr;
+    AVPacket*        pkt_        = nullptr;     // reused across read() calls
+    AVFrame*         frame_      = nullptr;     // reused across read() calls
     int              streamIndex_ = -1;
+
+    // swr_convert produces a variable amount of output per call; anything
+    // that didn't fit the caller's span is parked here for the next read().
+    std::vector<float> resampleBuf_;
+    std::size_t        resampleBufPos_ = 0;
+    bool               eofReached_     = false;
 
     AudioFormat outFormat_{};
     std::string lastError_;

@@ -7,9 +7,12 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QStatusBar>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -76,21 +79,73 @@ void MainWindow::onOpenFile() {
         tr("Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus);;All files (*)"));
     if (path.isEmpty()) return;
 
-    // TODO step 1: hand path to player_->load(path); enable transport on success.
-    statusLabel_->setText(tr("Selected: %1 (loading not implemented yet)").arg(path));
+    if (!player_->load(path.toStdString())) {
+        QMessageBox::warning(this, tr("Open failed"),
+            tr("Could not open: %1").arg(path));
+        statusLabel_->setText(tr("No file loaded."));
+        return;
+    }
+
+    const auto duration = player_->duration();
+    {
+        QSignalBlocker block(positionSlider_);
+        positionSlider_->setRange(0, static_cast<int>(duration.count()));
+        positionSlider_->setValue(0);
+    }
+    positionSlider_->setEnabled(true);
+    playButton_->setEnabled(true);
+    stopButton_->setEnabled(true);
+    playButton_->setText(tr("Play"));
+    statusLabel_->setText(tr("Loaded: %1  (%2 ms)")
+        .arg(path).arg(duration.count()));
+
+    if (!positionTimer_) {
+        positionTimer_ = new QTimer(this);
+        positionTimer_->setInterval(50);
+        connect(positionTimer_, &QTimer::timeout,
+                this, &MainWindow::updatePosition);
+    }
+    positionTimer_->start();
 }
 
 void MainWindow::onPlayPause() {
-    // TODO step 1: toggle player_ transport state.
+    if (!player_) return;
+    if (player_->state() == audio::TransportState::Playing) {
+        player_->pause();
+        playButton_->setText(tr("Play"));
+    } else {
+        player_->play();
+        playButton_->setText(tr("Pause"));
+    }
 }
 
 void MainWindow::onStop() {
-    // TODO step 1: stop player_ and reset slider.
+    if (!player_) return;
+    player_->stop();
+    playButton_->setText(tr("Play"));
+    QSignalBlocker block(positionSlider_);
+    positionSlider_->setValue(0);
 }
 
 void MainWindow::onSeek(int positionMs) {
-    // TODO step 1: player_->seek(std::chrono::milliseconds{positionMs});
-    Q_UNUSED(positionMs);
+    if (!player_) return;
+    player_->seek(std::chrono::milliseconds{positionMs});
+}
+
+void MainWindow::updatePosition() {
+    if (!player_) return;
+    const auto pos = player_->position();
+    {
+        QSignalBlocker block(positionSlider_);
+        positionSlider_->setValue(static_cast<int>(pos.count()));
+    }
+    // Auto-pause when we reach the end.
+    if (player_->state() == audio::TransportState::Playing
+        && player_->duration().count() > 0
+        && pos >= player_->duration()) {
+        player_->pause();
+        playButton_->setText(tr("Play"));
+    }
 }
 
 } // namespace fiddler::ui
