@@ -80,6 +80,21 @@ fiddler/
 └── tests/                      # Catch2 unit tests
 ```
 
+## Logging
+
+Default threshold is **WARN** (silent unless something's wrong). For
+debugging during development:
+
+```bash
+./build/src/fiddler --log-level=debug
+./build/src/fiddler --log-level=trace --log-filter='player.*'
+./build/src/fiddler --log-level=info --log-file=/tmp/fiddler.log
+FIDDLER_LOG_LEVEL=trace ./build/src/fiddler
+```
+
+See [`docs/architecture.md`](docs/architecture.md#logging) for levels,
+categories, and the realtime-callback rule.
+
 ## License
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).

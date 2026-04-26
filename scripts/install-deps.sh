@@ -18,6 +18,7 @@ sudo apt-get install -y \
     libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
     portaudio19-dev \
     librubberband-dev \
+    libspdlog-dev \
     catch2
 
 echo "Dependencies installed."

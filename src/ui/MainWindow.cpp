@@ -1,6 +1,7 @@
 #include "ui/MainWindow.h"
 
 #include "audio/Player.h"
+#include "util/Log.h"
 
 #include <QAction>
 #include <QFileDialog>
@@ -77,8 +78,12 @@ void MainWindow::onOpenFile() {
         tr("Open audio file"),
         {},
         tr("Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus);;All files (*)"));
-    if (path.isEmpty()) return;
+    if (path.isEmpty()) {
+        FLOG_DEBUG("ui", "open dialog cancelled");
+        return;
+    }
 
+    FLOG_DEBUG("ui", "user selected {}", path.toStdString());
     if (!player_->load(path.toStdString())) {
         QMessageBox::warning(this, tr("Open failed"),
             tr("Could not open: %1").arg(path));

@@ -1,5 +1,7 @@
 #include "audio/Player.h"
 
+#include "util/Log.h"
+
 #include <portaudio.h>
 
 #include <chrono>
@@ -36,6 +38,7 @@ bool Player::load(const std::filesystem::path& path) {
     PaStreamParameters outParams{};
     outParams.device = Pa_GetDefaultOutputDevice();
     if (outParams.device == paNoDevice) {
+        FLOG_ERROR("player", "Pa_GetDefaultOutputDevice returned paNoDevice");
         decoder_.close();
         ring_.reset();
         return false;
@@ -52,6 +55,7 @@ bool Player::load(const std::filesystem::path& path) {
         paFramesPerBufferUnspecified,
         paNoFlag, &Player::paCallback, this);
     if (err != paNoError) {
+        FLOG_ERROR("player", "Pa_OpenStream failed: {}", Pa_GetErrorText(err));
         decoder_.close();
         ring_.reset();
         return false;
@@ -62,6 +66,11 @@ bool Player::load(const std::filesystem::path& path) {
 
     decoderRunning_.store(true, std::memory_order_release);
     decoderThread_ = std::thread([this] { decoderThread(); });
+
+    FLOG_INFO("player", "loaded; ring={} samples ({} s at {} Hz x{})",
+              ringSize,
+              static_cast<double>(ringSize) / fmt.channels / fmt.sampleRate,
+              fmt.sampleRate, fmt.channels);
     return true;
 }
 
@@ -91,6 +100,9 @@ void Player::play() {
 
     if (Pa_StartStream(stream_) == paNoError) {
         state_.store(TransportState::Playing);
+        FLOG_DEBUG("player", "play (resume from {} ms)", position().count());
+    } else {
+        FLOG_ERROR("player", "Pa_StartStream failed");
     }
 }
 
@@ -98,6 +110,7 @@ void Player::pause() {
     if (state_.load() != TransportState::Playing) return;
     if (stream_ && Pa_IsStreamActive(stream_) == 1) Pa_StopStream(stream_);
     state_.store(TransportState::Paused);
+    FLOG_DEBUG("player", "pause at {} ms", position().count());
 }
 
 void Player::stop() {
@@ -109,10 +122,13 @@ void Player::stop() {
         framesPlayed_.store(0);
     }
     state_.store(TransportState::Stopped);
+    FLOG_DEBUG("player", "stop");
 }
 
 void Player::seek(std::chrono::milliseconds position) {
     if (!decoder_.isOpen()) return;
+
+    FLOG_DEBUG("player", "seek to {} ms", position.count());
 
     const bool wasPlaying = (state_.load() == TransportState::Playing);
     if (wasPlaying && stream_ && Pa_IsStreamActive(stream_) == 1) {
@@ -154,6 +170,9 @@ int Player::paCallback(const void* /*input*/, void* output,
                        const PaStreamCallbackTimeInfo* /*timeInfo*/,
                        unsigned long /*statusFlags*/,
                        void* userData) {
+    // REALTIME — DO NOT LOG, ALLOCATE, OR LOCK FROM THIS FUNCTION.
+    // The decoder thread or the GUI timer should surface diagnostics;
+    // this thread only touches atomics and the ring buffer.
     auto* self = static_cast<Player*>(userData);
     auto* out  = static_cast<float*>(output);
 
@@ -190,8 +209,12 @@ void Player::decoderThread() {
                     ring_->write({chunk.data(),
                                   static_cast<std::size_t>(got)});
                     didWork = true;
+                    FLOG_TRACE("player.thread",
+                               "fed {} samples; ring r/w = {}/{}",
+                               got, ring_->readAvailable(),
+                               ring_->writeAvailable());
                 }
-                // got == 0 → clean EOF; got < 0 → error. Either way, stop
+                // got == 0 → clean EOF, got < 0 → error. Either way, stop
                 // pushing until something changes (seek / unload).
             }
         }

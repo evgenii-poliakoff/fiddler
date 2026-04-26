@@ -76,3 +76,62 @@ Rules:
   thread.
 - Transport state lives in `std::atomic` so the GUI can read it from
   a timer for the position slider without locking.
+
+## Logging
+
+The logging facade lives in `src/util/Log.{h,cpp}` and wraps spdlog so
+the rest of the code never includes spdlog headers directly. All log
+calls go through five macros — `FLOG_TRACE`, `FLOG_DEBUG`, `FLOG_INFO`,
+`FLOG_WARN`, `FLOG_ERROR` — that take a category string and an
+fmt-style format:
+
+```cpp
+FLOG_INFO("decoder", "opened {}, {} ms, {} Hz",
+          path, duration.count(), sampleRate);
+```
+
+### Levels
+
+| Level | Use for |
+| --- | --- |
+| TRACE | Per-iteration firehose (decoder thread refills, ring stats). Off by default. |
+| DEBUG | Algorithmic milestones useful during development (seek targets, codec params). |
+| INFO  | Lifecycle events (file loaded, app starting/stopping). |
+| WARN  | Recoverable problems (missing Xing header, fallback paths). |
+| ERROR | Operations that failed. |
+
+Default threshold is **WARN** — silent unless something's wrong. Override
+at runtime with `--log-level=debug` or `FIDDLER_LOG_LEVEL=trace`.
+
+### Categories
+
+Hierarchical with `.` separators: `decoder`, `player`, `player.thread`,
+`player.callback`, `ui`, `app`. Filter at runtime:
+
+```bash
+fiddler --log-level=trace --log-filter='player.*'
+```
+
+The filter glob currently supports a bare `*` (everything) and a
+trailing `.*` (subtree match). It's intentionally simpler than a regex.
+
+### Hard rule: no logging from the PortAudio callback
+
+The callback runs on a realtime thread; spdlog takes a mutex. **Never**
+add `FLOG_*` calls to `Player::paCallback`. If you need per-callback
+diagnostics, stash counters in `std::atomic` and let the decoder thread
+or the GUI timer log them periodically.
+
+### Sinks
+
+Always: stderr, with colour. Optional: a rotating file at the path
+given by `--log-file` (5 MiB per file, 3 backups kept).
+
+### CLI summary
+
+```
+--log-level=LEVEL    trace|debug|info|warn|error|off
+--log-filter=GLOB    e.g. 'player.*' or 'decoder' (default '*')
+--log-file=PATH      also write to PATH, rotated
+FIDDLER_LOG_LEVEL    env var, overridden by --log-level
+```

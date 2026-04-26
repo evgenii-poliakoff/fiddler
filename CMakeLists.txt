@@ -31,6 +31,12 @@ pkg_check_modules(FFMPEG  REQUIRED IMPORTED_TARGET
     libavformat libavcodec libavutil libswresample)
 pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
 
+# spdlog: Ubuntu's libspdlog-dev ships only a pkg-config file, no
+# spdlogConfig.cmake. Pull it in via pkg-config — same pattern as
+# FFmpeg and PortAudio above. The IMPORTED_TARGET creates
+# PkgConfig::SPDLOG with the correct includes and link flags.
+pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
+
 # Rubber Band is wired in step 2; uncomment then.
 # find_package(RubberBand REQUIRED)
 

@@ -1,5 +1,7 @@
 #include "audio/Decoder.h"
 
+#include "util/Log.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -31,15 +33,19 @@ Decoder::~Decoder() { close(); }
 bool Decoder::open(const std::filesystem::path& path) {
     close(); // idempotent — supports re-opening on the same instance
 
+    FLOG_DEBUG("decoder", "opening {}", path.string());
+
     int ret = avformat_open_input(&formatCtx_, path.c_str(), nullptr, nullptr);
     if (ret < 0) {
         lastError_ = "avformat_open_input failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         return false;
     }
 
     ret = avformat_find_stream_info(formatCtx_, nullptr);
     if (ret < 0) {
         lastError_ = "avformat_find_stream_info failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -49,6 +55,7 @@ bool Decoder::open(const std::filesystem::path& path) {
                                        -1, -1, &codec, 0);
     if (streamIndex_ < 0 || !codec) {
         lastError_ = "no audio stream in file";
+        FLOG_ERROR("decoder", "{}: {}", path.string(), lastError_);
         close();
         return false;
     }
@@ -56,6 +63,7 @@ bool Decoder::open(const std::filesystem::path& path) {
     codecCtx_ = avcodec_alloc_context3(codec);
     if (!codecCtx_) {
         lastError_ = "avcodec_alloc_context3 failed";
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -64,6 +72,7 @@ bool Decoder::open(const std::filesystem::path& path) {
     ret = avcodec_parameters_to_context(codecCtx_, stream->codecpar);
     if (ret < 0) {
         lastError_ = "avcodec_parameters_to_context failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -71,9 +80,16 @@ bool Decoder::open(const std::filesystem::path& path) {
     ret = avcodec_open2(codecCtx_, codec, nullptr);
     if (ret < 0) {
         lastError_ = "avcodec_open2 failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
+
+    FLOG_DEBUG("decoder",
+               "source: codec={}, {} Hz, {} ch, sample_fmt={}",
+               codec->name, codecCtx_->sample_rate,
+               codecCtx_->ch_layout.nb_channels,
+               static_cast<int>(codecCtx_->sample_fmt));
 
     // Resampler: anything → interleaved float32 stereo at outFormat_.sampleRate.
     AVChannelLayout outLayout;
@@ -87,6 +103,7 @@ bool Decoder::open(const std::filesystem::path& path) {
 
     if (ret < 0 || !swr_) {
         lastError_ = "swr_alloc_set_opts2 failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -94,6 +111,7 @@ bool Decoder::open(const std::filesystem::path& path) {
     ret = swr_init(swr_);
     if (ret < 0) {
         lastError_ = "swr_init failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -102,6 +120,7 @@ bool Decoder::open(const std::filesystem::path& path) {
     frame_ = av_frame_alloc();
     if (!pkt_ || !frame_) {
         lastError_ = "av_packet/frame_alloc failed";
+        FLOG_ERROR("decoder", "{}", lastError_);
         close();
         return false;
     }
@@ -110,6 +129,10 @@ bool Decoder::open(const std::filesystem::path& path) {
     resampleBuf_.clear();
     resampleBufPos_ = 0;
     lastError_.clear();
+
+    FLOG_INFO("decoder", "opened {}, {} ms, output {} Hz {} ch",
+              path.string(), duration().count(),
+              outFormat_.sampleRate, outFormat_.channels);
     return true;
 }
 
@@ -255,9 +278,12 @@ bool Decoder::seek(std::chrono::milliseconds position) {
     const int64_t targetUs = position.count() * 1000;
     const int64_t ts = av_rescale_q(targetUs, AV_TIME_BASE_Q, stream->time_base);
 
+    FLOG_DEBUG("decoder", "seek to {} ms (ts={})", position.count(), ts);
+
     int ret = av_seek_frame(formatCtx_, streamIndex_, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         lastError_ = "av_seek_frame failed: " + avErr(ret);
+        FLOG_ERROR("decoder", "{}", lastError_);
         return false;
     }
 
