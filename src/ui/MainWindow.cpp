@@ -68,6 +68,18 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onSeek);
     layout->addWidget(positionSlider_);
 
+    auto* tempoRow = new QHBoxLayout();
+    tempoLabel_ = new QLabel(tr("Tempo: 100%"), central);
+    tempoSlider_ = new QSlider(Qt::Horizontal, central);
+    tempoSlider_->setRange(25, 100);
+    tempoSlider_->setValue(100);
+    tempoSlider_->setEnabled(false);
+    connect(tempoSlider_, &QSlider::valueChanged,
+            this, &MainWindow::onTempoChanged);
+    tempoRow->addWidget(tempoLabel_);
+    tempoRow->addWidget(tempoSlider_, /*stretch=*/1);
+    layout->addLayout(tempoRow);
+
     layout->addStretch();
     setCentralWidget(central);
 }
@@ -101,6 +113,17 @@ void MainWindow::onOpenFile() {
     playButton_->setEnabled(true);
     stopButton_->setEnabled(true);
     playButton_->setText(tr("Play"));
+
+    // Reset tempo to 100% on every fresh load — old slider state from
+    // a previous file shouldn't carry over.
+    {
+        QSignalBlocker block(tempoSlider_);
+        tempoSlider_->setValue(100);
+    }
+    tempoSlider_->setEnabled(true);
+    tempoLabel_->setText(tr("Tempo: 100%"));
+    player_->setTempoRatio(1.0);
+
     statusLabel_->setText(tr("Loaded: %1  (%2 ms)")
         .arg(path).arg(duration.count()));
 
@@ -135,6 +158,12 @@ void MainWindow::onStop() {
 void MainWindow::onSeek(int positionMs) {
     if (!player_) return;
     player_->seek(std::chrono::milliseconds{positionMs});
+}
+
+void MainWindow::onTempoChanged(int percent) {
+    if (!player_) return;
+    tempoLabel_->setText(tr("Tempo: %1%").arg(percent));
+    player_->setTempoRatio(percent / 100.0);
 }
 
 void MainWindow::updatePosition() {

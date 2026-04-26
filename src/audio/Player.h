@@ -50,6 +50,15 @@ public:
     void stop();
     void seek(std::chrono::milliseconds position);
 
+    // Tempo as a fraction of the source rate. 1.0 = original speed,
+    // 0.5 = half speed, etc. Clamped to [0.25, 1.0]. Pitch is
+    // preserved across changes. Safe to call from the GUI thread; the
+    // change is applied by the decoder thread on its next iteration.
+    void setTempoRatio(double ratio);
+    [[nodiscard]] double tempoRatio() const noexcept {
+        return currentTempoRatio_.load();
+    }
+
     [[nodiscard]] TransportState state() const noexcept { return state_.load(); }
     [[nodiscard]] std::chrono::milliseconds position() const noexcept;
     [[nodiscard]] std::chrono::milliseconds duration() const noexcept;
@@ -82,6 +91,23 @@ private:
     std::atomic<bool>          decoderRunning_{false};
     std::atomic<TransportState> state_{TransportState::Stopped};
     std::atomic<std::int64_t>  framesPlayed_{0};
+
+    // Tempo control. The GUI thread writes targetTempoRatio_; the
+    // decoder thread observes it once per iteration, applies it to the
+    // stretcher under mutex_, then updates currentTempoRatio_ together
+    // with the position anchor below.
+    std::atomic<double>        targetTempoRatio_{1.0};
+    std::atomic<double>        currentTempoRatio_{1.0};
+
+    // Position-tracking anchor (Rule 8: simple-first). position() is
+    //   anchorSourceMs_ + (framesPlayed_ - anchorOutFrames_)
+    //                     / sr * 1000 * currentTempoRatio_
+    // The anchor is moved on every seek and tempo change so the
+    // formula stays correct piecewise. While the ring drains output
+    // produced under an older ratio, position() drifts by at most
+    // ~2 s of source time, then re-converges.
+    std::atomic<std::int64_t>  anchorSourceMs_{0};
+    std::atomic<std::int64_t>  anchorOutFrames_{0};
 };
 
 } // namespace fiddler::audio

@@ -27,6 +27,7 @@ private slots:
     void onPlayPause();
     void onStop();
     void onSeek(int positionMs);
+    void onTempoChanged(int percent);
     void updatePosition();
 
 private:
@@ -41,6 +42,8 @@ private:
     QPushButton* playButton_     = nullptr;
     QPushButton* stopButton_     = nullptr;
     QSlider*     positionSlider_ = nullptr;
+    QSlider*     tempoSlider_    = nullptr;
+    QLabel*      tempoLabel_     = nullptr;
     QLabel*      statusLabel_    = nullptr;
     QTimer*      positionTimer_  = nullptr;
 };

@@ -4,6 +4,7 @@
 
 #include <portaudio.h>
 
+#include <algorithm>
 #include <chrono>
 #include <vector>
 
@@ -65,6 +66,10 @@ bool Player::load(const std::filesystem::path& path) {
     }
 
     framesPlayed_.store(0);
+    targetTempoRatio_.store(1.0);
+    currentTempoRatio_.store(1.0);
+    anchorSourceMs_.store(0);
+    anchorOutFrames_.store(0);
     state_.store(TransportState::Stopped);
 
     decoderRunning_.store(true, std::memory_order_release);
@@ -127,6 +132,8 @@ void Player::stop() {
         if (ring_) ring_->reset();
         eofFlushed_ = false;
         framesPlayed_.store(0);
+        anchorSourceMs_.store(0);
+        anchorOutFrames_.store(0);
     }
     state_.store(TransportState::Stopped);
     FLOG_DEBUG("player", "stop");
@@ -148,10 +155,11 @@ void Player::seek(std::chrono::milliseconds position) {
         if (stretcher_) stretcher_->reset();
         if (ring_) ring_->reset();
         eofFlushed_ = false;
-        const auto sr = decoder_.outputFormat().sampleRate;
-        if (sr > 0) {
-            framesPlayed_.store(position.count() * sr / 1000);
-        }
+        // Anchor the source position at the seek target. We don't
+        // touch framesPlayed_ — the callback keeps counting from
+        // wherever it was; the anchor delta starts at zero.
+        anchorSourceMs_.store(position.count());
+        anchorOutFrames_.store(framesPlayed_.load());
     }
 
     if (wasPlaying && stream_) {
@@ -164,10 +172,24 @@ std::chrono::milliseconds Player::position() const noexcept {
     const auto sr = decoder_.outputFormat().sampleRate;
     if (sr <= 0)            return std::chrono::milliseconds::zero();
 
-    const auto pos = std::chrono::milliseconds{
-        framesPlayed_.load() * 1000 / sr};
+    // Anchor model: the decoder thread updates the anchor whenever the
+    // tempo changes or a seek happens, so position() across a piece of
+    // constant-ratio playback is just anchor + (delta * ratio).
+    const auto frames       = framesPlayed_.load();
+    const auto anchorFrames = anchorOutFrames_.load();
+    const auto anchorMs     = anchorSourceMs_.load();
+    const auto ratio        = currentTempoRatio_.load();
+
+    const double deltaSec = static_cast<double>(frames - anchorFrames) / sr;
+    const auto deltaMs    = static_cast<std::int64_t>(
+        deltaSec * 1000.0 * ratio);
+    const auto pos = std::chrono::milliseconds{anchorMs + deltaMs};
     const auto dur = duration();
     return (dur.count() > 0 && pos > dur) ? dur : pos;
+}
+
+void Player::setTempoRatio(double ratio) {
+    targetTempoRatio_.store(std::clamp(ratio, 0.25, 1.0));
 }
 
 std::chrono::milliseconds Player::duration() const noexcept {
@@ -213,6 +235,35 @@ void Player::decoderThread() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (decoder_.isOpen() && ring_ && stretcher_) {
+                // 0. If the GUI moved the tempo slider since last
+                //    iteration, advance the position anchor using the
+                //    OLD ratio (so source-time stays consistent up to
+                //    this instant) and switch the stretcher to the
+                //    new ratio. From here, the anchor formula runs at
+                //    the new ratio.
+                const double target = targetTempoRatio_.load();
+                const double currentRatio = currentTempoRatio_.load();
+                if (target != currentRatio) {
+                    const auto sr = decoder_.outputFormat().sampleRate;
+                    if (sr > 0) {
+                        const auto frames     = framesPlayed_.load();
+                        const auto oldFrames  = anchorOutFrames_.load();
+                        const auto oldAnchor  = anchorSourceMs_.load();
+                        const double deltaSec =
+                            static_cast<double>(frames - oldFrames) / sr;
+                        const auto sourceMs = oldAnchor +
+                            static_cast<std::int64_t>(
+                                deltaSec * 1000.0 * currentRatio);
+                        anchorSourceMs_.store(sourceMs);
+                        anchorOutFrames_.store(frames);
+                    }
+                    currentTempoRatio_.store(target);
+                    stretcher_->setTimeRatio(1.0 / target);
+                    FLOG_DEBUG("player.thread",
+                               "tempo {} (time ratio {})",
+                               target, 1.0 / target);
+                }
+
                 // 1. Drain whatever the stretcher already has into the
                 //    ring. Priority: don't let the ring starve the
                 //    callback while the stretcher sits on output.
