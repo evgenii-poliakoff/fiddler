@@ -9,6 +9,8 @@ add_executable(fiddler
     audio/Player.h
     audio/Stretcher.cpp
     audio/Stretcher.h
+    audio/WaveformOverview.cpp
+    audio/WaveformOverview.h
     util/Log.cpp
     util/Log.h
 )

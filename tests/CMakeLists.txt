@@ -7,6 +7,7 @@ add_executable(fiddler_tests
     test_log.cpp
     test_ringbuffer.cpp
     test_stretcher.cpp
+    test_waveform_overview.cpp
 )
 
 target_include_directories(fiddler_tests PRIVATE
@@ -29,6 +30,7 @@ target_link_libraries(fiddler_tests PRIVATE
 target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
 )
 
