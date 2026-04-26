@@ -7,17 +7,19 @@ the tune onto a synchronised musical staff — clicking a bar in the staff
 seeks the audio, scrubbing the audio moves the staff cursor. Place a note
 on the staff to hear a reference tone for pitch-matching.
 
-**Status:** step 0 — repository skeleton. Nothing functional yet.
+**Status:** step 3 done — open audio, play with pitch-preserving tempo
+control 25–100 %.
 
 ## Roadmap
 
-1. **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output).
-2. **Step 2** — Real-time time-stretching via Rubber Band; tempo slider 50–100 % with no pitch change.
-3. **Step 3** — Waveform view synchronised with playback position.
-4. **Step 4** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps.
-5. **Step 5** — Bidirectional cursor between audio and staff.
-6. **Step 6** — Reference-tone synthesiser (sine/triangle) triggered by placing a note.
-7. **Step 7** — MusicXML and ABC notation export.
+- ✅ **Step 0** — Repository skeleton.
+- ✅ **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output).
+- ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
+- ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change.
+- 🔜 **Step 4** — Waveform view synchronised with playback position.
+- 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps.
+- 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
+- 🔜 **Step 7** — MusicXML and ABC notation export.
 
 See [`docs/architecture.md`](docs/architecture.md) for stack-choice rationale.
 
@@ -70,13 +72,12 @@ If the directory is empty, the corpus test prints a warning and passes
 ```
 fiddler/
 ├── CMakeLists.txt              # top-level
-├── cmake/                      # FindXxx.cmake helpers
 ├── docs/                       # architecture notes, ADRs
 ├── scripts/                    # dev helper scripts
 ├── src/
 │   ├── main.cpp
 │   ├── ui/                     # Qt widgets
-│   └── audio/                  # decoder, ring buffer, player
+│   └── audio/                  # decoder, stretcher, ring buffer, player
 └── tests/                      # Catch2 unit tests
 ```
 

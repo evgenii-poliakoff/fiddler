@@ -6,6 +6,7 @@ add_executable(fiddler_tests
     test_decoder_corpus.cpp
     test_log.cpp
     test_ringbuffer.cpp
+    test_stretcher.cpp
 )
 
 target_include_directories(fiddler_tests PRIVATE
@@ -20,12 +21,14 @@ target_compile_definitions(fiddler_tests PRIVATE
 target_link_libraries(fiddler_tests PRIVATE
     Catch2::Catch2WithMain
     PkgConfig::FFMPEG
+    PkgConfig::RUBBERBAND
     PkgConfig::SPDLOG
 )
 
 # Pull in the audio sources we want to test directly.
 target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
 )
 

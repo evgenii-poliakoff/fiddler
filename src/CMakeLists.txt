@@ -7,6 +7,8 @@ add_executable(fiddler
     audio/RingBuffer.h
     audio/Player.cpp
     audio/Player.h
+    audio/Stretcher.cpp
+    audio/Stretcher.h
     util/Log.cpp
     util/Log.h
 )
@@ -17,5 +19,6 @@ target_link_libraries(fiddler PRIVATE
     Qt6::Widgets
     PkgConfig::FFMPEG
     PkgConfig::PORTAUDIO
+    PkgConfig::RUBBERBAND
     PkgConfig::SPDLOG
 )

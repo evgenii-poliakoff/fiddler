@@ -4,6 +4,7 @@
 
 #include <portaudio.h>
 
+#include <algorithm>
 #include <chrono>
 #include <vector>
 
@@ -35,6 +36,9 @@ bool Player::load(const std::filesystem::path& path) {
         static_cast<std::size_t>(2 * fmt.sampleRate * fmt.channels);
     ring_ = std::make_unique<RingBuffer>(ringSize);
 
+    stretcher_ = std::make_unique<Stretcher>(fmt.sampleRate, fmt.channels);
+    eofFlushed_ = false;
+
     PaStreamParameters outParams{};
     outParams.device = Pa_GetDefaultOutputDevice();
     if (outParams.device == paNoDevice) {
@@ -62,6 +66,10 @@ bool Player::load(const std::filesystem::path& path) {
     }
 
     framesPlayed_.store(0);
+    targetTempoRatio_.store(1.0);
+    currentTempoRatio_.store(1.0);
+    anchorSourceMs_.store(0);
+    anchorOutFrames_.store(0);
     state_.store(TransportState::Stopped);
 
     decoderRunning_.store(true, std::memory_order_release);
@@ -84,7 +92,9 @@ void Player::unload() {
         stream_ = nullptr;
     }
     decoder_.close();
+    stretcher_.reset();
     ring_.reset();
+    eofFlushed_ = false;
     state_.store(TransportState::Stopped);
     framesPlayed_.store(0);
 }
@@ -118,8 +128,12 @@ void Player::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         decoder_.seek(0ms);
+        if (stretcher_) stretcher_->reset();
         if (ring_) ring_->reset();
+        eofFlushed_ = false;
         framesPlayed_.store(0);
+        anchorSourceMs_.store(0);
+        anchorOutFrames_.store(0);
     }
     state_.store(TransportState::Stopped);
     FLOG_DEBUG("player", "stop");
@@ -138,11 +152,14 @@ void Player::seek(std::chrono::milliseconds position) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         decoder_.seek(position);
+        if (stretcher_) stretcher_->reset();
         if (ring_) ring_->reset();
-        const auto sr = decoder_.outputFormat().sampleRate;
-        if (sr > 0) {
-            framesPlayed_.store(position.count() * sr / 1000);
-        }
+        eofFlushed_ = false;
+        // Anchor the source position at the seek target. We don't
+        // touch framesPlayed_ — the callback keeps counting from
+        // wherever it was; the anchor delta starts at zero.
+        anchorSourceMs_.store(position.count());
+        anchorOutFrames_.store(framesPlayed_.load());
     }
 
     if (wasPlaying && stream_) {
@@ -155,10 +172,24 @@ std::chrono::milliseconds Player::position() const noexcept {
     const auto sr = decoder_.outputFormat().sampleRate;
     if (sr <= 0)            return std::chrono::milliseconds::zero();
 
-    const auto pos = std::chrono::milliseconds{
-        framesPlayed_.load() * 1000 / sr};
+    // Anchor model: the decoder thread updates the anchor whenever the
+    // tempo changes or a seek happens, so position() across a piece of
+    // constant-ratio playback is just anchor + (delta * ratio).
+    const auto frames       = framesPlayed_.load();
+    const auto anchorFrames = anchorOutFrames_.load();
+    const auto anchorMs     = anchorSourceMs_.load();
+    const auto ratio        = currentTempoRatio_.load();
+
+    const double deltaSec = static_cast<double>(frames - anchorFrames) / sr;
+    const auto deltaMs    = static_cast<std::int64_t>(
+        deltaSec * 1000.0 * ratio);
+    const auto pos = std::chrono::milliseconds{anchorMs + deltaMs};
     const auto dur = duration();
     return (dur.count() > 0 && pos > dur) ? dur : pos;
+}
+
+void Player::setTempoRatio(double ratio) {
+    targetTempoRatio_.store(std::clamp(ratio, 0.25, 1.0));
 }
 
 std::chrono::milliseconds Player::duration() const noexcept {
@@ -196,26 +227,85 @@ int Player::paCallback(const void* /*input*/, void* output,
 
 void Player::decoderThread() {
     constexpr std::size_t chunkSamples = 4096; // 2048 stereo frames
-    std::vector<float> chunk(chunkSamples);
+    std::vector<float> inBuf(chunkSamples);
+    std::vector<float> outBuf(chunkSamples);
 
     while (decoderRunning_.load(std::memory_order_acquire)) {
         bool didWork = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (decoder_.isOpen() && ring_
-                && ring_->writeAvailable() >= chunkSamples) {
-                const auto got = decoder_.read({chunk.data(), chunkSamples});
-                if (got > 0) {
-                    ring_->write({chunk.data(),
-                                  static_cast<std::size_t>(got)});
-                    didWork = true;
-                    FLOG_TRACE("player.thread",
-                               "fed {} samples; ring r/w = {}/{}",
-                               got, ring_->readAvailable(),
-                               ring_->writeAvailable());
+            if (decoder_.isOpen() && ring_ && stretcher_) {
+                // 0. If the GUI moved the tempo slider since last
+                //    iteration, advance the position anchor using the
+                //    OLD ratio (so source-time stays consistent up to
+                //    this instant) and switch the stretcher to the
+                //    new ratio. From here, the anchor formula runs at
+                //    the new ratio.
+                const double target = targetTempoRatio_.load();
+                const double currentRatio = currentTempoRatio_.load();
+                if (target != currentRatio) {
+                    const auto sr = decoder_.outputFormat().sampleRate;
+                    if (sr > 0) {
+                        const auto frames     = framesPlayed_.load();
+                        const auto oldFrames  = anchorOutFrames_.load();
+                        const auto oldAnchor  = anchorSourceMs_.load();
+                        const double deltaSec =
+                            static_cast<double>(frames - oldFrames) / sr;
+                        const auto sourceMs = oldAnchor +
+                            static_cast<std::int64_t>(
+                                deltaSec * 1000.0 * currentRatio);
+                        anchorSourceMs_.store(sourceMs);
+                        anchorOutFrames_.store(frames);
+                    }
+                    currentTempoRatio_.store(target);
+                    stretcher_->setTimeRatio(1.0 / target);
+                    FLOG_DEBUG("player.thread",
+                               "tempo {} (time ratio {})",
+                               target, 1.0 / target);
                 }
-                // got == 0 → clean EOF, got < 0 → error. Either way, stop
-                // pushing until something changes (seek / unload).
+
+                // 1. Drain whatever the stretcher already has into the
+                //    ring. Priority: don't let the ring starve the
+                //    callback while the stretcher sits on output.
+                while (ring_->writeAvailable() >= chunkSamples
+                       && stretcher_->available() > 0) {
+                    const std::size_t got = stretcher_->retrieve(
+                        {outBuf.data(), chunkSamples});
+                    if (got == 0) break;
+                    ring_->write({outBuf.data(), got});
+                    didWork = true;
+                }
+
+                // 2. If the ring still has space, feed the stretcher
+                //    one chunk from the decoder (or flush its tail at
+                //    clean EOF, exactly once).
+                if (ring_->writeAvailable() >= chunkSamples && !eofFlushed_) {
+                    const auto got = decoder_.read({inBuf.data(), chunkSamples});
+                    if (got > 0) {
+                        stretcher_->process(
+                            {inBuf.data(), static_cast<std::size_t>(got)},
+                            /*final=*/false);
+                        didWork = true;
+                        FLOG_TRACE("player.thread",
+                                   "in {} samples; stretcher avail={} frames; "
+                                   "ring r/w={}/{}",
+                                   got, stretcher_->available(),
+                                   ring_->readAvailable(),
+                                   ring_->writeAvailable());
+                    } else if (got == 0) {
+                        // Clean EOF — flush the stretcher tail so the
+                        // last preroll-delayed samples come out.
+                        stretcher_->process({}, /*final=*/true);
+                        eofFlushed_ = true;
+                        didWork = true;
+                        FLOG_DEBUG("player.thread",
+                                   "decoder EOF; flushed stretcher tail "
+                                   "({} frames pending)",
+                                   stretcher_->available());
+                    }
+                    // got < 0 → decoder error. Stop pushing until
+                    // seek/unload clears state.
+                }
             }
         }
         if (!didWork) std::this_thread::sleep_for(5ms);
