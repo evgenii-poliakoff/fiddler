@@ -35,6 +35,9 @@ bool Player::load(const std::filesystem::path& path) {
         static_cast<std::size_t>(2 * fmt.sampleRate * fmt.channels);
     ring_ = std::make_unique<RingBuffer>(ringSize);
 
+    stretcher_ = std::make_unique<Stretcher>(fmt.sampleRate, fmt.channels);
+    eofFlushed_ = false;
+
     PaStreamParameters outParams{};
     outParams.device = Pa_GetDefaultOutputDevice();
     if (outParams.device == paNoDevice) {
@@ -84,7 +87,9 @@ void Player::unload() {
         stream_ = nullptr;
     }
     decoder_.close();
+    stretcher_.reset();
     ring_.reset();
+    eofFlushed_ = false;
     state_.store(TransportState::Stopped);
     framesPlayed_.store(0);
 }
@@ -118,7 +123,9 @@ void Player::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         decoder_.seek(0ms);
+        if (stretcher_) stretcher_->reset();
         if (ring_) ring_->reset();
+        eofFlushed_ = false;
         framesPlayed_.store(0);
     }
     state_.store(TransportState::Stopped);
@@ -138,7 +145,9 @@ void Player::seek(std::chrono::milliseconds position) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         decoder_.seek(position);
+        if (stretcher_) stretcher_->reset();
         if (ring_) ring_->reset();
+        eofFlushed_ = false;
         const auto sr = decoder_.outputFormat().sampleRate;
         if (sr > 0) {
             framesPlayed_.store(position.count() * sr / 1000);
@@ -196,26 +205,56 @@ int Player::paCallback(const void* /*input*/, void* output,
 
 void Player::decoderThread() {
     constexpr std::size_t chunkSamples = 4096; // 2048 stereo frames
-    std::vector<float> chunk(chunkSamples);
+    std::vector<float> inBuf(chunkSamples);
+    std::vector<float> outBuf(chunkSamples);
 
     while (decoderRunning_.load(std::memory_order_acquire)) {
         bool didWork = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (decoder_.isOpen() && ring_
-                && ring_->writeAvailable() >= chunkSamples) {
-                const auto got = decoder_.read({chunk.data(), chunkSamples});
-                if (got > 0) {
-                    ring_->write({chunk.data(),
-                                  static_cast<std::size_t>(got)});
+            if (decoder_.isOpen() && ring_ && stretcher_) {
+                // 1. Drain whatever the stretcher already has into the
+                //    ring. Priority: don't let the ring starve the
+                //    callback while the stretcher sits on output.
+                while (ring_->writeAvailable() >= chunkSamples
+                       && stretcher_->available() > 0) {
+                    const std::size_t got = stretcher_->retrieve(
+                        {outBuf.data(), chunkSamples});
+                    if (got == 0) break;
+                    ring_->write({outBuf.data(), got});
                     didWork = true;
-                    FLOG_TRACE("player.thread",
-                               "fed {} samples; ring r/w = {}/{}",
-                               got, ring_->readAvailable(),
-                               ring_->writeAvailable());
                 }
-                // got == 0 → clean EOF, got < 0 → error. Either way, stop
-                // pushing until something changes (seek / unload).
+
+                // 2. If the ring still has space, feed the stretcher
+                //    one chunk from the decoder (or flush its tail at
+                //    clean EOF, exactly once).
+                if (ring_->writeAvailable() >= chunkSamples && !eofFlushed_) {
+                    const auto got = decoder_.read({inBuf.data(), chunkSamples});
+                    if (got > 0) {
+                        stretcher_->process(
+                            {inBuf.data(), static_cast<std::size_t>(got)},
+                            /*final=*/false);
+                        didWork = true;
+                        FLOG_TRACE("player.thread",
+                                   "in {} samples; stretcher avail={} frames; "
+                                   "ring r/w={}/{}",
+                                   got, stretcher_->available(),
+                                   ring_->readAvailable(),
+                                   ring_->writeAvailable());
+                    } else if (got == 0) {
+                        // Clean EOF — flush the stretcher tail so the
+                        // last preroll-delayed samples come out.
+                        stretcher_->process({}, /*final=*/true);
+                        eofFlushed_ = true;
+                        didWork = true;
+                        FLOG_DEBUG("player.thread",
+                                   "decoder EOF; flushed stretcher tail "
+                                   "({} frames pending)",
+                                   stretcher_->available());
+                    }
+                    // got < 0 → decoder error. Stop pushing until
+                    // seek/unload clears state.
+                }
             }
         }
         if (!didWork) std::this_thread::sleep_for(5ms);

@@ -1,18 +1,20 @@
 // Player — owns the audio output stream and the decoder feeding it.
 //
-// Architecture (target for step 1):
+// Architecture:
 //
-//      [ Decoder ] --(decoder thread)--> [ RingBuffer ] --(callback)--> [ PortAudio ]
+//      [ Decoder ] --> [ Stretcher ] --> [ RingBuffer ] --(callback)--> [ PortAudio ]
+//                  decoder thread                          (RT thread)
 //
 // The PortAudio callback runs on a real-time thread and only touches
-// the ring buffer. The decoder thread tops up the ring buffer when low.
-// In step 2, a Rubber Band stretcher will be inserted between Decoder
-// and RingBuffer.
+// the ring buffer. The decoder thread reads from the decoder, feeds
+// the Rubber Band stretcher, and pushes the stretched output into the
+// ring buffer when there's space.
 
 #pragma once
 
 #include "audio/Decoder.h"
 #include "audio/RingBuffer.h"
+#include "audio/Stretcher.h"
 
 #include <atomic>
 #include <chrono>
@@ -62,8 +64,13 @@ private:
     void decoderThread();
 
     Decoder                    decoder_;
+    std::unique_ptr<Stretcher> stretcher_;
     std::unique_ptr<RingBuffer> ring_;
     PaStream*                  stream_ = nullptr;
+
+    // True once we've sent a final flush to the stretcher at EOF.
+    // Protected by mutex_; reset on seek / load / unload.
+    bool                       eofFlushed_ = false;
 
     // Protects decoder_ and ring_ against concurrent access by the
     // decoder thread and the GUI thread (during seek). The PortAudio
