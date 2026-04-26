@@ -13,6 +13,15 @@
 #include <span>
 #include <string>
 
+// FFmpeg forward declarations — at global namespace scope so they refer
+// to the real ::AVFormatContext etc., not a fresh declaration inside
+// fiddler::audio. Including libavformat/libavcodec headers from this
+// public header would leak FFmpeg into every translation unit; we keep
+// them confined to Decoder.cpp.
+struct AVFormatContext;
+struct AVCodecContext;
+struct SwrContext;
+
 namespace fiddler::audio {
 
 struct AudioFormat {
@@ -51,11 +60,12 @@ public:
     [[nodiscard]] const std::string& lastError() const noexcept { return lastError_; }
 
 private:
-    // Opaque FFmpeg state. Forward-declared to keep the header lean.
-    struct AVFormatContext* formatCtx_ = nullptr;
-    struct AVCodecContext*  codecCtx_  = nullptr;
-    struct SwrContext*      swr_       = nullptr;
-    int                     streamIndex_ = -1;
+    // Opaque FFmpeg state. Real types are pulled in by Decoder.cpp;
+    // here we only need the global forward declarations above.
+    AVFormatContext* formatCtx_  = nullptr;
+    AVCodecContext*  codecCtx_   = nullptr;
+    SwrContext*      swr_        = nullptr;
+    int              streamIndex_ = -1;
 
     AudioFormat outFormat_{};
     std::string lastError_;

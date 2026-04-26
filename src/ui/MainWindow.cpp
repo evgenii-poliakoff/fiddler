@@ -34,8 +34,8 @@ void MainWindow::buildMenus() {
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
     fileMenu->addAction(openAction_);
     fileMenu->addSeparator();
-    fileMenu->addAction(tr("&Quit"), this, &QWidget::close,
-                        QKeySequence::Quit);
+    fileMenu->addAction(tr("&Quit"), QKeySequence::Quit,
+                        this, &QWidget::close);
 }
 
 void MainWindow::buildCentralWidget() {
