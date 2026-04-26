@@ -17,8 +17,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wshadow)
 endif()
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
-
 # Qt 6 — Widgets is enough for step 1.
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 set(CMAKE_AUTOMOC ON)
@@ -37,8 +35,10 @@ pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
 # PkgConfig::SPDLOG with the correct includes and link flags.
 pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
 
-# Rubber Band is wired in step 2; uncomment then.
-# find_package(RubberBand REQUIRED)
+# Rubber Band Library — real-time time-stretching engine. Ships
+# rubberband.pc on Ubuntu 24.04 (librubberband-dev), so pkg-config is
+# the canonical integration point. See Rule 3 in docs/architecture.md.
+pkg_check_modules(RUBBERBAND REQUIRED IMPORTED_TARGET rubberband)
 
 enable_testing()
 
