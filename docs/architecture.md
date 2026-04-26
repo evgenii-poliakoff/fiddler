@@ -225,6 +225,27 @@ FLOG_INFO("decoder", "opened %s, %d ms", path, duration.count());  // wrong
 The macros forward to `fmt::format`. printf-style `%s`/`%d` will not
 compile.
 
+### Rule 8: prefer the simple solution; elaborate only when forced to
+
+Premature optimization is evil. When two designs both meet the current
+requirements, take the smaller one. Reach for the more elaborate option
+only when the simple version has demonstrably failed against a concrete
+need — not in anticipation of a hypothetical future requirement.
+
+If you're tempted to add machinery "in case we want it later", don't.
+Code that isn't needed now has no test, no use site to validate the API,
+and a guaranteed maintenance bill. Keep the door open by isolating the
+simple solution behind a small interface, so swapping it later is a
+localised change, not a rewrite.
+
+We took this path on step 3's position tracking. The simple option —
+anchor source position on each tempo change and seek; tolerate ≤2 s of
+bounded drift while the ring buffer drains at the new ratio — lives
+inside `Player::position()` and three atomics. If step 5's staff-cursor
+sync proves the drift unacceptable, exact per-chunk-ratio bookkeeping
+can replace just those atomics without touching the rest of the
+pipeline.
+
 ## Threading model
 
 ```
