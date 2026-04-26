@@ -380,7 +380,7 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 0** — Repository skeleton, build pipeline proven on the target stack.
 - ✅ **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output, synchronised slider).
 - ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
-- 🔜 **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 50–100 % with no pitch change. Insert `RubberBandStretcher` between the decoder and the ring buffer; expose a tempo-ratio property on `Player`. Acceptance: dragging the slider changes playback speed audibly while pitch stays constant; no underruns at 50 %.
+- 🔜 **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. Insert `RubberBandStretcher` between the decoder and the ring buffer; expose a tempo-ratio property on `Player`. Acceptance: dragging the slider changes playback speed audibly while pitch stays constant; no underruns at 25 %.
 - 🔜 **Step 4** — Waveform view synchronised with playback position. Decode-on-load into a downsampled overview buffer; render with `QPainter`.
 - 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps. `QGraphicsView`-based.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
