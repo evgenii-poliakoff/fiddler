@@ -55,16 +55,26 @@ abstracts too much for this and is harder to hook the stretcher into.
 RtAudio is a viable alternative with similar ergonomics; we picked
 PortAudio because it's more widely deployed.
 
-### Time stretching: Rubber Band Library (arrives in step 3)
+### Time stretching: Rubber Band Library
 
-State-of-the-art open option. Phase-vocoder engine with formant
-preservation; default in Ardour and Mixxx. Real-time mode
-(`OptionProcessRealTime`) is suited to interactive tempo changes during
-playback. License: GPL or commercial. We adopt GPL-3.0 in step 0;
-switch to a commercial Rubber Band licence if a closed-source build is
-ever needed. SoundTouch (WSOLA, LGPL) is the lighter fallback, but
-quality drops below ~75 % tempo, which is exactly where fiddlers want
-to listen.
+State-of-the-art open option. Default in Ardour and Mixxx. License:
+GPL or commercial. We adopt GPL-3.0 in step 0; switch to a commercial
+Rubber Band licence if a closed-source build is ever needed.
+SoundTouch (WSOLA, LGPL) is the lighter fallback, but quality drops
+below ~75 % tempo, which is exactly where fiddlers want to listen.
+
+Configured for realtime use with `OptionProcessRealTime` so changes
+take effect on the next process call. Engine is `OptionEngineFiner`
+(R3, the default since Rubber Band 3.0): finer time/frequency
+resolution preserves bow attacks and ornament transients down to 25 %
+playback rate. R2 (`OptionEngineFaster`) is lighter on CPU but smears
+transients at extreme stretches — the regime fiddlers actually use.
+`OptionPitchHighConsistency` keeps pitch rock-stable across ratio
+changes. Formant preservation is off; it's a vocal feature and on
+fiddle it can subtly tint timbre.
+
+The `audio::Stretcher` class wraps `RubberBandStretcher` behind pImpl
+(Rule 6) so Rubber Band headers don't leak into Player or the UI.
 
 ### Logging: spdlog (behind a facade)
 
@@ -249,29 +259,32 @@ pipeline.
 ## Threading model
 
 ```
-+----------+    decoded float32     +-------------+
-| Decoder  | ---------------------> | RingBuffer  |
-| (worker) |     (later via         | (lock-free  |
-+----------+      RubberBand)       |  SPSC)      |
-                                    +------+------+
-                                           |
-                                           v
-                                  +-----------------+
-                                  | PortAudio       |
-                                  | callback (RT)   |
-                                  +-----------------+
++----------+    PCM    +-----------+   stretched   +-------------+
+| Decoder  | --------> | Stretcher | ------------> | RingBuffer  |
+| (worker) |           | (worker)  |               | (lock-free  |
++----------+           +-----------+               |  SPSC)      |
+                                                   +------+------+
+                                                          |
+                                                          v
+                                                 +-----------------+
+                                                 | PortAudio       |
+                                                 | callback (RT)   |
+                                                 +-----------------+
 ```
 
 Three threads of interest:
 
 - **GUI thread** (Qt's main thread). Drives the `Player` API, polls
-  `Player::position()` every 50 ms via `QTimer` to update the slider.
-  Never touches FFmpeg or PortAudio directly — always goes through
-  `Player`.
-- **Decoder thread**, owned by `Player`. Sleeps in a 5 ms loop watching
-  `ring_->writeAvailable()`; tops up the ring when it has space. Holds
-  `Player::mutex_` while reading from the decoder so seek() can safely
-  reset state.
+  `Player::position()` every 50 ms via `QTimer` to update the slider,
+  and writes `targetTempoRatio_` when the tempo slider moves. Never
+  touches FFmpeg or PortAudio directly — always goes through `Player`.
+- **Decoder thread**, owned by `Player`. Sleeps in a 5 ms loop. Each
+  iteration: (1) if the GUI moved the tempo slider, advance the
+  position anchor under the *old* ratio and apply the new ratio to the
+  stretcher; (2) drain the stretcher into the ring; (3) feed one chunk
+  of decoded input to the stretcher. Holds `Player::mutex_` while
+  touching `decoder_` and `stretcher_` so `seek()` can safely reset
+  state.
 - **PortAudio realtime callback thread**. Drains `ring_` only. Subject
   to Rule 2 (nothing else allowed).
 
@@ -279,14 +292,24 @@ Synchronization primitives:
 
 - `RingBuffer` — lock-free SPSC, `std::atomic` head/tail. Producer is
   the decoder thread, consumer is the audio callback.
-- `Player::mutex_` — protects `decoder_` and ring writes against
-  concurrent seek from the GUI thread. The audio callback NEVER takes
-  this mutex.
+- `Player::mutex_` — protects `decoder_`, `stretcher_`, and ring
+  writes against concurrent seek from the GUI thread. The audio
+  callback NEVER takes this mutex.
 - `Player::framesPlayed_` — `std::atomic<int64_t>`, incremented by the
   callback, read by the GUI for `position()`.
 - `Player::state_` — `std::atomic<TransportState>`, written by GUI
   thread, read by the GUI for play/pause UI state.
 - `Player::decoderRunning_` — `std::atomic<bool>` for shutdown signal.
+- `Player::targetTempoRatio_` — `std::atomic<double>`, written by the
+  GUI when the slider moves, observed by the decoder thread.
+- `Player::currentTempoRatio_`, `Player::anchorSourceMs_`,
+  `Player::anchorOutFrames_` — atomic anchor for `position()` under
+  changing tempo. Updated together by the decoder thread on tempo
+  change and seek; `position()` reads them lock-free. The cost is
+  bounded source-time drift (≤ 2 s, the ring's worth) while the ring
+  drains output produced under an older ratio. See Rule 8 for the
+  simple-first reasoning behind this choice over per-chunk-ratio
+  bookkeeping.
 
 ## Logging
 
@@ -353,14 +376,14 @@ FIDDLER_LOG_LEVEL    env var, overridden by --log-level
 ```
 fiddler/
 ├── CMakeLists.txt              # top-level
-├── cmake/                      # FindXxx.cmake helpers
 ├── docs/                       # this file, ADRs, design notes
 ├── scripts/                    # install-deps.sh, bootstrap.sh
 ├── src/
 │   ├── main.cpp                # CLI parsing + log init + Qt app
-│   ├── ui/MainWindow.{h,cpp}   # Qt main window, transport controls
+│   ├── ui/MainWindow.{h,cpp}   # Qt main window, transport + tempo
 │   ├── audio/
 │   │   ├── Decoder.{h,cpp}     # FFmpeg wrapper, opaque interface
+│   │   ├── Stretcher.{h,cpp}   # Rubber Band wrapper (pImpl)
 │   │   ├── Player.{h,cpp}      # PortAudio + decoder thread
 │   │   └── RingBuffer.h        # lock-free SPSC, header-only
 │   └── util/Log.{h,cpp}        # logging facade over spdlog
@@ -401,7 +424,7 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 0** — Repository skeleton, build pipeline proven on the target stack.
 - ✅ **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output, synchronised slider).
 - ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
-- 🔜 **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. Insert `RubberBandStretcher` between the decoder and the ring buffer; expose a tempo-ratio property on `Player`. Acceptance: dragging the slider changes playback speed audibly while pitch stays constant; no underruns at 25 %.
+- ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. `Stretcher` (R3 engine) sits between the decoder and the ring buffer on the decoder thread; `Player::setTempoRatio()` is the GUI-visible knob. Position tracking uses the simple anchor model (Rule 8).
 - 🔜 **Step 4** — Waveform view synchronised with playback position. Decode-on-load into a downsampled overview buffer; render with `QPainter`.
 - 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps. `QGraphicsView`-based.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
