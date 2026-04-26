@@ -1,0 +1,54 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/*.cmake
+
+# Compiled
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dylib
+*.exe
+
+# Qt
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qmlc
+*.jsc
+*.user
+*.user.*
+
+# IDEs
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+.DS_Store
+compile_commands.json
+
+# Test artifacts
+Testing/
+*.log
+
+# Sample audio files for manual testing (don't commit large media)
+samples/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.opus
