@@ -7,8 +7,8 @@ the tune onto a synchronised musical staff — clicking a bar in the staff
 seeks the audio, scrubbing the audio moves the staff cursor. Place a note
 on the staff to hear a reference tone for pitch-matching.
 
-**Status:** step 3 done — open audio, play with pitch-preserving tempo
-control 25–100 %.
+**Status:** step 4 done — open audio, play with pitch-preserving tempo
+control 25–100 %, see and seek through a synchronised waveform view.
 
 ## Roadmap
 
@@ -16,7 +16,7 @@ control 25–100 %.
 - ✅ **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output).
 - ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change.
-- 🔜 **Step 4** — Waveform view synchronised with playback position.
+- ✅ **Step 4** — Waveform view synchronised with playback position; click to seek.
 - 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
@@ -76,9 +76,9 @@ fiddler/
 ├── scripts/                    # dev helper scripts
 ├── src/
 │   ├── main.cpp
-│   ├── ui/                     # Qt widgets
-│   └── audio/                  # decoder, stretcher, ring buffer, player
-└── tests/                      # Catch2 unit tests
+│   ├── ui/                     # Qt widgets (main window, waveform)
+│   └── audio/                  # decoder, stretcher, overview, ring buffer, player
+└── tests/                      # Catch2 + Qt6::Test
 ```
 
 ## Logging

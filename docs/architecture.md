@@ -76,6 +76,40 @@ fiddle it can subtly tint timbre.
 The `audio::Stretcher` class wraps `RubberBandStretcher` behind pImpl
 (Rule 6) so Rubber Band headers don't leak into Player or the UI.
 
+### Waveform view: `QWidget` + `QPainter`
+
+`audio::WaveformOverview` is the data model — N peak buckets per
+channel keyed on source-time milliseconds — and `ui::WaveformWidget`
+is a plain `QWidget` that paints peaks plus a playhead cursor and
+emits `seekRequested(ms)` on left-click. Source-time is the universal
+coordinate; every overlay added later (staff barlines in step 5,
+note ranges and selections in step 6+) hangs off the same axis.
+
+Architectural commitments made up front, against the temptation to
+defer all of them (Rule 8 still applies — these are tiny *interface*
+choices, not features):
+
+- The widget consumes a `std::shared_ptr<const WaveformOverview>` and
+  emits a signal; it knows nothing about `Player`. Parent wires the
+  loop. Future views (mini-strip, second pane, spectrogram) drop in
+  against the same data without touching `Player`.
+- Public coordinate transforms `xToMs(int)` / `msToX(int64_t)` so step
+  5's overlay code maps pixels ↔ source time without reimplementing.
+- Overview construction is two-stage: `WaveformOverview::fromSamples`
+  is pure (testable end-to-end without FFmpeg); `buildOverview(Decoder&)`
+  is the production glue that decodes a file and forwards.
+
+Considered alternatives:
+
+- `QGraphicsView` was attractive for the eventual draggable overlay
+  handles in step 6+, but `QWidget` + `QPainter` is enough for peaks
+  + cursor today. Migrating later is localised inside the widget.
+- An overlay-layer / region API was deliberately *not* built up front;
+  step 5 will introduce the first concrete overlay (barlines), and
+  guessing the shape now would produce the wrong abstraction.
+- An on-disk thumbnail cache was deferred; re-decoding on file open
+  takes well under a second for typical Irish-trad recordings.
+
 ### Logging: spdlog (behind a facade)
 
 The application code never includes spdlog headers directly. All log
@@ -84,10 +118,34 @@ so we can swap loggers without touching call sites. spdlog was picked
 over `std::format`-from-scratch (more code) and Qt's `QLoggingCategory`
 (awkward in non-Qt audio code).
 
-### Test framework: Catch2 v3
+### Test framework: Catch2 v3 + Qt6::Test for GUI
 
-Available in 24.04 as `catch2`. Header-light, low ceremony, expressive
-`REQUIRE`/`SECTION` syntax.
+Catch2 (Ubuntu's `catch2` package) drives the suite. Header-light,
+low ceremony, expressive `REQUIRE`/`SECTION` syntax.
+
+GUI tests use Qt's `QTest` namespace for input synthesis
+(`QTest::mouseClick`, `QTest::qWaitFor`) and `QSignalSpy` to assert
+emitted signals. Two pieces of plumbing are non-obvious and worth
+recording:
+
+- **Stack-allocated `QApplication` in a custom `main()`.** A
+  function-local-static `QApplication` segfaults at process exit on
+  Ubuntu 24.04 / Qt 6.4 because Qt's own globals destruct in a
+  different order than the static. We link `Catch2::Catch2` (not
+  `Catch2WithMain`) and provide our own `main()` in
+  `tests/qt_test_app.cpp` that constructs `QApplication` on the stack,
+  then calls `Catch::Session().run(argc, argv)`.
+- **`QT_QPA_PLATFORM=offscreen`** is set both in that `main()` (for
+  direct invocation of the test exe) and via `catch_discover_tests
+  PROPERTIES ENVIRONMENT` (so ctest invocations see it before the
+  child process starts). Qt resolves the variable during
+  `QApplication`'s constructor; an in-process `qputenv` would be too
+  late on hosts where `DISPLAY` is set.
+
+The integration test for `MainWindow` writes a small in-memory PCM
+WAV (440 Hz sine, 2 s, stereo, 44.1 kHz) into the system temp dir on
+first use, so the suite is self-contained and doesn't depend on the
+`.gitignore`d corpus directory being populated.
 
 ### Score format (later, steps 6–7)
 
@@ -287,6 +345,18 @@ Three threads of interest:
   state.
 - **PortAudio realtime callback thread**. Drains `ring_` only. Subject
   to Rule 2 (nothing else allowed).
+- **Overview-builder workers** (one per file open, detached). Decode
+  the entire file into a `WaveformOverview` and post the result back
+  to the GUI thread via `QMetaObject::invokeMethod` with
+  `Qt::QueuedConnection`. We *detach* (rather than store a joinable
+  handle) so a slow build never freezes the GUI when the user opens
+  the next file; an atomic generation counter on `MainWindow`,
+  bumped per `loadFile()`, ensures only the most recent build's
+  result is installed (a stale post from a still-running build for
+  file A is dropped when its generation no longer matches). The
+  post-back captures the receiver via `QPointer<MainWindow>` so the
+  lambda no-ops if the window is destroyed before the queued event
+  runs.
 
 Synchronization primitives:
 
@@ -310,6 +380,11 @@ Synchronization primitives:
   drains output produced under an older ratio. See Rule 8 for the
   simple-first reasoning behind this choice over per-chunk-ratio
   bookkeeping.
+- `MainWindow::overviewGeneration_` — `std::atomic<uint64_t>`,
+  incremented on every `loadFile()`. Detached overview workers carry
+  the generation that was active when they were spawned and drop
+  their result if it no longer matches when the queued post-back
+  reaches the GUI thread.
 
 ## Logging
 
@@ -375,22 +450,26 @@ FIDDLER_LOG_LEVEL    env var, overridden by --log-level
 
 ```
 fiddler/
-├── CMakeLists.txt              # top-level
-├── docs/                       # this file, ADRs, design notes
-├── scripts/                    # install-deps.sh, bootstrap.sh
+├── CMakeLists.txt                  # top-level
+├── docs/                           # this file, ADRs, design notes
+├── scripts/                        # install-deps.sh, bootstrap.sh
 ├── src/
-│   ├── main.cpp                # CLI parsing + log init + Qt app
-│   ├── ui/MainWindow.{h,cpp}   # Qt main window, transport + tempo
+│   ├── main.cpp                    # CLI parsing + log init + Qt app
+│   ├── ui/
+│   │   ├── MainWindow.{h,cpp}      # transport + tempo + waveform
+│   │   └── WaveformWidget.{h,cpp}  # peaks + cursor + click-to-seek
 │   ├── audio/
-│   │   ├── Decoder.{h,cpp}     # FFmpeg wrapper, opaque interface
-│   │   ├── Stretcher.{h,cpp}   # Rubber Band wrapper (pImpl)
-│   │   ├── Player.{h,cpp}      # PortAudio + decoder thread
-│   │   └── RingBuffer.h        # lock-free SPSC, header-only
-│   └── util/Log.{h,cpp}        # logging facade over spdlog
+│   │   ├── Decoder.{h,cpp}         # FFmpeg wrapper, opaque interface
+│   │   ├── Stretcher.{h,cpp}       # Rubber Band wrapper (pImpl)
+│   │   ├── WaveformOverview.{h,cpp}# downsampled peak summary
+│   │   ├── Player.{h,cpp}          # PortAudio + decoder thread
+│   │   └── RingBuffer.h            # lock-free SPSC, header-only
+│   └── util/Log.{h,cpp}            # logging facade over spdlog
 └── tests/
-    ├── CMakeLists.txt          # Catch2 v3
-    ├── data/audio/             # corpus dir, scanned at test time
-    └── test_*.cpp              # one file per concern
+    ├── CMakeLists.txt              # Catch2 v3 + Qt6::Test
+    ├── data/audio/                 # corpus dir, scanned at test time
+    ├── qt_test_app.{h,cpp}         # QApplication + offscreen plugin
+    └── test_*.cpp                  # one file per concern
 ```
 
 `src/audio/` is plain C++, no Qt. `src/ui/` is Qt-specific. `src/util/`
@@ -425,7 +504,7 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 1** — Open and play any common audio format at normal speed (Qt UI, FFmpeg decode, PortAudio output, synchronised slider).
 - ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. `Stretcher` (R3 engine) sits between the decoder and the ring buffer on the decoder thread; `Player::setTempoRatio()` is the GUI-visible knob. Position tracking uses the simple anchor model (Rule 8).
-- 🔜 **Step 4** — Waveform view synchronised with playback position. Decode-on-load into a downsampled overview buffer; render with `QPainter`.
+- ✅ **Step 4** — Waveform view synchronised with playback position. `audio::WaveformOverview` (peak buckets keyed on source-time ms) is built on a detached worker thread on file open; `ui::WaveformWidget` paints peaks plus a cursor and emits `seekRequested(ms)` on click. Decoupled from `Player`; public `xToMs`/`msToX` so step 5's overlays plug in without restructuring.
 - 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps. `QGraphicsView`-based.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.

@@ -39,30 +39,35 @@ bool Player::load(const std::filesystem::path& path) {
     stretcher_ = std::make_unique<Stretcher>(fmt.sampleRate, fmt.channels);
     eofFlushed_ = false;
 
+    // Try to acquire a PortAudio output stream. If the host has no
+    // usable audio device (CI runners, broken audio config, headless
+    // environments) we fall through with stream_ == nullptr — the
+    // decoder, stretcher, ring buffer, and seek path all stay valid
+    // for visualisation; play() will no-op.
     PaStreamParameters outParams{};
     outParams.device = Pa_GetDefaultOutputDevice();
     if (outParams.device == paNoDevice) {
-        FLOG_ERROR("player", "Pa_GetDefaultOutputDevice returned paNoDevice");
-        decoder_.close();
-        ring_.reset();
-        return false;
-    }
-    outParams.channelCount     = fmt.channels;
-    outParams.sampleFormat     = paFloat32;
-    outParams.suggestedLatency =
-        Pa_GetDeviceInfo(outParams.device)->defaultLowOutputLatency;
-    outParams.hostApiSpecificStreamInfo = nullptr;
+        FLOG_WARN("player",
+                  "Pa_GetDefaultOutputDevice returned paNoDevice — "
+                  "loaded for visualisation only");
+    } else {
+        outParams.channelCount     = fmt.channels;
+        outParams.sampleFormat     = paFloat32;
+        outParams.suggestedLatency =
+            Pa_GetDeviceInfo(outParams.device)->defaultLowOutputLatency;
+        outParams.hostApiSpecificStreamInfo = nullptr;
 
-    PaError err = Pa_OpenStream(&stream_,
-        nullptr, &outParams,
-        static_cast<double>(fmt.sampleRate),
-        paFramesPerBufferUnspecified,
-        paNoFlag, &Player::paCallback, this);
-    if (err != paNoError) {
-        FLOG_ERROR("player", "Pa_OpenStream failed: {}", Pa_GetErrorText(err));
-        decoder_.close();
-        ring_.reset();
-        return false;
+        PaError err = Pa_OpenStream(&stream_,
+            nullptr, &outParams,
+            static_cast<double>(fmt.sampleRate),
+            paFramesPerBufferUnspecified,
+            paNoFlag, &Player::paCallback, this);
+        if (err != paNoError) {
+            FLOG_WARN("player",
+                      "Pa_OpenStream failed: {} — loaded for visualisation only",
+                      Pa_GetErrorText(err));
+            stream_ = nullptr;
+        }
     }
 
     framesPlayed_.store(0);
@@ -75,10 +80,11 @@ bool Player::load(const std::filesystem::path& path) {
     decoderRunning_.store(true, std::memory_order_release);
     decoderThread_ = std::thread([this] { decoderThread(); });
 
-    FLOG_INFO("player", "loaded; ring={} samples ({} s at {} Hz x{})",
+    FLOG_INFO("player", "loaded; ring={} samples ({} s at {} Hz x{}){}",
               ringSize,
               static_cast<double>(ringSize) / fmt.channels / fmt.sampleRate,
-              fmt.sampleRate, fmt.channels);
+              fmt.sampleRate, fmt.channels,
+              stream_ ? "" : " [no audio output]");
     return true;
 }
 

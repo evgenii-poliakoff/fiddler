@@ -2,6 +2,8 @@ add_executable(fiddler
     main.cpp
     ui/MainWindow.cpp
     ui/MainWindow.h
+    ui/WaveformWidget.cpp
+    ui/WaveformWidget.h
     audio/Decoder.cpp
     audio/Decoder.h
     audio/RingBuffer.h
@@ -9,6 +11,8 @@ add_executable(fiddler
     audio/Player.h
     audio/Stretcher.cpp
     audio/Stretcher.h
+    audio/WaveformOverview.cpp
+    audio/WaveformOverview.h
     util/Log.cpp
     util/Log.h
 )

@@ -63,6 +63,13 @@ public:
     [[nodiscard]] std::chrono::milliseconds position() const noexcept;
     [[nodiscard]] std::chrono::milliseconds duration() const noexcept;
 
+    // True if PortAudio handed us a usable output stream. False on
+    // hosts where Pa_GetDefaultOutputDevice() returns paNoDevice or
+    // Pa_OpenStream fails (CI runners, broken audio config, etc.).
+    // When false, load() still succeeds and seek/position work — just
+    // play() is a no-op.
+    [[nodiscard]] bool hasAudioOutput() const noexcept { return stream_ != nullptr; }
+
 private:
     static int paCallback(const void* input, void* output,
                           unsigned long frameCount,
