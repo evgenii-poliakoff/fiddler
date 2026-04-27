@@ -13,6 +13,8 @@ add_executable(fiddler
     audio/Stretcher.h
     audio/WaveformOverview.cpp
     audio/WaveformOverview.h
+    score/BarlineModel.cpp
+    score/BarlineModel.h
     util/Log.cpp
     util/Log.h
 )

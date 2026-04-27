@@ -1,6 +1,7 @@
 find_package(Catch2 3 REQUIRED)
 
 add_executable(fiddler_tests
+    test_barline_model.cpp
     test_decoder.cpp
     test_decoder_synthetic.cpp
     test_decoder_corpus.cpp
@@ -44,6 +45,7 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Player.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/WaveformWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
