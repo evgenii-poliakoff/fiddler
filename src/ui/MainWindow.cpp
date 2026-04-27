@@ -137,13 +137,17 @@ bool MainWindow::loadFile(const QString& path) {
     }
 
     const auto duration = player_->duration();
+    const bool hasAudio = player_->hasAudioOutput();
     {
         QSignalBlocker block(positionSlider_);
         positionSlider_->setRange(0, static_cast<int>(duration.count()));
         positionSlider_->setValue(0);
     }
     positionSlider_->setEnabled(true);
-    playButton_->setEnabled(true);
+    // No audio output (headless CI, broken audio config) → file is
+    // still loaded for visualisation and seek, but Play would no-op.
+    // Stop stays enabled as a "rewind to start" affordance.
+    playButton_->setEnabled(hasAudio);
     stopButton_->setEnabled(true);
     playButton_->setText(tr("Play"));
 
@@ -162,8 +166,10 @@ bool MainWindow::loadFile(const QString& path) {
     waveform_->setOverview(nullptr);
     waveform_->setPositionMs(0);
 
-    statusLabel_->setText(tr("Loaded: %1  (%2 ms)")
-        .arg(path).arg(duration.count()));
+    statusLabel_->setText(tr("Loaded: %1  (%2 ms)%3")
+        .arg(path)
+        .arg(duration.count())
+        .arg(hasAudio ? QString() : tr("  [no audio output]")));
 
     if (!positionTimer_) {
         positionTimer_ = new QTimer(this);
