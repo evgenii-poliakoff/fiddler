@@ -5,6 +5,7 @@ add_executable(fiddler_tests
     test_decoder_synthetic.cpp
     test_decoder_corpus.cpp
     test_log.cpp
+    test_main_window.cpp
     test_ringbuffer.cpp
     test_stretcher.cpp
     test_waveform_overview.cpp
@@ -30,16 +31,20 @@ target_link_libraries(fiddler_tests PRIVATE
     Qt6::Widgets
     Qt6::Test
     PkgConfig::FFMPEG
+    PkgConfig::PORTAUDIO
     PkgConfig::RUBBERBAND
     PkgConfig::SPDLOG
 )
 
 # Pull in the source files we want to test directly. Qt-bearing
-# sources (WaveformWidget) trigger AUTOMOC for the test target.
+# sources (WaveformWidget, MainWindow) trigger AUTOMOC for the test
+# target.
 target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Player.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/WaveformWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
 )

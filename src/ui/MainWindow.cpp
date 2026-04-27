@@ -1,14 +1,20 @@
 #include "ui/MainWindow.h"
 
+#include "audio/Decoder.h"
 #include "audio/Player.h"
+#include "audio/WaveformOverview.h"
+#include "ui/WaveformWidget.h"
 #include "util/Log.h"
 
 #include <QAction>
+#include <QApplication>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMetaObject>
+#include <QPointer>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -17,7 +23,21 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <chrono>
+#include <memory>
+#include <thread>
+#include <utility>
+
 namespace fiddler::ui {
+
+namespace {
+// Bucket count is the overview's *internal* peak resolution. The
+// widget downsamples to its current pixel width on every paint, so a
+// fixed-and-generous 4096 covers any plausible window width without
+// rebuilding when the user resizes. 4096 buckets × 2 ch × 8 bytes ≈
+// 64 KB — trivial.
+constexpr std::size_t kOverviewBuckets = 4096;
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -61,6 +81,13 @@ void MainWindow::buildCentralWidget() {
     transport->addStretch();
     layout->addLayout(transport);
 
+    waveform_ = new WaveformWidget(central);
+    connect(waveform_, &WaveformWidget::seekRequested,
+            this, [this](std::int64_t ms) {
+                onSeek(static_cast<int>(ms));
+            });
+    layout->addWidget(waveform_, /*stretch=*/1);
+
     positionSlider_ = new QSlider(Qt::Horizontal, central);
     positionSlider_->setRange(0, 0);
     positionSlider_->setEnabled(false);
@@ -80,7 +107,8 @@ void MainWindow::buildCentralWidget() {
     tempoRow->addWidget(tempoSlider_, /*stretch=*/1);
     layout->addLayout(tempoRow);
 
-    layout->addStretch();
+    // No trailing addStretch — waveform_ already claims any extra
+    // vertical space via its layout stretch factor.
     setCentralWidget(central);
 }
 
@@ -96,11 +124,16 @@ void MainWindow::onOpenFile() {
     }
 
     FLOG_DEBUG("ui", "user selected {}", path.toStdString());
-    if (!player_->load(path.toStdString())) {
+    if (!loadFile(path)) {
         QMessageBox::warning(this, tr("Open failed"),
             tr("Could not open: %1").arg(path));
+    }
+}
+
+bool MainWindow::loadFile(const QString& path) {
+    if (!player_->load(path.toStdString())) {
         statusLabel_->setText(tr("No file loaded."));
-        return;
+        return false;
     }
 
     const auto duration = player_->duration();
@@ -124,6 +157,11 @@ void MainWindow::onOpenFile() {
     tempoLabel_->setText(tr("Tempo: 100%"));
     player_->setTempoRatio(1.0);
 
+    // Clear any stale waveform + reset cursor immediately. The fresh
+    // overview will arrive asynchronously below.
+    waveform_->setOverview(nullptr);
+    waveform_->setPositionMs(0);
+
     statusLabel_->setText(tr("Loaded: %1  (%2 ms)")
         .arg(path).arg(duration.count()));
 
@@ -134,6 +172,38 @@ void MainWindow::onOpenFile() {
                 this, &MainWindow::updatePosition);
     }
     positionTimer_->start();
+
+    // Kick off the overview build on a worker thread. We detach
+    // (rather than store a joinable thread) so a slow build never
+    // blocks the GUI when the user opens the next file. A generation
+    // counter on the post-back guards against an old build's result
+    // landing after a newer file has been loaded.
+    const auto generation = ++overviewGeneration_;
+    const std::string utf8Path = path.toStdString();
+    QPointer<MainWindow> self(this);
+    std::thread([self, utf8Path, generation]() {
+        audio::Decoder dec;
+        if (!dec.open(utf8Path)) {
+            FLOG_WARN("waveform", "overview build: decoder failed to open {}",
+                      utf8Path);
+            return;
+        }
+        auto built = audio::buildOverview(dec, kOverviewBuckets);
+        if (!built) return;
+        auto shared = std::make_shared<const audio::WaveformOverview>(
+            std::move(*built));
+        QMetaObject::invokeMethod(qApp, [self, generation, shared]() {
+            if (!self) return;
+            if (generation != self->overviewGeneration_.load()) return;
+            self->waveform_->setOverview(shared);
+            FLOG_DEBUG("waveform",
+                       "overview installed: gen={}, buckets={}, dur={} ms",
+                       generation, shared->bucketCount(),
+                       shared->duration().count());
+        }, Qt::QueuedConnection);
+    }).detach();
+
+    return true;
 }
 
 void MainWindow::onPlayPause() {
@@ -172,6 +242,9 @@ void MainWindow::updatePosition() {
     {
         QSignalBlocker block(positionSlider_);
         positionSlider_->setValue(static_cast<int>(pos.count()));
+    }
+    if (waveform_) {
+        waveform_->setPositionMs(pos.count());
     }
     // Auto-pause when we reach the end.
     if (player_->state() == audio::TransportState::Playing
