@@ -17,8 +17,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wshadow)
 endif()
 
-# Qt 6 — Widgets is enough for step 1.
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+# Qt 6 — Widgets for the app, Test for QSignalSpy / QTest in the
+# GUI test suite.
+find_package(Qt6 REQUIRED COMPONENTS Widgets Test)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
