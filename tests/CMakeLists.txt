@@ -8,6 +8,7 @@ add_executable(fiddler_tests
     test_log.cpp
     test_main_window.cpp
     test_ringbuffer.cpp
+    test_staff_widget.cpp
     test_stretcher.cpp
     test_waveform_overview.cpp
     test_waveform_widget.cpp
@@ -47,6 +48,7 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/StaffWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/WaveformWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
 )
