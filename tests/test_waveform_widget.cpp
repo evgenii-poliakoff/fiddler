@@ -4,8 +4,10 @@
 
 #include "audio/WaveformOverview.h"
 #include "qt_test_app.h"
+#include "score/BarlineModel.h"
 #include "ui/WaveformWidget.h"
 
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QSignalSpy>
 #include <QTest>
@@ -18,6 +20,7 @@
 #include <vector>
 
 using fiddler::audio::WaveformOverview;
+using fiddler::score::BarlineModel;
 using fiddler::test::qtApp;
 using fiddler::ui::WaveformWidget;
 
@@ -225,4 +228,269 @@ TEST_CASE("WaveformWidget: paint survives extreme widget sizes",
         QTest::qWait(5);
     }
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// Barline overlay: paint, selection, key-nav, delete
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Helper: install a barline model on the widget with the given
+// timestamps. The model is heap-allocated as shared_ptr so the
+// widget can own a const reference; the test holds a non-const handle
+// to mutate it later.
+std::shared_ptr<BarlineModel>
+installModel(WaveformWidget& w, std::span<const std::int64_t> stamps = {}) {
+    auto model = std::make_shared<BarlineModel>();
+    for (auto ms : stamps) model->add(ms);
+    w.setBarlineModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("WaveformWidget: paints barline ticks without crashing",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500, 3500 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    QTest::qWait(20);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: click on a barline selects it and seeks to its ms",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));      // 4 s, msToX is linear
+    // Place a barline at exactly 1000 ms — at width 800 that's x=200.
+    const std::int64_t stamps[] = { 1000 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+    QSignalSpy selSpy(&w,  &WaveformWidget::barlineSelectionChanged);
+
+    // Click at x=202 — within 5 px of the tick at x=200.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(202, 50));
+
+    REQUIRE(w.selectedBarline() == 0);
+
+    // The seek emission carries the *barline's* ms (1000), not the
+    // click's ms (which would be ~1010).
+    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
+
+    REQUIRE(selSpy.count() == 1);
+    REQUIRE(selSpy.takeFirst().at(0).value<std::optional<std::size_t>>()
+            == std::optional<std::size_t>{0});
+}
+
+TEST_CASE("WaveformWidget: click far from any barline seeks without selecting",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+    QSignalSpy selSpy(&w,  &WaveformWidget::barlineSelectionChanged);
+
+    // Click far from x=200 — say x=600 (3000 ms), no barline anywhere
+    // near. Selection stays empty, seek goes to clicked ms.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 50));
+
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(seekSpy.count() == 1);
+    const auto seekedMs = seekSpy.takeFirst().at(0).toLongLong();
+    REQUIRE(seekedMs >= 2980);
+    REQUIRE(seekedMs <= 3020);
+    REQUIRE(selSpy.count() == 0);   // no selection change to report
+}
+
+TEST_CASE("WaveformWidget: clicking elsewhere clears an existing selection",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+
+    // Pre-select via click on the bar.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 50));
+    REQUIRE(w.selectedBarline() == 0);
+
+    QSignalSpy selSpy(&w, &WaveformWidget::barlineSelectionChanged);
+    // Click in empty space.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 50));
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(selSpy.count() == 1);
+    REQUIRE(selSpy.takeFirst().at(0).value<std::optional<std::size_t>>()
+            == std::optional<std::size_t>{});
+}
+
+TEST_CASE("WaveformWidget: arrow keys navigate selection between barlines",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500, 3500 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    // Pre-select index 1 by simulated click at the 1500 ms tick (x=300).
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(300, 50));
+    REQUIRE(w.selectedBarline() == 1);
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+    seekSpy.clear();
+
+    QTest::keyClick(&w, Qt::Key_Right);
+    REQUIRE(w.selectedBarline() == 2);
+    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 2500);
+
+    QTest::keyClick(&w, Qt::Key_Left);
+    QTest::keyClick(&w, Qt::Key_Left);
+    REQUIRE(w.selectedBarline() == 0);
+}
+
+TEST_CASE("WaveformWidget: arrow keys saturate at boundaries",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    // Pre-select last (index 2).
+    w.setSelectedBarline(2);
+    QTest::keyClick(&w, Qt::Key_Right);   // already at end
+    REQUIRE(w.selectedBarline() == 2);
+
+    // Pre-select first (index 0).
+    w.setSelectedBarline(0);
+    QTest::keyClick(&w, Qt::Key_Left);    // already at start
+    REQUIRE(w.selectedBarline() == 0);
+}
+
+TEST_CASE("WaveformWidget: Esc clears the selection",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline() == 0);
+
+    QSignalSpy selSpy(&w, &WaveformWidget::barlineSelectionChanged);
+    QTest::keyClick(&w, Qt::Key_Escape);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(selSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: Del fires barlineDeleteRequested with the index",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+    w.setSelectedBarline(1);
+
+    QSignalSpy delSpy(&w, &WaveformWidget::barlineDeleteRequested);
+    QTest::keyClick(&w, Qt::Key_Delete);
+    REQUIRE(delSpy.count() == 1);
+    REQUIRE(delSpy.takeFirst().at(0).value<std::size_t>() == 1u);
+}
+
+TEST_CASE("WaveformWidget: Del with no selection does nothing",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    installModel(w, std::span<const std::int64_t>{});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    QSignalSpy delSpy(&w, &WaveformWidget::barlineDeleteRequested);
+    QTest::keyClick(&w, Qt::Key_Delete);
+    REQUIRE(delSpy.count() == 0);
+}
+
+TEST_CASE("WaveformWidget: model removeAt of selected entry clears selection",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500 };
+    auto model = installModel(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.setSelectedBarline(2);
+    REQUIRE(w.selectedBarline() == 2);
+
+    QSignalSpy selSpy(&w, &WaveformWidget::barlineSelectionChanged);
+
+    // Remove the selected entry. The widget should observe the
+    // model's `changed` signal and drop the now-out-of-range index.
+    model->removeAt(2);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(selSpy.count() >= 1);
+}
+
+TEST_CASE("WaveformWidget: setBarlineModel(nullptr) detaches and clears selection",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline() == 0);
+
+    w.setBarlineModel(nullptr);
+    REQUIRE(w.barlineModel() == nullptr);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+}
+
+TEST_CASE("WaveformWidget: setSelectedBarline rejects out-of-range indices",
+          "[waveform-widget][gui][barlines]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500 };
+    installModel(w, std::span<const std::int64_t>{stamps});
+
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline() == 0);
+
+    // Out of range — silently coerced to nullopt.
+    w.setSelectedBarline(99);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
 }

@@ -1,6 +1,9 @@
 #include "ui/WaveformWidget.h"
 
+#include "score/BarlineModel.h"
+
 #include <QColor>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
@@ -13,11 +16,20 @@
 namespace fiddler::ui {
 
 namespace {
-constexpr int kLanePaddingPx = 2;
+constexpr int kLanePaddingPx        = 2;
+// Click-to-select tolerance: if the click x is within this many
+// pixels of a barline tick, the barline is selected (and the audio
+// seeks to its exact source-ms). Larger than 1 px because hitting
+// a single-pixel-wide tick precisely is annoying; small enough not
+// to trap clicks meant for plain seeking.
+constexpr int kBarlineHitTolerancePx = 5;
 } // namespace
 
 WaveformWidget::WaveformWidget(QWidget* parent) : QWidget(parent) {
     setAttribute(Qt::WA_OpaquePaintEvent);
+    // StrongFocus so the widget can receive arrow / Esc / Del keys
+    // after a click gives it focus.
+    setFocusPolicy(Qt::StrongFocus);
 }
 
 WaveformWidget::~WaveformWidget() = default;
@@ -29,9 +41,49 @@ void WaveformWidget::setOverview(
     update();
 }
 
+void WaveformWidget::setBarlineModel(
+    std::shared_ptr<const score::BarlineModel> model)
+{
+    if (barlineModel_) {
+        disconnect(barlineModel_.get(), nullptr, this, nullptr);
+    }
+    barlineModel_ = std::move(model);
+    if (barlineModel_) {
+        connect(barlineModel_.get(), &score::BarlineModel::changed,
+                this, &WaveformWidget::onBarlineModelChanged);
+    }
+    if (selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    update();
+}
+
 void WaveformWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
+    update();
+}
+
+void WaveformWidget::setSelectedBarline(std::optional<std::size_t> index) {
+    if (index.has_value() && barlineModel_
+        && *index >= barlineModel_->size()) {
+        index = std::nullopt;
+    }
+    if (selectedBarline_ == index) return;
+    selectedBarline_ = index;
+    update();
+    emit barlineSelectionChanged(selectedBarline_);
+}
+
+void WaveformWidget::onBarlineModelChanged() {
+    // The selection's index might no longer be valid (entry removed,
+    // model cleared). Drop it if so.
+    if (selectedBarline_.has_value() && barlineModel_
+        && *selectedBarline_ >= barlineModel_->size()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
     update();
 }
 
@@ -112,6 +164,21 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
+    // Barline ticks — drawn between peaks and the cursor so the
+    // playhead always wins z-order.
+    if (barlineModel_) {
+        const auto bars = barlineModel_->barlines();
+        for (std::size_t i = 0; i < bars.size(); ++i) {
+            const int x = msToX(bars[i]);
+            if (x < 0 || x >= width()) continue;
+            const bool selected = (selectedBarline_ == i);
+            painter.setPen(QPen(
+                selected ? QColor(255, 200, 90) : QColor(210, 170, 60),
+                selected ? 2.0 : 1.0));
+            painter.drawLine(x, 0, x, height());
+        }
+    }
+
     // Playhead cursor.
     const int cursorX = msToX(positionMs_);
     if (cursorX >= 0 && cursorX < width()) {
@@ -121,12 +188,91 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
 }
 
 void WaveformWidget::mousePressEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton && overview_) {
-        emit seekRequested(xToMs(event->pos().x()));
-        event->accept();
+    if (event->button() != Qt::LeftButton || !overview_) {
+        QWidget::mousePressEvent(event);
         return;
     }
-    QWidget::mousePressEvent(event);
+    setFocus();
+    const int x  = event->pos().x();
+    const auto ms = xToMs(x);
+
+    // Hit-test a nearby barline. Tolerance is in source-ms, scaled
+    // from kBarlineHitTolerancePx using the current widget's
+    // ms-per-pixel rate.
+    std::optional<std::size_t> hit;
+    if (barlineModel_ && barlineModel_->size() > 0
+        && overview_ && width() > 0)
+    {
+        const auto durationMs = overview_->duration().count();
+        if (durationMs > 0) {
+            const auto tolMs = static_cast<std::int64_t>(
+                kBarlineHitTolerancePx) * durationMs / width();
+            hit = barlineModel_->nearest(ms, tolMs);
+        }
+    }
+
+    if (hit.has_value()) {
+        // Update selection (if it changed) and seek to the barline's
+        // exact ms — not the click ms — so the cursor lands on the
+        // tick, not just nearby.
+        if (selectedBarline_ != hit) {
+            selectedBarline_ = hit;
+            update();
+            emit barlineSelectionChanged(selectedBarline_);
+        }
+        emit seekRequested(barlineModel_->barlines()[*hit]);
+    } else {
+        if (selectedBarline_.has_value()) {
+            selectedBarline_.reset();
+            update();
+            emit barlineSelectionChanged(selectedBarline_);
+        }
+        emit seekRequested(ms);
+    }
+    event->accept();
+}
+
+void WaveformWidget::keyPressEvent(QKeyEvent* event) {
+    if (!barlineModel_) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+    const auto count = barlineModel_->size();
+
+    switch (event->key()) {
+    case Qt::Key_Left:
+        if (selectedBarline_ && *selectedBarline_ > 0) {
+            setSelectedBarline(*selectedBarline_ - 1);
+            emit seekRequested(
+                barlineModel_->barlines()[*selectedBarline_]);
+        }
+        event->accept();
+        return;
+    case Qt::Key_Right:
+        if (selectedBarline_ && *selectedBarline_ + 1 < count) {
+            setSelectedBarline(*selectedBarline_ + 1);
+            emit seekRequested(
+                barlineModel_->barlines()[*selectedBarline_]);
+        }
+        event->accept();
+        return;
+    case Qt::Key_Escape:
+        if (selectedBarline_.has_value()) {
+            setSelectedBarline(std::nullopt);
+        }
+        event->accept();
+        return;
+    case Qt::Key_Delete:
+        if (selectedBarline_.has_value()) {
+            emit barlineDeleteRequested(*selectedBarline_);
+            // Don't reset selection here — onBarlineModelChanged()
+            // will handle it once the model actually drops the entry.
+        }
+        event->accept();
+        return;
+    default:
+        QWidget::keyPressEvent(event);
+    }
 }
 
 } // namespace fiddler::ui
