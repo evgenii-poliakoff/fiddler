@@ -114,6 +114,18 @@ MainWindow::MainWindow(QWidget* parent)
     undoShortcut_->setContext(Qt::WindowShortcut);
     connect(undoShortcut_, &QShortcut::activated,
             this, &MainWindow::onUndoLastBarline);
+
+    // Del: remove the currently-selected barline. We install this at
+    // window scope (not just on the score widgets) so the shortcut
+    // works regardless of which child has focus — e.g. right after
+    // tap-to-place, when focus is still on the transport button the
+    // user clicked. The score widgets' own Key_Delete handlers stay
+    // in place for the standalone-widget unit tests; in MainWindow
+    // context this shortcut intercepts the key first.
+    deleteBarShortcut_ = new QShortcut(QKeySequence(Qt::Key_Delete), this);
+    deleteBarShortcut_->setContext(Qt::WindowShortcut);
+    connect(deleteBarShortcut_, &QShortcut::activated,
+            this, &MainWindow::onDeleteSelectedBarline);
 }
 
 MainWindow::~MainWindow() = default;
@@ -379,7 +391,18 @@ void MainWindow::onTapBarline() {
     // record it. The model handles sorted insertion + duplicate
     // rejection; both widgets receive `changed()` and repaint.
     if (!player_ || !player_->duration().count()) return;
-    barlineModel_->add(player_->position().count());
+    const auto inserted =
+        barlineModel_->add(player_->position().count());
+
+    // Auto-select the newly-placed barline. This makes "tap B, press
+    // Del" work as a symmetric pair — without auto-select, the user
+    // would have to first click the (1-pixel-wide) tick to select it
+    // before Del had anything to remove. The waveform's
+    // setSelectedBarline emits barlineSelectionChanged, which the
+    // mirror plumbing forwards to the staff.
+    if (inserted.has_value() && waveform_) {
+        waveform_->setSelectedBarline(inserted);
+    }
 }
 
 void MainWindow::onUndoLastBarline() {
@@ -424,6 +447,20 @@ void MainWindow::onBarlineDeleteRequested(std::size_t index) {
     // route through the same slot — the model is the single source
     // of truth, and its `changed()` signal will repaint both views.
     barlineModel_->removeAt(index);
+}
+
+void MainWindow::onDeleteSelectedBarline() {
+    // Window-level Del shortcut. Looks up the currently-selected
+    // barline (the waveform and staff stay in sync via the mirror
+    // plumbing, so reading either is fine) and removes it from the
+    // model. With no current selection this is a quiet no-op — the
+    // user can tap B to add a new one, click on a tick to select an
+    // existing one, or Ctrl+Z to peel the most-recent placement.
+    if (!waveform_) return;
+    const auto sel = waveform_->selectedBarline();
+    if (sel.has_value()) {
+        barlineModel_->removeAt(*sel);
+    }
 }
 
 void MainWindow::updatePosition() {

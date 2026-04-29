@@ -79,6 +79,13 @@ private slots:
     // an actual model mutation.
     void onBarlineDeleteRequested(std::size_t index);
 
+    // The window-level 'Del' shortcut: removes the currently-selected
+    // barline regardless of which child widget has focus. Without
+    // this, Del only worked when one of the score widgets was
+    // focused — which it usually wasn't right after a tap-to-place,
+    // since the focus tended to be on the transport buttons.
+    void onDeleteSelectedBarline();
+
 private:
     void buildMenus();
     void buildCentralWidget();
@@ -98,8 +105,9 @@ private:
     WaveformWidget* waveform_       = nullptr;
     StaffWidget*    staff_          = nullptr;
     QComboBox*      tuneTypeCombo_  = nullptr;
-    QShortcut*      tapBarShortcut_ = nullptr;   // 'B'
-    QShortcut*      undoShortcut_   = nullptr;   // Ctrl+Z
+    QShortcut*      tapBarShortcut_    = nullptr;   // 'B'
+    QShortcut*      undoShortcut_      = nullptr;   // Ctrl+Z
+    QShortcut*      deleteBarShortcut_ = nullptr;   // 'Del'
 
     // The shared score model — owned here, observed by both widgets
     // as a const view. shared_ptr (not unique_ptr) so the widgets'

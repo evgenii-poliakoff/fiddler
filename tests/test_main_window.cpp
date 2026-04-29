@@ -117,6 +117,175 @@ TEST_CASE("MainWindow: load fails gracefully on a non-existent file",
     REQUIRE_FALSE(w.loadFile("/no/such/file.wav"));
 }
 
+// ---------------------------------------------------------------------------
+// Tap-then-Del flow: regression coverage for "I cannot delete the only
+// barline I just placed via Del". Two compounding causes — Del only
+// worked when a score widget was focused (focus tended to be on the
+// transport buttons after a click), and a freshly-placed bar wasn't
+// selected so Del had nothing to remove. Both fixes are exercised
+// here.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: tapping B auto-selects the newly-placed barline",
+          "[main-window][gui][integration][tap-then-del]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(waveform != nullptr);
+    REQUIRE(staff    != nullptr);
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // No barlines yet → no selection.
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+    REQUIRE_FALSE(staff->selectedBarline().has_value());
+
+    // Tap B once. The placement should also become the active
+    // selection in BOTH widgets (the staff via the mirror plumbing).
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(waveform->selectedBarline() == 0);
+    REQUIRE(staff->selectedBarline()    == 0);
+}
+
+TEST_CASE("MainWindow: tap B then Del removes the bar without a click",
+          "[main-window][gui][integration][tap-then-del]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // The exact scenario from the smoke-test bug report:
+    //   1. open a file
+    //   2. tap B once
+    //   3. press Del — expect the bar to be gone
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->barlineModel().empty());
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+}
+
+TEST_CASE("MainWindow: Del shortcut works when focus is on the Play button",
+          "[main-window][gui][integration][tap-then-del]") {
+    // The original bug surfaced precisely because the user clicked
+    // Play, then tapped B, then pressed Del — and Del did nothing.
+    // The keyboard target was the Play button, which doesn't handle
+    // Del. The window-level QShortcut we added must intercept.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform   = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    REQUIRE(waveform   != nullptr);
+    REQUIRE(playButton != nullptr);
+    REQUIRE(stopButton != nullptr);
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Click Play + Stop to mimic the real workflow and to land on a
+    // deterministic position. Focus is now on stopButton.
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+    REQUIRE(stopButton->hasFocus());
+
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    // The keyboard target is still the Stop button. Without the
+    // window-level Del shortcut, this keypress would be consumed
+    // (or ignored) by the button rather than removing the bar.
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->barlineModel().empty());
+}
+
+TEST_CASE("MainWindow: each tap shifts auto-selection to the latest bar",
+          "[main-window][gui][integration][tap-then-del]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform  = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff     = window->findChild<StaffWidget*>("staffWidget");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    auto* playBtn   = window->findChild<QPushButton*>("playButton");
+    auto* stopBtn   = window->findChild<QPushButton*>("stopButton");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    const auto durationMs = window->player().duration().count();
+
+    // Lock the player to position 0 deterministically.
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+
+    // Place at 0. Selection follows the placement.
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(waveform->selectedBarline() == 0);
+    REQUIRE(staff->selectedBarline()    == 0);
+
+    // Place at durationMs / 2. The new entry sorts to index 1; the
+    // selection moves to it.
+    posSlider->setValue(static_cast<int>(durationMs / 2));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 2));
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 2);
+    REQUIRE(waveform->selectedBarline() == 1);
+    REQUIRE(staff->selectedBarline()    == 1);
+
+    // Place at durationMs / 4 — sorts BETWEEN the two existing
+    // entries (index 1). Both pre-existing entries shift; selection
+    // tracks the just-placed bar.
+    posSlider->setValue(static_cast<int>(durationMs / 4));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 4));
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 3);
+    REQUIRE(waveform->selectedBarline() == 1);  // the new middle bar
+    REQUIRE(staff->selectedBarline()    == 1);
+
+    // One Del peels the just-placed quarter-mark bar; the remaining
+    // two are at 0 and durationMs/2.
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->barlineModel().size() == 2);
+    REQUIRE(window->barlineModel().barlines()[0] == 0);
+    REQUIRE(window->barlineModel().barlines()[1] == durationMs / 2);
+}
+
+TEST_CASE("MainWindow: Del with nothing selected is a quiet no-op",
+          "[main-window][gui][integration][tap-then-del]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // No bar placed yet → no selection. Pressing Del must not crash
+    // or do anything to the (empty) model.
+    REQUIRE(window->barlineModel().empty());
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->barlineModel().empty());
+}
+
 TEST_CASE("MainWindow: starts with the default time-sig preset (Reel 4/4)",
           "[main-window][gui][integration]") {
     // Regression for a smoke-test finding: the staff's tune-type
