@@ -8,10 +8,15 @@
 
 #include "audio/Player.h"
 #include "qt_test_app.h"
+#include "score/BarlineModel.h"
 #include "ui/MainWindow.h"
+#include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 
+#include <QComboBox>
+#include <QPushButton>
 #include <QSignalSpy>
+#include <QSlider>
 #include <QString>
 #include <QTest>
 
@@ -27,6 +32,7 @@
 
 using fiddler::test::qtApp;
 using fiddler::ui::MainWindow;
+using fiddler::ui::StaffWidget;
 using fiddler::ui::WaveformWidget;
 
 namespace {
@@ -186,4 +192,158 @@ TEST_CASE("MainWindow: opening a second file replaces the first overview",
     REQUIRE(QTest::qWaitFor(
         [&]() { return waveform->overview() != nullptr; }, 5000));
     REQUIRE(waveform->overview() != firstOverview);
+}
+
+// ---------------------------------------------------------------------------
+// Full session flow — drives every testable user interaction in one
+// long test. Mirrors what an actual transcription session looks like.
+// ---------------------------------------------------------------------------
+//
+// What we *can* simulate headlessly:
+//   - file load (via the loadFile() seam — the OS file dialog isn't
+//     reachable from QTest)
+//   - tap-to-place ('B' key) and Ctrl+Z undo, with QShortcut routing
+//   - clicks on transport buttons, the waveform, the staff
+//   - keyboard input on focused widgets (Del, Esc, arrows)
+//   - QComboBox selection changes via setCurrentIndex + activated()
+//   - position-slider drag via QSlider::sliderMoved emission
+//   - window close
+//
+// What we *cannot* verify on a no-audio CI host:
+//   - actual audio playback (Player::play() is a no-op when there's
+//     no PortAudio output device — we click Play and verify the UI
+//     plumbing doesn't crash, not that sound came out)
+
+TEST_CASE("MainWindow: full simulated user session — open, tap, undo, "
+          "signature, click-seek, select+Del, slider-seek, close",
+          "[main-window][gui][integration][session]") {
+    qtApp();
+
+    // 1. Open the window and load the fixture WAV. We hold the
+    //    window via unique_ptr so step 9 (close) can drop it
+    //    deterministically inside the test rather than at scope-exit.
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    const QString fixturePath = QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->loadFile(fixturePath));
+
+    auto* waveform   = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff      = window->findChild<StaffWidget*>("staffWidget");
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    auto* posSlider  = window->findChild<QSlider*>("positionSlider");
+    auto* tuneCombo  = window->findChild<QComboBox*>("tuneTypeCombo");
+    REQUIRE(waveform   != nullptr);
+    REQUIRE(staff      != nullptr);
+    REQUIRE(playButton != nullptr);
+    REQUIRE(stopButton != nullptr);
+    REQUIRE(posSlider  != nullptr);
+    REQUIRE(tuneCombo  != nullptr);
+
+    // 2. Wait for the async overview build.
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    const auto durationMs = window->player().duration().count();
+    REQUIRE(durationMs > 0);
+    REQUIRE(staff->durationMs() == durationMs);
+    REQUIRE(window->barlineModel().empty());
+
+    // 3. Click Play, then immediately click Stop. On a dev machine
+    //    with a real audio device, Play actually starts playback —
+    //    so by the time we get to step 4 the player position would
+    //    have drifted past zero. Stop rewinds deterministically to
+    //    0 on any host (audio or not), giving us a known-good
+    //    starting position for tap-to-place.
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+    REQUIRE(window->player().position().count() == 0);
+
+    // 4. Tap-to-place. Send 'B'; the WindowShortcut on MainWindow
+    //    intercepts the key before any focused child widget sees it,
+    //    so the focused widget doesn't matter. The model receives
+    //    add(player.position()) — which is 0 right now.
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->barlineModel().barlines()[0] == 0);
+
+    // 5. Drag the position slider to mid-file, then tap B again.
+    //    sliderMoved → onSeek → player.seek(target) — and because
+    //    the player is Stopped, framesPlayed_ stays at 0, so
+    //    position() stays exactly at the seek target. Deterministic.
+    posSlider->setValue(static_cast<int>(durationMs / 2));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 2));
+    REQUIRE(window->player().position().count()
+            == durationMs / 2);
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 2);
+    REQUIRE(window->barlineModel().barlines()[0] == 0);
+    REQUIRE(window->barlineModel().barlines()[1] == durationMs / 2);
+
+    // 6. Ctrl+Z undoes the most recent placement (the mid-file one).
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->barlineModel().barlines()[0] == 0);
+
+    // Place a quarter-way barline so we have two for the
+    // selection-mirror + Del tests below.
+    posSlider->setValue(static_cast<int>(durationMs / 4));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 4));
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 2);
+
+    // 6. Pick a different time signature via the combo. activated()
+    //    is the right signal — currentIndexChanged would also fire
+    //    on programmatic setCurrentIndex calls, but emitting
+    //    activated explicitly mimics a real user pick.
+    const int jigIndex = tuneCombo->findText("Single Jig (6/8)");
+    REQUIRE(jigIndex >= 0);
+    tuneCombo->setCurrentIndex(jigIndex);
+    emit tuneCombo->activated(jigIndex);
+    REQUIRE(window->barlineModel().timeSignature().numerator   == 6);
+    REQUIRE(window->barlineModel().timeSignature().denominator == 8);
+    REQUIRE(window->barlineModel().timeSignature().tuneType    == "Single Jig");
+
+    // 7. Click on the waveform near the second (last) barline tick →
+    //    it should select + seek, and the staff's selection should
+    //    mirror. We pick the trailing barline on purpose so that the
+    //    Del in step 8 invalidates the index (size==1 → 0 is valid;
+    //    selecting trailing index 1 means removing it leaves index
+    //    1 out of range, which the widget's contract clears).
+    waveform->resize(1000, 100);
+    staff->resize(1000,    80);
+    const int xOfTrailingBar =
+        waveform->msToX(durationMs / 4);   // index 1 in [0, durationMs/4]
+    QTest::mouseClick(waveform, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xOfTrailingBar + 1, 50));
+    REQUIRE(waveform->selectedBarline() == 1);
+    REQUIRE(staff->selectedBarline()    == 1);   // mirror landed
+
+    // 8. Press Del while the staff has focus → barline removed,
+    //    selection cleared in both views (index 1 is now out of range).
+    staff->setFocus();
+    QTest::keyClick(staff, Qt::Key_Delete);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->barlineModel().barlines()[0] == 0);
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+    REQUIRE_FALSE(staff->selectedBarline().has_value());
+
+    // 9. Drag the position slider — the player should follow.
+    const int dragTargetMs = static_cast<int>(durationMs * 3 / 4);
+    posSlider->setValue(dragTargetMs);
+    emit posSlider->sliderMoved(dragTargetMs);
+    REQUIRE(window->player().position().count() >= dragTargetMs - 10);
+    REQUIRE(window->player().position().count() <= dragTargetMs + 10);
+
+    // 10. Click Stop — position rewinds, transport state goes back
+    //     to Stopped. Stop is null-safe even on no-audio hosts.
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+    REQUIRE(window->player().position().count() == 0);
+
+    // 11. Close the window. unique_ptr's reset() runs the destructor
+    //     synchronously; if anything were leaking or double-deleting,
+    //     this is where we'd find out.
+    window->close();
+    window.reset();
+    SUCCEED();
 }
