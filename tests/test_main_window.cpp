@@ -117,6 +117,22 @@ TEST_CASE("MainWindow: load fails gracefully on a non-existent file",
     REQUIRE_FALSE(w.loadFile("/no/such/file.wav"));
 }
 
+TEST_CASE("MainWindow: starts with the default time-sig preset (Reel 4/4)",
+          "[main-window][gui][integration]") {
+    // Regression for a smoke-test finding: the staff's tune-type
+    // label was blank on first launch because the combo's initial
+    // index 0 wasn't synced to the model. The model should always
+    // carry a populated tuneType so the staff has something to draw
+    // above the time-signature digits, even before the user picks
+    // from the combo or opens a file.
+    qtApp();
+    MainWindow w;
+    const auto ts = w.barlineModel().timeSignature();
+    REQUIRE(ts.numerator   == 4);
+    REQUIRE(ts.denominator == 4);
+    REQUIRE(ts.tuneType    == "Reel");
+}
+
 // ---------------------------------------------------------------------------
 // Full pipeline: open → overview ready → click → player seeks
 // ---------------------------------------------------------------------------

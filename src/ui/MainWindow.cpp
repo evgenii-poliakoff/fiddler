@@ -79,6 +79,21 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , player_(std::make_unique<audio::Player>())
     , barlineModel_(std::make_shared<score::BarlineModel>()) {
+    // Initialise the model with the first preset (Reel 4/4) so the
+    // staff's tune-type label matches what the combo box shows on
+    // first launch. The combo defaults to index 0; without this
+    // sync, the model would carry an empty tuneType string and the
+    // staff would render the digits but not the "Reel" label above
+    // them — confusing for a user who hasn't yet touched the combo.
+    {
+        const auto& initial = kTuneTypePresets[0];
+        barlineModel_->setTimeSignature({
+            initial.numerator,
+            initial.denominator,
+            QString::fromUtf8(initial.tuneType),
+        });
+    }
+
     setWindowTitle("Fiddler");
     buildMenus();
     buildCentralWidget();
