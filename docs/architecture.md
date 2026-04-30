@@ -110,6 +110,84 @@ Considered alternatives:
 - An on-disk thumbnail cache was deferred; re-decoding on file open
   takes well under a second for typical Irish-trad recordings.
 
+### Score model: barlines + time signature
+
+`score::BarlineModel` is the shared data layer for everything the
+user annotates on top of the audio. For step 5 it holds two pieces:
+
+- a list of `int64_t` source-time anchors (barline positions), kept
+  sorted ascending and paired with an LIFO add-history so a single
+  `Ctrl+Z` peels the most recent placement;
+- a `TimeSignature` value (numerator, denominator, plus a `tuneType`
+  string label like `"Reel"` / `"Jig"`).
+
+Two design commitments worth recording, because both look unremarkable
+in passing but are load-bearing:
+
+- **`TimeSignature` is descriptive, not prescriptive.** It labels what
+  the user thinks the tune is in; it never generates or constrains
+  barline positions. Each bar's length is just
+  `barlines[i+1] - barlines[i]` — whatever the recording happens to
+  give you. That's what lets the model handle non-uniform recording
+  speed (rubato) and crooked tunes (irregular bar lengths or counts
+  in a section) honestly. A future auto-suggestion advisor will
+  *propose* positions for the user to confirm; it must never write to
+  the model directly.
+- **Barline placement is keyboard-tap-driven, not click-driven.** The
+  primary gesture is `B` to place a bar at `Player::position()` —
+  the workflow that matches how an ear-oriented player actually
+  marks bars (slow the tempo, tap on each downbeat). Click on the
+  waveform / staff is reserved for *seek*. Del removes the
+  currently-selected bar (newly-placed bars are auto-selected, so
+  "tap B, press Del" works without an intermediate click);
+  `Ctrl+Z` peels the most-recent placement.
+
+The model is a `QObject` so widgets can observe `changed()` and
+repaint, but it owns no widget references and pulls no UI types
+beyond `QString` for the tune-type label.
+
+### Time-signature picker: tradition-named, technical-form deferred
+
+The combo box surfaces ten Irish-trad presets — Reel (4/4), Hornpipe
+(4/4), Polka (2/4), March (2/4), Single Jig (6/8), Double Jig (6/8),
+Slip Jig (9/8), Slide (12/8), Waltz (3/4), Mazurka (3/4) — picking
+one pushes a complete `TimeSignature` (numerator + denominator +
+label) into the model. The label rides through to step 7's MusicXML
+/ ABC export so genre survives the round-trip.
+
+Free-meter Airs and explicit numerator/denominator entry are
+reachable in the model but don't yet have a UI; they're a follow-on
+once we have a feel for how the preset path performs in real
+transcription. See `memory/project_handbook_for_self_taught.md` for
+why traditional names lead the picker rather than bare technical form.
+
+### Score widgets: WaveformWidget overlay + StaffWidget
+
+Both widgets observe the same `BarlineModel` (held as
+`shared_ptr<const BarlineModel>`) and the same source-time axis, so
+their barline ticks line up 1:1 horizontally. Each widget is small,
+self-contained, and emits a narrow set of signals
+(`seekRequested`, `barlineSelectionChanged`, `barlineDeleteRequested`)
+that MainWindow turns into model mutations and seek calls. Selection
+is a per-widget UI state; MainWindow mirrors it across the two so the
+highlight always matches.
+
+Things deliberately not built in step 5 (deferred to a follow-on PR
+or a later step):
+
+- Markers (named timestamps for navigation) and practice loops —
+  separate concerns, separate models, separate UI. Will be the
+  next PR after step 5 lands.
+- Tap-latency compensation (subtracting ~150 ms from `player.position()`
+  at tap time to account for human reaction lag).
+- Drag-to-nudge a placed barline.
+- Auto-suggestion of bar positions.
+- Free-meter / Air / "Other..." entries in the time-sig picker.
+- A generic overlay-layer registration API. Step 5 paints barlines
+  directly inside each widget's `paintEvent` because we have one
+  concrete overlay; the abstraction can wait until markers + loops
+  + note ranges arrive and we know the real shape.
+
 ### Logging: spdlog (behind a facade)
 
 The application code never includes spdlog headers directly. All log
@@ -385,6 +463,12 @@ Synchronization primitives:
   the generation that was active when they were spawned and drop
   their result if it no longer matches when the queued post-back
   reaches the GUI thread.
+- `score::BarlineModel` — owned by MainWindow, observed by both
+  score widgets via `shared_ptr<const ...>`. All mutations happen on
+  the GUI thread; no cross-thread access. The `changed()` Qt signal
+  is the one synchronisation point — widgets connect to it and call
+  `update()`, which hops naturally onto the GUI thread's paint
+  queue.
 
 ## Logging
 
@@ -456,14 +540,17 @@ fiddler/
 ├── src/
 │   ├── main.cpp                    # CLI parsing + log init + Qt app
 │   ├── ui/
-│   │   ├── MainWindow.{h,cpp}      # transport + tempo + waveform
-│   │   └── WaveformWidget.{h,cpp}  # peaks + cursor + click-to-seek
+│   │   ├── MainWindow.{h,cpp}      # transport + tempo + tune-type picker
+│   │   ├── WaveformWidget.{h,cpp}  # peaks + cursor + barline overlay
+│   │   └── StaffWidget.{h,cpp}     # 5-line staff + time sig + barlines
 │   ├── audio/
 │   │   ├── Decoder.{h,cpp}         # FFmpeg wrapper, opaque interface
 │   │   ├── Stretcher.{h,cpp}       # Rubber Band wrapper (pImpl)
 │   │   ├── WaveformOverview.{h,cpp}# downsampled peak summary
 │   │   ├── Player.{h,cpp}          # PortAudio + decoder thread
 │   │   └── RingBuffer.h            # lock-free SPSC, header-only
+│   ├── score/
+│   │   └── BarlineModel.{h,cpp}    # barlines + time signature
 │   └── util/Log.{h,cpp}            # logging facade over spdlog
 └── tests/
     ├── CMakeLists.txt              # Catch2 v3 + Qt6::Test
@@ -505,7 +592,7 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 2** — Structured logging via spdlog facade with CLI flags.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. `Stretcher` (R3 engine) sits between the decoder and the ring buffer on the decoder thread; `Player::setTempoRatio()` is the GUI-visible knob. Position tracking uses the simple anchor model (Rule 8).
 - ✅ **Step 4** — Waveform view synchronised with playback position. `audio::WaveformOverview` (peak buckets keyed on source-time ms) is built on a detached worker thread on file open; `ui::WaveformWidget` paints peaks plus a cursor and emits `seekRequested(ms)` on click. Decoupled from `Player`; public `xToMs`/`msToX` so step 5's overlays plug in without restructuring.
-- 🔜 **Step 5** — Empty staff widget; user sets time signature and clicks to place barlines mapped to audio timestamps. `QGraphicsView`-based.
+- ✅ **Step 5** — Empty staff widget; user-placed barlines mapped to audio timestamps. `score::BarlineModel` is the shared data layer (descriptive `TimeSignature`, no uniformity enforcement — supports crooked tunes); `ui::StaffWidget` and `ui::WaveformWidget` both observe it. Tap-to-place is the primary gesture (`B`); `Ctrl+Z` undoes the last placement; `Del` removes the selected (auto-selected on tap) bar. Tradition-named time-signature picker; `QPainter` rather than `QGraphicsView` — see "Score widgets" above for the deferred features.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 

@@ -3,19 +3,24 @@
 #include "audio/Decoder.h"
 #include "audio/Player.h"
 #include "audio/WaveformOverview.h"
+#include "score/BarlineModel.h"
+#include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 #include "util/Log.h"
 
 #include <QAction>
 #include <QApplication>
+#include <QComboBox>
 #include <QFileDialog>
 #include <QHBoxLayout>
+#include <QKeySequence>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPointer>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStatusBar>
@@ -23,6 +28,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -31,24 +37,102 @@
 namespace fiddler::ui {
 
 namespace {
+
 // Bucket count is the overview's *internal* peak resolution. The
 // widget downsamples to its current pixel width on every paint, so a
 // fixed-and-generous 4096 covers any plausible window width without
 // rebuilding when the user resizes. 4096 buckets × 2 ch × 8 bytes ≈
 // 64 KB — trivial.
 constexpr std::size_t kOverviewBuckets = 4096;
+
+// Tradition-named time-signature presets, surfaced as the primary
+// picker for the user. The order is roughly "most common in Irish
+// trad first". When the user picks one, the entire TimeSignature
+// (numerator, denominator, tuneType label) is pushed into the model.
+//
+// Air and free-meter / crooked tunes are reachable in the model but
+// don't have a dedicated UI here yet — that's a deferred follow-on
+// (see project_handbook_for_self_taught.md and project_crooked_tunes.md).
+struct TuneTypePreset {
+    const char* label;        // user-visible: "Reel (4/4)"
+    const char* tuneType;     // metadata: "Reel"
+    int         numerator;
+    int         denominator;
+};
+
+constexpr std::array<TuneTypePreset, 10> kTuneTypePresets = {{
+    { "Reel (4/4)",       "Reel",        4, 4 },
+    { "Hornpipe (4/4)",   "Hornpipe",    4, 4 },
+    { "Polka (2/4)",      "Polka",       2, 4 },
+    { "March (2/4)",      "March",       2, 4 },
+    { "Single Jig (6/8)", "Single Jig",  6, 8 },
+    { "Double Jig (6/8)", "Double Jig",  6, 8 },
+    { "Slip Jig (9/8)",   "Slip Jig",    9, 8 },
+    { "Slide (12/8)",     "Slide",      12, 8 },
+    { "Waltz (3/4)",      "Waltz",       3, 4 },
+    { "Mazurka (3/4)",    "Mazurka",     3, 4 },
+}};
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , player_(std::make_unique<audio::Player>()) {
+    , player_(std::make_unique<audio::Player>())
+    , barlineModel_(std::make_shared<score::BarlineModel>()) {
+    // Initialise the model with the first preset (Reel 4/4) so the
+    // staff's tune-type label matches what the combo box shows on
+    // first launch. The combo defaults to index 0; without this
+    // sync, the model would carry an empty tuneType string and the
+    // staff would render the digits but not the "Reel" label above
+    // them — confusing for a user who hasn't yet touched the combo.
+    {
+        const auto& initial = kTuneTypePresets[0];
+        barlineModel_->setTimeSignature({
+            initial.numerator,
+            initial.denominator,
+            QString::fromUtf8(initial.tuneType),
+        });
+    }
+
     setWindowTitle("Fiddler");
     buildMenus();
     buildCentralWidget();
     statusBar()->showMessage("Ready");
+
+    // Tap-to-place: 'B' anywhere in the window adds a barline at the
+    // player's current source-time position. WindowShortcut context
+    // means it fires regardless of which child widget has focus, so
+    // the user can keep clicking around the waveform / staff and
+    // still tap-along.
+    tapBarShortcut_ = new QShortcut(QKeySequence(Qt::Key_B), this);
+    tapBarShortcut_->setContext(Qt::WindowShortcut);
+    connect(tapBarShortcut_, &QShortcut::activated,
+            this, &MainWindow::onTapBarline);
+
+    // Ctrl+Z: peel the most-recently-placed barline (LIFO undo).
+    undoShortcut_ = new QShortcut(QKeySequence::Undo, this);
+    undoShortcut_->setContext(Qt::WindowShortcut);
+    connect(undoShortcut_, &QShortcut::activated,
+            this, &MainWindow::onUndoLastBarline);
+
+    // Del: remove the currently-selected barline. We install this at
+    // window scope (not just on the score widgets) so the shortcut
+    // works regardless of which child has focus — e.g. right after
+    // tap-to-place, when focus is still on the transport button the
+    // user clicked. The score widgets' own Key_Delete handlers stay
+    // in place for the standalone-widget unit tests; in MainWindow
+    // context this shortcut intercepts the key first.
+    deleteBarShortcut_ = new QShortcut(QKeySequence(Qt::Key_Delete), this);
+    deleteBarShortcut_->setContext(Qt::WindowShortcut);
+    connect(deleteBarShortcut_, &QShortcut::activated,
+            this, &MainWindow::onDeleteSelectedBarline);
 }
 
 MainWindow::~MainWindow() = default;
+
+const score::BarlineModel& MainWindow::barlineModel() const noexcept {
+    return *barlineModel_;
+}
 
 void MainWindow::buildMenus() {
     openAction_ = new QAction(tr("&Open…"), this);
@@ -69,26 +153,71 @@ void MainWindow::buildCentralWidget() {
     statusLabel_ = new QLabel(tr("No file loaded."), central);
     layout->addWidget(statusLabel_);
 
+    // Transport row: Play / Stop buttons on the left, the tune-type
+    // picker on the right. Object names give integration tests a
+    // stable handle to find each widget without reaching into private
+    // state.
     auto* transport = new QHBoxLayout();
     playButton_ = new QPushButton(tr("Play"), central);
     stopButton_ = new QPushButton(tr("Stop"), central);
+    playButton_->setObjectName("playButton");
+    stopButton_->setObjectName("stopButton");
     playButton_->setEnabled(false);
     stopButton_->setEnabled(false);
     connect(playButton_, &QPushButton::clicked, this, &MainWindow::onPlayPause);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::onStop);
     transport->addWidget(playButton_);
     transport->addWidget(stopButton_);
+    transport->addSpacing(20);
+
+    auto* sigLabel = new QLabel(tr("Tune type:"), central);
+    transport->addWidget(sigLabel);
+    tuneTypeCombo_ = new QComboBox(central);
+    tuneTypeCombo_->setObjectName("tuneTypeCombo");
+    for (const auto& preset : kTuneTypePresets) {
+        tuneTypeCombo_->addItem(QString::fromUtf8(preset.label));
+    }
+    // Use `activated` (not `currentIndexChanged`) so programmatic
+    // changes from setCurrentIndex() don't loop back into the slot.
+    // We only react to actual user picks.
+    connect(tuneTypeCombo_, &QComboBox::activated,
+            this, &MainWindow::onTuneTypePresetChosen);
+    transport->addWidget(tuneTypeCombo_);
     transport->addStretch();
     layout->addLayout(transport);
 
+    // Waveform: the upper view. Stretches to fill the extra vertical
+    // space; barline ticks line up 1:1 with the staff below.
     waveform_ = new WaveformWidget(central);
+    waveform_->setObjectName("waveformWidget");
+    waveform_->setBarlineModel(barlineModel_);
     connect(waveform_, &WaveformWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 onSeek(static_cast<int>(ms));
             });
+    connect(waveform_, &WaveformWidget::barlineSelectionChanged,
+            this, &MainWindow::onWaveformSelectionChanged);
+    connect(waveform_, &WaveformWidget::barlineDeleteRequested,
+            this, &MainWindow::onBarlineDeleteRequested);
     layout->addWidget(waveform_, /*stretch=*/1);
 
+    // Staff: the lower view. Fixed-ish height (its sizeHint), shares
+    // the same BarlineModel and source-time axis as the waveform.
+    staff_ = new StaffWidget(central);
+    staff_->setObjectName("staffWidget");
+    staff_->setBarlineModel(barlineModel_);
+    connect(staff_, &StaffWidget::seekRequested,
+            this, [this](std::int64_t ms) {
+                onSeek(static_cast<int>(ms));
+            });
+    connect(staff_, &StaffWidget::barlineSelectionChanged,
+            this, &MainWindow::onStaffSelectionChanged);
+    connect(staff_, &StaffWidget::barlineDeleteRequested,
+            this, &MainWindow::onBarlineDeleteRequested);
+    layout->addWidget(staff_);
+
     positionSlider_ = new QSlider(Qt::Horizontal, central);
+    positionSlider_->setObjectName("positionSlider");
     positionSlider_->setRange(0, 0);
     positionSlider_->setEnabled(false);
     connect(positionSlider_, &QSlider::sliderMoved,
@@ -98,6 +227,7 @@ void MainWindow::buildCentralWidget() {
     auto* tempoRow = new QHBoxLayout();
     tempoLabel_ = new QLabel(tr("Tempo: 100%"), central);
     tempoSlider_ = new QSlider(Qt::Horizontal, central);
+    tempoSlider_->setObjectName("tempoSlider");
     tempoSlider_->setRange(25, 100);
     tempoSlider_->setValue(100);
     tempoSlider_->setEnabled(false);
@@ -165,6 +295,17 @@ bool MainWindow::loadFile(const QString& path) {
     // overview will arrive asynchronously below.
     waveform_->setOverview(nullptr);
     waveform_->setPositionMs(0);
+
+    // A new file means the previous file's barlines are no longer
+    // meaningful — drop them. Both widgets are observing the model
+    // and will repaint to empty automatically.
+    barlineModel_->clear();
+
+    // Tell the staff how long this file is (so its msToX mapping
+    // works). The waveform gets its duration via the WaveformOverview
+    // shared_ptr later.
+    staff_->setDurationMs(duration.count());
+    staff_->setPositionMs(0);
 
     statusLabel_->setText(tr("Loaded: %1  (%2 ms)%3")
         .arg(path)
@@ -242,6 +383,86 @@ void MainWindow::onTempoChanged(int percent) {
     player_->setTempoRatio(percent / 100.0);
 }
 
+// ---- score-related slots ------------------------------------------------
+
+void MainWindow::onTapBarline() {
+    // The 'B' key — primary barline-placement gesture. We capture
+    // the player's current source-time position and ask the model to
+    // record it. The model handles sorted insertion + duplicate
+    // rejection; both widgets receive `changed()` and repaint.
+    if (!player_ || !player_->duration().count()) return;
+    const auto inserted =
+        barlineModel_->add(player_->position().count());
+
+    // Auto-select the newly-placed barline. This makes "tap B, press
+    // Del" work as a symmetric pair — without auto-select, the user
+    // would have to first click the (1-pixel-wide) tick to select it
+    // before Del had anything to remove. The waveform's
+    // setSelectedBarline emits barlineSelectionChanged, which the
+    // mirror plumbing forwards to the staff.
+    if (inserted.has_value() && waveform_) {
+        waveform_->setSelectedBarline(inserted);
+    }
+}
+
+void MainWindow::onUndoLastBarline() {
+    // Ctrl+Z — peel the most-recently-added barline. The model
+    // returns false if the LIFO is empty; we just no-op in that case
+    // so an extra Ctrl+Z press doesn't do anything surprising.
+    barlineModel_->undoLastAdd();
+}
+
+void MainWindow::onTuneTypePresetChosen(int comboIndex) {
+    if (comboIndex < 0
+        || comboIndex >= static_cast<int>(kTuneTypePresets.size())) {
+        return;
+    }
+    const auto& preset = kTuneTypePresets[static_cast<std::size_t>(comboIndex)];
+    barlineModel_->setTimeSignature({
+        preset.numerator,
+        preset.denominator,
+        QString::fromUtf8(preset.tuneType),
+    });
+}
+
+void MainWindow::onWaveformSelectionChanged(
+    std::optional<std::size_t> index)
+{
+    // Mirror the waveform's selection onto the staff so both views
+    // show the same highlight. setSelectedBarline() is a no-op when
+    // the value is unchanged, so the round-trip
+    // staff -> onStaffSelectionChanged -> waveform
+    // doesn't loop forever.
+    if (staff_) staff_->setSelectedBarline(index);
+}
+
+void MainWindow::onStaffSelectionChanged(
+    std::optional<std::size_t> index)
+{
+    if (waveform_) waveform_->setSelectedBarline(index);
+}
+
+void MainWindow::onBarlineDeleteRequested(std::size_t index) {
+    // Either widget can fire this (via its Del-key handler). Both
+    // route through the same slot — the model is the single source
+    // of truth, and its `changed()` signal will repaint both views.
+    barlineModel_->removeAt(index);
+}
+
+void MainWindow::onDeleteSelectedBarline() {
+    // Window-level Del shortcut. Looks up the currently-selected
+    // barline (the waveform and staff stay in sync via the mirror
+    // plumbing, so reading either is fine) and removes it from the
+    // model. With no current selection this is a quiet no-op — the
+    // user can tap B to add a new one, click on a tick to select an
+    // existing one, or Ctrl+Z to peel the most-recent placement.
+    if (!waveform_) return;
+    const auto sel = waveform_->selectedBarline();
+    if (sel.has_value()) {
+        barlineModel_->removeAt(*sel);
+    }
+}
+
 void MainWindow::updatePosition() {
     if (!player_) return;
     const auto pos = player_->position();
@@ -251,6 +472,9 @@ void MainWindow::updatePosition() {
     }
     if (waveform_) {
         waveform_->setPositionMs(pos.count());
+    }
+    if (staff_) {
+        staff_->setPositionMs(pos.count());
     }
     // Auto-pause when we reach the end.
     if (player_->state() == audio::TransportState::Playing
