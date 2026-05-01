@@ -48,6 +48,13 @@ public:
     // actually reach the model.
     [[nodiscard]] const score::BarlineModel& barlineModel() const noexcept;
 
+protected:
+    // MEMO: closeEvent is overridden purely to emit a `[ui.file] close`
+    // log line — when the user closes the window we want the log to
+    // record the boundary of the session, so a later log-replay test
+    // knows the scenario ends here.
+    void closeEvent(QCloseEvent* event) override;
+
 private slots:
     void onOpenFile();
     void onPlayPause();
@@ -116,6 +123,21 @@ private:
     // parent-child destruction order doesn't quite line up with
     // member destruction here).
     std::shared_ptr<score::BarlineModel> barlineModel_;
+
+    // MEMO: invariant — selection mirrors are one-shot, not loops.
+    // The waveform and staff each emit barlineSelectionChanged when
+    // their selection changes; MainWindow forwards each event to the
+    // *other* widget. Without a guard, "user clicks waveform" would
+    // bounce: waveform→staff→waveform→staff…  The setSelectedBarline
+    // no-op-on-equal short-circuits the loop after one round trip,
+    // but we still see the second emission and would log "select via
+    // staff" for what was actually a "select via waveform" event.
+    // mirroringSelection_ is set true while we're propagating from
+    // one widget to the other; the receiving slot returns early when
+    // it sees the flag, so only the *originating* slot logs and
+    // forwards. Reset to false in the originating slot's outer scope
+    // after the forwarding call returns.
+    bool mirroringSelection_ = false;
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't

@@ -10,6 +10,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QFileDialog>
 #include <QHBoxLayout>
@@ -193,6 +194,12 @@ void MainWindow::buildCentralWidget() {
     waveform_->setBarlineModel(barlineModel_);
     connect(waveform_, &WaveformWidget::seekRequested,
             this, [this](std::int64_t ms) {
+                // MEMO: log includes the source ("waveform-click")
+                // because onSeek() is a primitive shared by three
+                // sources (waveform, staff, position-slider) and the
+                // log is the only place that distinguishes them.
+                FLOG_DEBUG("ui.score",
+                           "seek ms={} via=waveform-click", ms);
                 onSeek(static_cast<int>(ms));
             });
     connect(waveform_, &WaveformWidget::barlineSelectionChanged,
@@ -208,6 +215,8 @@ void MainWindow::buildCentralWidget() {
     staff_->setBarlineModel(barlineModel_);
     connect(staff_, &StaffWidget::seekRequested,
             this, [this](std::int64_t ms) {
+                FLOG_DEBUG("ui.score",
+                           "seek ms={} via=staff-click", ms);
                 onSeek(static_cast<int>(ms));
             });
     connect(staff_, &StaffWidget::barlineSelectionChanged,
@@ -221,7 +230,16 @@ void MainWindow::buildCentralWidget() {
     positionSlider_->setRange(0, 0);
     positionSlider_->setEnabled(false);
     connect(positionSlider_, &QSlider::sliderMoved,
-            this, &MainWindow::onSeek);
+            this, [this](int ms) {
+                // MEMO: sliderMoved (not valueChanged) only fires
+                // for user-driven motion, so this lambda doesn't log
+                // for programmatic setValue calls during
+                // updatePosition(). That's the right behaviour —
+                // those programmatic updates are not user actions.
+                FLOG_DEBUG("ui.transport",
+                           "seek ms={} via=position-slider", ms);
+                onSeek(ms);
+            });
     layout->addWidget(positionSlider_);
 
     auto* tempoRow = new QHBoxLayout();
@@ -249,11 +267,12 @@ void MainWindow::onOpenFile() {
         {},
         tr("Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus);;All files (*)"));
     if (path.isEmpty()) {
-        FLOG_DEBUG("ui", "open dialog cancelled");
+        // MEMO: ui-event log — user dismissed the file dialog.
+        // See feedback_logs_drive_tests.md for the contract.
+        FLOG_DEBUG("ui.file", "open: cancelled");
         return;
     }
 
-    FLOG_DEBUG("ui", "user selected {}", path.toStdString());
     if (!loadFile(path)) {
         QMessageBox::warning(this, tr("Open failed"),
             tr("Could not open: %1").arg(path));
@@ -262,12 +281,16 @@ void MainWindow::onOpenFile() {
 
 bool MainWindow::loadFile(const QString& path) {
     if (!player_->load(path.toStdString())) {
+        FLOG_DEBUG("ui.file", "open: failed path={}", path.toStdString());
         statusLabel_->setText(tr("No file loaded."));
         return false;
     }
 
     const auto duration = player_->duration();
     const bool hasAudio = player_->hasAudioOutput();
+    FLOG_DEBUG("ui.file",
+               "open: path={} duration={} ms audio={}",
+               path.toStdString(), duration.count(), hasAudio);
     {
         QSignalBlocker block(positionSlider_);
         positionSlider_->setRange(0, static_cast<int>(duration.count()));
@@ -356,11 +379,16 @@ bool MainWindow::loadFile(const QString& path) {
 void MainWindow::onPlayPause() {
     if (!player_) return;
     if (player_->state() == audio::TransportState::Playing) {
+        const auto pos = player_->position().count();
         player_->pause();
         playButton_->setText(tr("Play"));
+        FLOG_DEBUG("ui.transport", "pause at={} ms", pos);
     } else {
+        const auto pos = player_->position().count();
         player_->play();
         playButton_->setText(tr("Pause"));
+        FLOG_DEBUG("ui.transport",
+                   "play from={} ms audio={}", pos, player_->hasAudioOutput());
     }
 }
 
@@ -370,9 +398,15 @@ void MainWindow::onStop() {
     playButton_->setText(tr("Play"));
     QSignalBlocker block(positionSlider_);
     positionSlider_->setValue(0);
+    FLOG_DEBUG("ui.transport", "stop rewind=0");
 }
 
 void MainWindow::onSeek(int positionMs) {
+    // MEMO: this is a primitive called by three different UI sources
+    // (waveform-click, staff-click, position-slider drag); the
+    // *source* is logged at the call site so each source's log line
+    // is distinct ("seek via waveform" vs "seek via slider"). Adding
+    // a log here would either duplicate or lose source information.
     if (!player_) return;
     player_->seek(std::chrono::milliseconds{positionMs});
 }
@@ -381,6 +415,13 @@ void MainWindow::onTempoChanged(int percent) {
     if (!player_) return;
     tempoLabel_->setText(tr("Tempo: %1%").arg(percent));
     player_->setTempoRatio(percent / 100.0);
+    // MEMO: every value step during a drag emits one debug line.
+    // Verbose for slow drags (~75 lines for a 100→25 sweep), but the
+    // log is meant to reproduce the user's path — a debounce would
+    // hide the intermediate seeks the user actually heard. Filter
+    // with `--log-filter='!ui.tempo'` if it gets in the way.
+    FLOG_DEBUG("ui.tempo", "tempo={}% ratio={:.4f}",
+               percent, percent / 100.0);
 }
 
 // ---- score-related slots ------------------------------------------------
@@ -391,17 +432,41 @@ void MainWindow::onTapBarline() {
     // record it. The model handles sorted insertion + duplicate
     // rejection; both widgets receive `changed()` and repaint.
     if (!player_ || !player_->duration().count()) return;
-    const auto inserted =
-        barlineModel_->add(player_->position().count());
+    const auto pos        = player_->position().count();
+    const auto sizeBefore = barlineModel_->size();
+    const auto inserted   = barlineModel_->add(pos);
+
+    // MEMO: BarlineModel::add returns the existing index on
+    // duplicates (not nullopt), so `inserted.has_value()` alone
+    // doesn't distinguish "really inserted" from "duplicate-rejected".
+    // We compare size before/after to tell them apart. A future API
+    // cleanup could change BarlineModel::add to return nullopt on
+    // duplicate; until then we work around here. The relevant unit
+    // test is "BarlineModel: add at an existing ms is rejected
+    // silently" — that test pins the current contract.
+    const bool actuallyAdded =
+        inserted.has_value() && barlineModel_->size() > sizeBefore;
 
     // Auto-select the newly-placed barline. This makes "tap B, press
     // Del" work as a symmetric pair — without auto-select, the user
     // would have to first click the (1-pixel-wide) tick to select it
     // before Del had anything to remove. The waveform's
     // setSelectedBarline emits barlineSelectionChanged, which the
-    // mirror plumbing forwards to the staff.
-    if (inserted.has_value() && waveform_) {
+    // mirror plumbing forwards to the staff. We only re-select on a
+    // genuine insert; for a duplicate the existing bar is already
+    // there and was likely already selected.
+    if (actuallyAdded && waveform_) {
         waveform_->setSelectedBarline(inserted);
+    }
+
+    if (actuallyAdded) {
+        FLOG_DEBUG("ui.score",
+                   "tap-place ms={} index={} size={} sel={}",
+                   pos, *inserted, barlineModel_->size(), *inserted);
+    } else {
+        FLOG_DEBUG("ui.score",
+                   "tap-place ms={} ignored (duplicate) size={}",
+                   pos, barlineModel_->size());
     }
 }
 
@@ -409,7 +474,12 @@ void MainWindow::onUndoLastBarline() {
     // Ctrl+Z — peel the most-recently-added barline. The model
     // returns false if the LIFO is empty; we just no-op in that case
     // so an extra Ctrl+Z press doesn't do anything surprising.
-    barlineModel_->undoLastAdd();
+    const auto removed = barlineModel_->undoLastAdd();
+    if (removed) {
+        FLOG_DEBUG("ui.score", "undo-last size={}", barlineModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "undo-last empty (no-op)");
+    }
 }
 
 void MainWindow::onTuneTypePresetChosen(int comboIndex) {
@@ -423,30 +493,56 @@ void MainWindow::onTuneTypePresetChosen(int comboIndex) {
         preset.denominator,
         QString::fromUtf8(preset.tuneType),
     });
+    FLOG_DEBUG("ui.score",
+               "time-sig label={} numerator={} denominator={}",
+               preset.tuneType, preset.numerator, preset.denominator);
 }
 
 void MainWindow::onWaveformSelectionChanged(
     std::optional<std::size_t> index)
 {
-    // Mirror the waveform's selection onto the staff so both views
-    // show the same highlight. setSelectedBarline() is a no-op when
-    // the value is unchanged, so the round-trip
-    // staff -> onStaffSelectionChanged -> waveform
-    // doesn't loop forever.
+    // MEMO: see the mirroringSelection_ comment in MainWindow.h —
+    // we early-return when called in response to our own forward,
+    // so only the *originating* slot logs and propagates.
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
     if (staff_) staff_->setSelectedBarline(index);
+    mirroringSelection_ = false;
+
+    if (index.has_value()) {
+        FLOG_DEBUG("ui.score", "select index={} via=waveform size={}",
+                   *index, barlineModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select cleared via=waveform size={}",
+                   barlineModel_->size());
+    }
 }
 
 void MainWindow::onStaffSelectionChanged(
     std::optional<std::size_t> index)
 {
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
     if (waveform_) waveform_->setSelectedBarline(index);
+    mirroringSelection_ = false;
+
+    if (index.has_value()) {
+        FLOG_DEBUG("ui.score", "select index={} via=staff size={}",
+                   *index, barlineModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select cleared via=staff size={}",
+                   barlineModel_->size());
+    }
 }
 
 void MainWindow::onBarlineDeleteRequested(std::size_t index) {
-    // Either widget can fire this (via its Del-key handler). Both
-    // route through the same slot — the model is the single source
-    // of truth, and its `changed()` signal will repaint both views.
+    // Either widget can fire this (via its Del-key handler) when it
+    // has focus. Both route through the same slot — the model is
+    // the single source of truth, and its `changed()` signal will
+    // repaint both views.
     barlineModel_->removeAt(index);
+    FLOG_DEBUG("ui.score", "delete index={} via=widget-key size={}",
+               index, barlineModel_->size());
 }
 
 void MainWindow::onDeleteSelectedBarline() {
@@ -459,7 +555,13 @@ void MainWindow::onDeleteSelectedBarline() {
     if (!waveform_) return;
     const auto sel = waveform_->selectedBarline();
     if (sel.has_value()) {
-        barlineModel_->removeAt(*sel);
+        const auto idx = *sel;
+        barlineModel_->removeAt(idx);
+        FLOG_DEBUG("ui.score",
+                   "delete index={} via=window-shortcut size={}",
+                   idx, barlineModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "delete via=window-shortcut no-selection");
     }
 }
 
@@ -482,7 +584,13 @@ void MainWindow::updatePosition() {
         && pos >= player_->duration()) {
         player_->pause();
         playButton_->setText(tr("Play"));
+        FLOG_DEBUG("ui.transport", "auto-pause at-end ms={}", pos.count());
     }
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    FLOG_DEBUG("ui.file", "close");
+    QMainWindow::closeEvent(event);
 }
 
 } // namespace fiddler::ui

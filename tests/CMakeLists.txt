@@ -5,6 +5,7 @@ add_executable(fiddler_tests
     test_decoder.cpp
     test_decoder_synthetic.cpp
     test_decoder_corpus.cpp
+    test_event_logging.cpp
     test_log.cpp
     test_main_window.cpp
     test_ringbuffer.cpp
@@ -14,6 +15,8 @@ add_executable(fiddler_tests
     test_waveform_widget.cpp
     qt_test_app.cpp
     qt_test_app.h
+    wav_fixture.cpp
+    wav_fixture.h
 )
 
 target_include_directories(fiddler_tests PRIVATE
