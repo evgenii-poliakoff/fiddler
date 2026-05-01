@@ -17,6 +17,8 @@ add_executable(fiddler
     audio/WaveformOverview.h
     score/BarlineModel.cpp
     score/BarlineModel.h
+    score/MarkerModel.cpp
+    score/MarkerModel.h
     util/Log.cpp
     util/Log.h
 )
