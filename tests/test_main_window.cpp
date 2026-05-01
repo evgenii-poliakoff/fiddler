@@ -12,6 +12,7 @@
 #include "ui/MainWindow.h"
 #include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
+#include "wav_fixture.h"
 
 #include <QComboBox>
 #include <QPushButton>
@@ -23,88 +24,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <numbers>
 
+using fiddler::test::fixtureWav;
 using fiddler::test::qtApp;
 using fiddler::ui::MainWindow;
 using fiddler::ui::StaffWidget;
 using fiddler::ui::WaveformWidget;
-
-namespace {
-
-namespace fs = std::filesystem;
-
-// Write a minimal RIFF/WAVE file (16-bit PCM, little-endian) at
-// `path`. Content is a 440 Hz sine wave on every channel.
-void writeSineWav(const fs::path& path,
-                  double durationSec,
-                  int    sampleRate,
-                  int    channels) {
-    std::ofstream f(path, std::ios::binary);
-    const auto put32 = [&](std::uint32_t v) {
-        unsigned char b[4]{
-            static_cast<unsigned char>(v),
-            static_cast<unsigned char>(v >> 8),
-            static_cast<unsigned char>(v >> 16),
-            static_cast<unsigned char>(v >> 24)};
-        f.write(reinterpret_cast<const char*>(b), 4);
-    };
-    const auto put16 = [&](std::uint16_t v) {
-        unsigned char b[2]{
-            static_cast<unsigned char>(v),
-            static_cast<unsigned char>(v >> 8)};
-        f.write(reinterpret_cast<const char*>(b), 2);
-    };
-
-    const auto frames     = static_cast<std::uint32_t>(durationSec * sampleRate);
-    const auto byteRate   = static_cast<std::uint32_t>(sampleRate * channels * 2);
-    const auto blockAlign = static_cast<std::uint16_t>(channels * 2);
-    const auto dataBytes  = frames * channels * 2;
-
-    f.write("RIFF", 4);
-    put32(36u + dataBytes);
-    f.write("WAVE", 4);
-    f.write("fmt ", 4);
-    put32(16u);
-    put16(1);                 // PCM
-    put16(static_cast<std::uint16_t>(channels));
-    put32(static_cast<std::uint32_t>(sampleRate));
-    put32(byteRate);
-    put16(blockAlign);
-    put16(16);                // bits/sample
-    f.write("data", 4);
-    put32(dataBytes);
-
-    for (std::uint32_t n = 0; n < frames; ++n) {
-        const double t = static_cast<double>(n) / sampleRate;
-        const auto s = static_cast<std::int16_t>(
-            std::sin(2.0 * std::numbers::pi * 440.0 * t) * 16384);
-        for (int c = 0; c < channels; ++c) put16(static_cast<std::uint16_t>(s));
-    }
-}
-
-// Lazy-built fixture path so a single sine WAV is shared across the
-// integration tests in this TU.
-const fs::path& fixtureWav() {
-    static const fs::path p = [] {
-        const auto dir = fs::temp_directory_path() / "fiddler-tests";
-        fs::create_directories(dir);
-        const auto path = dir / "fixture-sine-2s.wav";
-        if (!fs::exists(path)) {
-            writeSineWav(path, /*durationSec=*/2.0,
-                         /*sampleRate=*/44100, /*channels=*/2);
-        }
-        return path;
-    }();
-    return p;
-}
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // Failure mode

@@ -98,6 +98,25 @@ FIDDLER_LOG_LEVEL=trace ./build/src/fiddler
 See [`docs/architecture.md`](docs/architecture.md#logging) for levels,
 categories, and the realtime-callback rule.
 
+## Reporting a UI bug
+
+If something goes wrong in the UI, please re-run with the structured
+event log enabled and attach the resulting file:
+
+```bash
+./build/src/fiddler \
+    --log-level=debug \
+    --log-filter='ui.*,player,waveform,score' \
+    --log-file=/tmp/fiddler.log
+```
+
+Every user-driven action (file open, play, pause, seek, tempo change,
+tap-to-place, undo, select, delete, time-signature pick, close) emits
+one line capturing the verb, the parameters, and the resulting model
+state. The full workflow — including how each fix lands as a
+regression test that replays the same log sequence — is in
+[`docs/debugging.md`](docs/debugging.md).
+
 ## License
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
