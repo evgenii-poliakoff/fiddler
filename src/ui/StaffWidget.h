@@ -35,7 +35,10 @@ class QMouseEvent;
 class QPaintEvent;
 class QPainter;
 
-namespace fiddler::score { class BarlineModel; }
+namespace fiddler::score {
+class BarlineModel;
+class MarkerModel;
+}
 
 namespace fiddler::ui {
 
@@ -59,9 +62,19 @@ public:
     [[nodiscard]] std::shared_ptr<const score::BarlineModel>
         barlineModel() const noexcept { return barlineModel_; }
 
+    // Marker overlay — same shape as WaveformWidget's. Selection is
+    // by stable ID (because setPosition can reorder), and is mutually
+    // exclusive with barline selection (the project viewer needs a
+    // single "selected artifact" concept).
+    void setMarkerModel(std::shared_ptr<const score::MarkerModel> model);
+    [[nodiscard]] std::shared_ptr<const score::MarkerModel>
+        markerModel() const noexcept { return markerModel_; }
+
     [[nodiscard]] std::int64_t positionMs() const noexcept { return positionMs_; }
     [[nodiscard]] std::optional<std::size_t>
         selectedBarline() const noexcept { return selectedBarline_; }
+    [[nodiscard]] std::optional<std::int64_t>
+        selectedMarkerId() const noexcept { return selectedMarkerId_; }
 
     // Coordinate transforms — public so other code can map between
     // pixel columns and source-time milliseconds without
@@ -75,28 +88,27 @@ public:
 
 public slots:
     void setPositionMs(std::int64_t ms);
-    // Programmatic selection setter. MainWindow uses this to keep
-    // the waveform and staff showing the same selected barline —
-    // when the user clicks a bar in the waveform, MainWindow forwards
-    // that index to the staff via this method, and vice versa.
+    // Programmatic selection setters. MainWindow uses these to keep
+    // the waveform and staff (and dock) showing the same selected
+    // artifact. MEMO: setting one kind clears the other (mutual
+    // exclusion).
     void setSelectedBarline(std::optional<std::size_t> index);
+    void setSelectedMarkerId(std::optional<std::int64_t> id);
 
 signals:
     // Fires on left-click. The argument is the source-time the user
-    // clicked (or the exact ms of a clicked-on barline, see the .cpp
-    // for the click-to-select details). MainWindow wires this to
-    // Player::seek().
+    // clicked (or the exact ms of a clicked-on artifact). MainWindow
+    // wires this to Player::seek().
     void seekRequested(std::int64_t ms);
 
-    // Fires when the widget's selection state changes — by click,
-    // arrow-key navigation, Esc, or because the model invalidated
-    // the previous selection. MainWindow mirrors the value to the
-    // sibling WaveformWidget so both views show the same highlight.
+    // Selection state changes — by click, arrow-key, Esc, or model
+    // invalidation. MainWindow mirrors the value to siblings.
     void barlineSelectionChanged(std::optional<std::size_t> index);
+    void markerSelectionChanged (std::optional<std::int64_t> id);
 
-    // Fires when the user presses Del while a barline is selected.
-    // MainWindow turns this into a BarlineModel::removeAt() call.
+    // User pressed Del while an artifact was selected.
     void barlineDeleteRequested(std::size_t index);
+    void markerDeleteRequested (std::int64_t id);
 
 protected:
     void paintEvent(QPaintEvent* event)        override;
@@ -104,9 +116,8 @@ protected:
     void keyPressEvent(QKeyEvent* event)       override;
 
 private:
-    // Slot connected to BarlineModel::changed in setBarlineModel().
-    // Invalidates a now-out-of-range selection and triggers a repaint.
     void onBarlineModelChanged();
+    void onMarkerModelChanged();
 
     // paintEvent's work is split into one helper per visual concern.
     // Each helper assumes `painter` is already targeting this widget
@@ -114,6 +125,7 @@ private:
     void paintStaffLines(QPainter& painter)    const;
     void paintTimeSignature(QPainter& painter) const;
     void paintBarlines(QPainter& painter)      const;
+    void paintMarkers(QPainter& painter)       const;
     void paintCursor(QPainter& painter)        const;
 
     // Pixel y-coordinates of the top and bottom staff lines.
@@ -121,9 +133,11 @@ private:
     [[nodiscard]] int staffBottomY() const noexcept;
 
     std::shared_ptr<const score::BarlineModel> barlineModel_;
+    std::shared_ptr<const score::MarkerModel>  markerModel_;
     std::int64_t                               durationMs_      = 0;
     std::int64_t                               positionMs_      = 0;
     std::optional<std::size_t>                 selectedBarline_;
+    std::optional<std::int64_t>                selectedMarkerId_;
 };
 
 } // namespace fiddler::ui

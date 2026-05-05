@@ -188,14 +188,29 @@ TEST_CASE("ui.file: successful loadFile logs path + duration + audio flag",
     (void)QTest::qWaitForWindowExposed(window.get());
     REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
 
-    // MEMO: the substrings pinned here are the load-bearing fields —
-    // path (so the log can identify which file), duration (so a
-    // log-replay test knows the file's length), and the audio flag
-    // (so we know whether playback was usable).
+    // MEMO: load-bearing fields pinned here — path (so the log can
+    // identify which file), duration (so a log-replay test knows the
+    // file's length), audio flag (so we know whether playback was
+    // usable).
     const auto entries = logs.snapshot();
     REQUIRE(containsLog(entries, "ui.file", "open:"));
     REQUIRE(containsLog(entries, "ui.file", "duration="));
     REQUIRE(containsLog(entries, "ui.file", "audio="));
+
+    // MEMO: load-bearing — wait for the detached overview-build
+    // thread to finish before the test exits. Without this wait the
+    // thread is still running when the test process tears down: most
+    // of the time that's harmless, but sometimes the thread is
+    // mid-invokeMethod against `qApp` exactly as qApp is being
+    // destroyed, and the process segfaults during teardown rather
+    // than completing cleanly. (Other tests that exercise loadFile
+    // wait for the overview as part of their assertions, so this
+    // race only ever bit the one log-line test that didn't.)
+    auto* waveform =
+        window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(waveform != nullptr);
+    (void)QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000);
 }
 
 TEST_CASE("ui.file: failed loadFile logs path",
