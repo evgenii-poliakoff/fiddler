@@ -2,6 +2,8 @@ add_executable(fiddler
     main.cpp
     ui/MainWindow.cpp
     ui/MainWindow.h
+    ui/ProjectViewerDock.cpp
+    ui/ProjectViewerDock.h
     ui/StaffWidget.cpp
     ui/StaffWidget.h
     ui/WaveformWidget.cpp
