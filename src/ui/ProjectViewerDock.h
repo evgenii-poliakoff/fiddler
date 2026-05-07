@@ -96,7 +96,12 @@ private slots:
     // updatingPropertyPage_ guard suppresses re-emit when *we* set
     // the field values from the model (not when the user types).
     void onNameEdited();
-    void onPositionEdited(int newMs);
+    // MEMO: takes no `newMs` because we read the spinbox's value()
+    // directly. We bind to editingFinished (not valueChanged) so
+    // the user can type leading zeros while editing without each
+    // keystroke round-tripping through the model and stripping
+    // them. See the slot impl for the full reasoning.
+    void onPositionEdited();
 
 private:
     void buildUi();

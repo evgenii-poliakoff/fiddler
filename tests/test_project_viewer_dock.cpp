@@ -217,10 +217,52 @@ TEST_CASE("ProjectViewerDock: editing the Position spinbox moves the marker",
     REQUIRE(posBox != nullptr);
     REQUIRE(posBox->value() == 1000);
 
+    // MEMO: simulate "user typed 1500 and pressed Enter" — the dock
+    // commits position edits on editingFinished (not on every
+    // valueChanged) so leading zeros aren't stripped mid-edit. The
+    // test mimics the commit step explicitly.
     posBox->setValue(1500);
+    emit posBox->editingFinished();
+
     REQUIRE(model->markers()[0].sourceMs == 1500);
     // Selection survives the re-position because IDs are stable.
     REQUIRE(dock.selectedMarkerId() == markerId);
+}
+
+TEST_CASE("ProjectViewerDock: in-progress spinbox edits don't strip leading zeros",
+          "[project-viewer-dock][gui]") {
+    // MEMO: regression for the smoke-test bug — at marker position
+    // 30004 ms, placing the caret after the 3 and pressing Del to
+    // remove it left the user with "4 ms" instead of "0004 ms"
+    // because every keystroke round-tripped through the model and
+    // re-formatted the text. The fix is editingFinished commits;
+    // this test pins that property by mutating the model only when
+    // editingFinished fires, not on every value change.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 30004 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+    dock.setSelectedMarkerId(*model->idAt(0));
+
+    QSignalSpy modelSpy(model.get(), &MarkerModel::changed);
+    auto* posBox = dock.findChild<QSpinBox*>("markerPositionBox");
+    REQUIRE(posBox != nullptr);
+
+    // Simulate the in-progress text edit by setting the spinbox's
+    // value to 4 (what live-parsing would do mid-edit). Without
+    // editingFinished firing, the model must NOT mutate.
+    posBox->setValue(4);
+    REQUIRE(modelSpy.count() == 0);
+    REQUIRE(model->markers()[0].sourceMs == 30004);   // unchanged
+
+    // After the user presses Enter / Tab / clicks elsewhere,
+    // editingFinished fires and the value is committed. Use a final
+    // value of 40004 here to mirror the user's intended end state
+    // ("delete '3' from 30004, type '4' in front, end with 40004").
+    posBox->setValue(40004);
+    emit posBox->editingFinished();
+    REQUIRE(model->markers()[0].sourceMs == 40004);
 }
 
 TEST_CASE("ProjectViewerDock: setting the spinbox doesn't loop back into rewriting itself",

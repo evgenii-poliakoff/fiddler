@@ -102,13 +102,19 @@ void ProjectViewerDock::buildUi() {
         markerPositionBox_->setObjectName("markerPositionBox");
         markerPositionBox_->setRange(0, INT_MAX);
         markerPositionBox_->setSuffix(tr(" ms"));
-        // MEMO: live valueChanged (not editingFinished) so the
-        // marker visibly tracks the user as they type or step the
-        // spinbox. The updatingPropertyPage_ guard keeps the
-        // model→widget direction from feeding back into the
-        // widget→model direction.
-        connect(markerPositionBox_,
-                qOverload<int>(&QSpinBox::valueChanged),
+        // MEMO: bind to editingFinished (Enter or focus-loss) — NOT
+        // valueChanged. valueChanged fires after every keystroke,
+        // and that round-trips through the model
+        // (onPositionEdited → setPosition → emit changed →
+        // refreshPropertyPage → setValue), which forces the spinbox
+        // to re-format its text on every edit. That re-formatting
+        // strips leading zeros: editing "30004" by deleting the '3'
+        // produces "0004" which gets re-parsed to 4 and re-rendered
+        // as "4" — instead of the "0004" the user expects to keep
+        // editing toward "40004". editingFinished commits only on
+        // user intent (Enter / Tab / focus-loss), so the in-progress
+        // text is left alone.
+        connect(markerPositionBox_, &QSpinBox::editingFinished,
                 this, &ProjectViewerDock::onPositionEdited);
         form->addRow(tr("Position:"), markerPositionBox_);
 
@@ -285,11 +291,16 @@ void ProjectViewerDock::onNameEdited() {
     // Tree text refreshes via onMarkerModelChanged → rebuildTree.
 }
 
-void ProjectViewerDock::onPositionEdited(int newMs) {
+void ProjectViewerDock::onPositionEdited() {
     if (updatingPropertyPage_) return;
     if (!selectedMarkerId_ || !markerModel_) return;
-    markerModel_->setPosition(*selectedMarkerId_,
-                              static_cast<std::int64_t>(newMs));
+    // editingFinished doesn't pass the new value, so we read it
+    // directly from the spinbox. By the time this fires the user
+    // has finished editing (Enter / focus-loss), so the value is
+    // settled.
+    markerModel_->setPosition(
+        *selectedMarkerId_,
+        static_cast<std::int64_t>(markerPositionBox_->value()));
 }
 
 // ---- input forwarding ---------------------------------------------------
