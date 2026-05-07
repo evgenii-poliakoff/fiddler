@@ -27,7 +27,10 @@ class QKeyEvent;
 class QMouseEvent;
 class QPaintEvent;
 
-namespace fiddler::score { class BarlineModel; }
+namespace fiddler::score {
+class BarlineModel;
+class MarkerModel;
+}
 
 namespace fiddler::ui {
 
@@ -50,9 +53,27 @@ public:
     [[nodiscard]] std::shared_ptr<const score::BarlineModel>
         barlineModel() const noexcept { return barlineModel_; }
 
+    // Marker overlay. Same shape as the barline overlay but tracks
+    // selection by the marker's stable int64_t ID — markers can be
+    // moved (setPosition) and renamed (rename) which would change
+    // their index but not their ID.
+    //
+    // MEMO: barline-selection and marker-selection are mutually
+    // exclusive — selecting a marker clears any barline selection
+    // and vice versa. The user wanted "the selected artifact" to be
+    // a single concept (the property viewer in PR step 5.5 shows
+    // its properties), so we enforce that here. Both selections
+    // are stored and reported separately, but at most one is
+    // populated at any given moment.
+    void setMarkerModel(std::shared_ptr<const score::MarkerModel> model);
+    [[nodiscard]] std::shared_ptr<const score::MarkerModel>
+        markerModel() const noexcept { return markerModel_; }
+
     [[nodiscard]] std::int64_t positionMs() const noexcept { return positionMs_; }
     [[nodiscard]] std::optional<std::size_t>
         selectedBarline() const noexcept { return selectedBarline_; }
+    [[nodiscard]] std::optional<std::int64_t>
+        selectedMarkerId() const noexcept { return selectedMarkerId_; }
 
     // Coordinate transforms — public so overlays can map pixels to
     // source time and back. Both clamp to the widget's current bounds
@@ -68,16 +89,27 @@ public slots:
     void setPositionMs(std::int64_t ms);
     // Programmatic selection setter. Used by MainWindow to keep the
     // staff and waveform showing the same selected barline.
+    // MEMO: setting a barline selection clears any marker selection
+    // (mutual exclusion).
     void setSelectedBarline(std::optional<std::size_t> index);
+    // Programmatic marker selection setter. Used by the project
+    // viewer + MainWindow to mirror selection across waveform / staff
+    // / dock. MEMO: setting a marker selection clears any barline
+    // selection (mutual exclusion).
+    void setSelectedMarkerId(std::optional<std::int64_t> id);
 
 signals:
     void seekRequested(std::int64_t ms);
-    // The widget's selection changed in response to a click, key-nav,
-    // or a model change that invalidated the previous selection.
+    // The widget's barline selection changed in response to a click,
+    // key-nav, or a model change. nullopt when the selection was
+    // cleared (including by the mutual-exclusion swap).
     void barlineSelectionChanged(std::optional<std::size_t> index);
-    // User pressed Del while a barline was selected. MainWindow
-    // turns this into a model->removeAt() call.
+    void markerSelectionChanged (std::optional<std::int64_t> id);
+    // User pressed Del while a barline / marker was selected.
+    // MainWindow turns these into model->removeAt / model->remove
+    // calls.
     void barlineDeleteRequested(std::size_t index);
+    void markerDeleteRequested (std::int64_t id);
 
 protected:
     void paintEvent(QPaintEvent* event)        override;
@@ -86,11 +118,14 @@ protected:
 
 private:
     void onBarlineModelChanged();
+    void onMarkerModelChanged();
 
     std::shared_ptr<const audio::WaveformOverview> overview_;
     std::shared_ptr<const score::BarlineModel>     barlineModel_;
+    std::shared_ptr<const score::MarkerModel>      markerModel_;
     std::int64_t                                   positionMs_ = 0;
     std::optional<std::size_t>                     selectedBarline_;
+    std::optional<std::int64_t>                    selectedMarkerId_;
 };
 
 } // namespace fiddler::ui

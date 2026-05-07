@@ -8,6 +8,8 @@ add_executable(fiddler_tests
     test_event_logging.cpp
     test_log.cpp
     test_main_window.cpp
+    test_marker_model.cpp
+    test_project_viewer_dock.cpp
     test_ringbuffer.cpp
     test_staff_widget.cpp
     test_stretcher.cpp
@@ -50,7 +52,9 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/MarkerModel.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/ProjectViewerDock.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/StaffWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/WaveformWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp

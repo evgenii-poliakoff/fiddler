@@ -5,6 +5,7 @@
 #include "audio/WaveformOverview.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/MarkerModel.h"
 #include "ui/WaveformWidget.h"
 
 #include <QKeyEvent>
@@ -21,6 +22,7 @@
 
 using fiddler::audio::WaveformOverview;
 using fiddler::score::BarlineModel;
+using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::WaveformWidget;
 
@@ -493,4 +495,229 @@ TEST_CASE("WaveformWidget: setSelectedBarline rejects out-of-range indices",
     // Out of range — silently coerced to nullopt.
     w.setSelectedBarline(99);
     REQUIRE_FALSE(w.selectedBarline().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Marker overlay
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Install a fresh MarkerModel on the widget with the given ms
+// values. Returns the model handle so the test can mutate it later.
+// The model is heap-allocated; the widget takes a const view.
+std::shared_ptr<MarkerModel>
+installMarkers(WaveformWidget& w, std::span<const std::int64_t> stamps) {
+    auto model = std::make_shared<MarkerModel>();
+    for (auto ms : stamps) (void)model->add(ms);
+    w.setMarkerModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("WaveformWidget: paints marker ticks + label flags without crashing",
+          "[waveform-widget][gui][markers]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    QTest::qWait(20);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: click on a marker selects by ID and seeks",
+          "[waveform-widget][gui][markers]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));   // 4 s file
+    // Place a marker at exactly 1000 ms — at width=800 that's x=200.
+    const std::int64_t stamps[] = { 1000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+    QSignalSpy selSpy (&w, &WaveformWidget::markerSelectionChanged);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(202, 50));
+
+    // MEMO: load-bearing — selection is by stable ID, not index.
+    // The widget's API surface for marker selection is selectedMarkerId().
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE(*w.selectedMarkerId() == *model->idAt(0));
+
+    // Seek goes to the marker's exact ms (1000), not the click ms (~1010).
+    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
+
+    REQUIRE(selSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: marker click clears any active barline selection",
+          "[waveform-widget][gui][markers]") {
+    // MEMO: load-bearing — barline-selection and marker-selection
+    // are mutually exclusive. Selecting a marker must clear the
+    // barline selection, otherwise the property viewer can't show
+    // a coherent "selected artifact".
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t bars[]    = { 500 };           // barline at x=100
+    const std::int64_t markers[] = { 2000 };          // marker at x=400
+    auto barModel = std::make_shared<BarlineModel>();
+    for (auto ms : bars) (void)barModel->add(ms);
+    w.setBarlineModel(barModel);
+    installMarkers(w, std::span<const std::int64_t>{markers});
+    w.resize(800, 100);
+
+    // Pre-select a barline by clicking on it.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(102, 50));
+    REQUIRE(w.selectedBarline() == 0);
+
+    QSignalSpy barSelSpy(&w, &WaveformWidget::barlineSelectionChanged);
+
+    // Click on the marker. Marker becomes selected; barline cleared.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(402, 50));
+
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    // The barline-selection-changed signal fired once with nullopt.
+    REQUIRE(barSelSpy.count() == 1);
+    REQUIRE(barSelSpy.takeFirst().at(0)
+            .value<std::optional<std::size_t>>() == std::nullopt);
+}
+
+TEST_CASE("WaveformWidget: barline click clears any active marker selection",
+          "[waveform-widget][gui][markers]") {
+    // Mirror of the previous test — the rule is symmetric.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t bars[]    = { 2000 };
+    const std::int64_t markers[] = { 500 };
+    auto barModel = std::make_shared<BarlineModel>();
+    for (auto ms : bars) (void)barModel->add(ms);
+    w.setBarlineModel(barModel);
+    installMarkers(w, std::span<const std::int64_t>{markers});
+    w.resize(800, 100);
+
+    // Pre-select the marker.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(102, 50));
+    REQUIRE(w.selectedMarkerId().has_value());
+
+    QSignalSpy markerSelSpy(&w, &WaveformWidget::markerSelectionChanged);
+
+    // Click the barline.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(402, 50));
+
+    REQUIRE(w.selectedBarline() == 0);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE(markerSelSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: Del with marker selection fires markerDeleteRequested",
+          "[waveform-widget][gui][markers][keys]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+    w.setSelectedMarkerId(*model->idAt(0));
+
+    QSignalSpy delSpy(&w, &WaveformWidget::markerDeleteRequested);
+    QTest::keyClick(&w, Qt::Key_Delete);
+
+    REQUIRE(delSpy.count() == 1);
+    // MEMO: delete-by-ID, not by index — markers can move under
+    // selection and the widget mustn't translate to a stale index.
+    REQUIRE(delSpy.takeFirst().at(0).value<std::int64_t>()
+            == *model->idAt(0));
+}
+
+TEST_CASE("WaveformWidget: arrow nav cycles through markers when one is selected",
+          "[waveform-widget][gui][markers][keys]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 500, 1500, 2500, 3500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.resize(800, 100);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    // Pre-select the second marker (index 1 in sort order).
+    w.setSelectedMarkerId(*model->idAt(1));
+    REQUIRE(*w.selectedMarkerId() == *model->idAt(1));
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+    QTest::keyClick(&w, Qt::Key_Right);
+    REQUIRE(*w.selectedMarkerId() == *model->idAt(2));
+    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 2500);
+
+    QTest::keyClick(&w, Qt::Key_Left);
+    QTest::keyClick(&w, Qt::Key_Left);
+    REQUIRE(*w.selectedMarkerId() == *model->idAt(0));
+}
+
+TEST_CASE("WaveformWidget: marker setPosition keeps selection alive across re-sort",
+          "[waveform-widget][gui][markers]") {
+    // MEMO: load-bearing — this is exactly what stable IDs buy us.
+    // After moving the selected marker past its neighbour, its
+    // index changes from 0 to 1 but its ID is the same; the widget
+    // selection (held by ID) tracks correctly.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000, 2000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    const auto firstId = *model->idAt(0);
+
+    w.setSelectedMarkerId(firstId);
+    REQUIRE(*w.selectedMarkerId() == firstId);
+
+    // Move the first marker past the second.
+    REQUIRE(model->setPosition(firstId, 3000));
+
+    REQUIRE(w.selectedMarkerId() == firstId);   // still tracking
+    REQUIRE(*model->indexOf(firstId) == 1);      // but at a new index
+}
+
+TEST_CASE("WaveformWidget: removing the selected marker clears the selection",
+          "[waveform-widget][gui][markers]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1000, 2000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    const auto secondId = *model->idAt(1);
+    w.setSelectedMarkerId(secondId);
+    REQUIRE(w.selectedMarkerId() == secondId);
+
+    QSignalSpy selSpy(&w, &WaveformWidget::markerSelectionChanged);
+    REQUIRE(model->remove(secondId));
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE(selSpy.count() >= 1);
+}
+
+TEST_CASE("WaveformWidget: setMarkerModel(nullptr) detaches and clears selection",
+          "[waveform-widget][gui][markers]") {
+    qtApp();
+    WaveformWidget w;
+    const std::int64_t stamps[] = { 1000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+    REQUIRE(w.selectedMarkerId().has_value());
+
+    w.setMarkerModel(nullptr);
+    REQUIRE(w.markerModel() == nullptr);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
 }

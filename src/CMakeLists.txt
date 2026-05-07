@@ -2,6 +2,8 @@ add_executable(fiddler
     main.cpp
     ui/MainWindow.cpp
     ui/MainWindow.h
+    ui/ProjectViewerDock.cpp
+    ui/ProjectViewerDock.h
     ui/StaffWidget.cpp
     ui/StaffWidget.h
     ui/WaveformWidget.cpp
@@ -17,6 +19,8 @@ add_executable(fiddler
     audio/WaveformOverview.h
     score/BarlineModel.cpp
     score/BarlineModel.h
+    score/MarkerModel.cpp
+    score/MarkerModel.h
     util/Log.cpp
     util/Log.h
 )

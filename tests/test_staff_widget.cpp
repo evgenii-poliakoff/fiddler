@@ -6,6 +6,7 @@
 
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/MarkerModel.h"
 #include "ui/StaffWidget.h"
 
 #include <QSignalSpy>
@@ -18,6 +19,7 @@
 #include <span>
 
 using fiddler::score::BarlineModel;
+using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::StaffWidget;
 
@@ -395,4 +397,111 @@ TEST_CASE("StaffWidget: paint with custom time signature + tune-type label",
     w.show();
     QTest::qWait(20);
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// Marker overlay
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a fresh MarkerModel and attach it to the widget. Returns
+// the model handle so the test can mutate it later.
+std::shared_ptr<MarkerModel>
+installMarkers(StaffWidget& w, std::span<const std::int64_t> stamps) {
+    auto model = std::make_shared<MarkerModel>();
+    for (auto ms : stamps) (void)model->add(ms);
+    w.setMarkerModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("StaffWidget: paints marker ticks + label flags without crashing",
+          "[staff-widget][gui][markers]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());                  // tune-type label active
+    const std::int64_t stamps[] = { 500, 1500, 2500 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.show();
+    QTest::qWait(20);
+    SUCCEED();
+}
+
+TEST_CASE("StaffWidget: click on a marker selects by ID and seeks",
+          "[staff-widget][gui][markers]") {
+    // 4 s file across 800 px → marker at 1000 ms is at x=200.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::int64_t stamps[] = { 1000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
+    QSignalSpy selSpy (&w, &StaffWidget::markerSelectionChanged);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(202, 40));
+
+    REQUIRE(w.selectedMarkerId() == *model->idAt(0));
+    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
+    REQUIRE(selSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: marker click clears barline selection (mutual exclusion)",
+          "[staff-widget][gui][markers]") {
+    qtApp();
+    StaffWidget w;
+    const std::int64_t bars[] = { 500 };           // x=100
+    auto barModel = makeModel(std::span<const std::int64_t>{bars});
+    setUpWidget(w, barModel);
+    const std::int64_t markers[] = { 2000 };       // x=400
+    installMarkers(w, std::span<const std::int64_t>{markers});
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(102, 40));
+    REQUIRE(w.selectedBarline() == 0);
+
+    QSignalSpy barSelSpy(&w, &StaffWidget::barlineSelectionChanged);
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(402, 40));
+
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(barSelSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: Del with marker selection fires markerDeleteRequested",
+          "[staff-widget][gui][markers][keys]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::int64_t stamps[] = { 1000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+    w.setSelectedMarkerId(*model->idAt(0));
+
+    QSignalSpy delSpy(&w, &StaffWidget::markerDeleteRequested);
+    QTest::keyClick(&w, Qt::Key_Delete);
+    REQUIRE(delSpy.count() == 1);
+    REQUIRE(delSpy.takeFirst().at(0).value<std::int64_t>()
+            == *model->idAt(0));
+}
+
+TEST_CASE("StaffWidget: marker setPosition keeps ID-based selection alive",
+          "[staff-widget][gui][markers]") {
+    // Stable-ID survival regression — see the equivalent waveform
+    // test for the rationale.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::int64_t stamps[] = { 1000, 2000 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    const auto firstId = *model->idAt(0);
+
+    w.setSelectedMarkerId(firstId);
+    REQUIRE(model->setPosition(firstId, 3000));   // moves past second
+    REQUIRE(w.selectedMarkerId() == firstId);
+    REQUIRE(*model->indexOf(firstId) == 1);
 }

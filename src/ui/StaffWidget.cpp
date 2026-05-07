@@ -1,6 +1,7 @@
 #include "ui/StaffWidget.h"
 
 #include "score/BarlineModel.h"
+#include "score/MarkerModel.h"
 
 #include <QFont>
 #include <QFontMetrics>
@@ -9,6 +10,7 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPen>
+#include <QString>
 
 #include <algorithm>
 
@@ -20,16 +22,23 @@ namespace {
 // numbers in the paint code mean something at a glance.
 constexpr int kStaffLineCount      = 5;
 constexpr int kStaffSpacingPx      = 8;     // gap between adjacent staff lines
-constexpr int kStaffTopMarginPx    = 18;    // room above for a tune-type label
+constexpr int kStaffTopMarginPx    = 18;    // room above for tune-type label + marker flags
 constexpr int kStaffBottomMarginPx = 12;    // unused for now; reserved for step 6 ledger lines
 
 // Click-to-select tolerance in pixels — same value as WaveformWidget
-// so the two widgets feel equally forgiving. Single-pixel barlines
-// are too narrow to hit precisely with a mouse.
-constexpr int kBarlineHitTolerancePx = 5;
+// so the two widgets feel equally forgiving. Single-pixel ticks are
+// too narrow to hit precisely with a mouse.
+constexpr int kHitTolerancePx = 5;
 
 constexpr int kTimeSigLeftMarginPx = 6;
 constexpr int kTimeSigPointSize    = 14;
+
+// Marker label flag — same shape as WaveformWidget's, sits in the
+// top margin band above the staff lines.
+constexpr int kMarkerFlagHeightPx     = 12;
+constexpr int kMarkerFlagPaddingPx    = 4;
+constexpr int kMarkerFlagFontPointSz  = 8;
+constexpr int kMarkerFlagMaxWidthPx   = 120;
 
 } // namespace
 
@@ -83,6 +92,24 @@ void StaffWidget::setBarlineModel(
     update();
 }
 
+void StaffWidget::setMarkerModel(
+    std::shared_ptr<const score::MarkerModel> model)
+{
+    if (markerModel_) {
+        disconnect(markerModel_.get(), nullptr, this, nullptr);
+    }
+    markerModel_ = std::move(model);
+    if (markerModel_) {
+        connect(markerModel_.get(), &score::MarkerModel::changed,
+                this, &StaffWidget::onMarkerModelChanged);
+    }
+    if (selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    update();
+}
+
 void StaffWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
@@ -97,10 +124,37 @@ void StaffWidget::setSelectedBarline(std::optional<std::size_t> index) {
         && *index >= barlineModel_->size()) {
         index = std::nullopt;
     }
-    if (selectedBarline_ == index) return;
+    // MEMO: mutual exclusion — see WaveformWidget's setSelectedBarline
+    // for the rationale; both widgets enforce the same rule.
+    if (index.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedBarline_ == index) {
+        update();
+        return;
+    }
     selectedBarline_ = index;
     update();
     emit barlineSelectionChanged(selectedBarline_);
+}
+
+void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
+    if (id.has_value() && markerModel_
+        && !markerModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (selectedMarkerId_ == id) {
+        update();
+        return;
+    }
+    selectedMarkerId_ = id;
+    update();
+    emit markerSelectionChanged(selectedMarkerId_);
 }
 
 void StaffWidget::onBarlineModelChanged() {
@@ -111,6 +165,17 @@ void StaffWidget::onBarlineModelChanged() {
         && *selectedBarline_ >= barlineModel_->size()) {
         selectedBarline_.reset();
         emit barlineSelectionChanged(selectedBarline_);
+    }
+    update();
+}
+
+void StaffWidget::onMarkerModelChanged() {
+    // Drop the marker selection only if the ID has truly gone away;
+    // a mere re-position keeps the ID valid (just at a new index).
+    if (selectedMarkerId_.has_value() && markerModel_
+        && !markerModel_->indexOf(*selectedMarkerId_).has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
     }
     update();
 }
@@ -152,6 +217,7 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     paintStaffLines(painter);
     paintTimeSignature(painter);
     paintBarlines(painter);
+    paintMarkers(painter);
     paintCursor(painter);
 }
 
@@ -222,6 +288,44 @@ void StaffWidget::paintBarlines(QPainter& painter) const {
     }
 }
 
+void StaffWidget::paintMarkers(QPainter& painter) const {
+    if (!markerModel_) return;
+    const auto markers = markerModel_->markers();
+
+    QFont flagFont = painter.font();
+    flagFont.setPointSize(kMarkerFlagFontPointSz);
+    flagFont.setBold(true);
+    painter.setFont(flagFont);
+    const QFontMetrics fm(flagFont);
+
+    for (const auto& m : markers) {
+        const int x = msToX(m.sourceMs);
+        if (x < 0 || x >= width()) continue;
+        const bool selected = (selectedMarkerId_ == m.id);
+        const QColor lineCol = selected
+            ? QColor(140, 230, 250)
+            : QColor(100, 200, 220);
+
+        // Marker tick: full height, like the staff barline.
+        painter.setPen(QPen(lineCol, selected ? 2.0 : 1.0));
+        painter.drawLine(x, 0, x, height());
+
+        // Label flag in the top margin (sits above the staff lines).
+        const int rawTextWidth = fm.horizontalAdvance(m.name);
+        const int textWidth =
+            std::min(rawTextWidth, kMarkerFlagMaxWidthPx
+                     - 2 * kMarkerFlagPaddingPx);
+        const int flagWidth = textWidth + 2 * kMarkerFlagPaddingPx;
+        const QRect flagRect(x, 0, flagWidth, kMarkerFlagHeightPx);
+        painter.fillRect(flagRect, lineCol.darker(140));
+        painter.setPen(QColor(20, 20, 24));
+        painter.drawText(flagRect.adjusted(kMarkerFlagPaddingPx, 0,
+                                          -kMarkerFlagPaddingPx, 0),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         fm.elidedText(m.name, Qt::ElideRight, textWidth));
+    }
+}
+
 void StaffWidget::paintCursor(QPainter& painter) const {
     const int cursorX = msToX(positionMs_);
     if (cursorX < 0 || cursorX >= width()) return;
@@ -243,47 +347,61 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
     const int          clickX = event->pos().x();
     const std::int64_t ms     = xToMs(clickX);
 
-    // First, try to hit-test a nearby barline. Tolerance is in
-    // source-ms; we convert the pixel tolerance using the current
-    // ms-per-pixel rate. The static_cast keeps the multiplication
-    // 64-bit so very long files don't overflow.
-    std::optional<std::size_t> hit;
-    if (barlineModel_ && barlineModel_->size() > 0 && width() > 0) {
-        const std::int64_t tolMs =
-            static_cast<std::int64_t>(kBarlineHitTolerancePx)
+    // MEMO: same hit-test priority as WaveformWidget — markers
+    // first (labelled, visually above), then barlines, then plain
+    // seek with both selections cleared.
+    std::int64_t tolMs = 0;
+    if (width() > 0) {
+        tolMs = static_cast<std::int64_t>(kHitTolerancePx)
                 * durationMs_ / width();
-        hit = barlineModel_->nearest(ms, tolMs);
     }
 
-    if (hit.has_value()) {
-        // Click landed on (or very near) a barline.
-        if (selectedBarline_ != hit) {
-            selectedBarline_ = hit;
-            update();
-            emit barlineSelectionChanged(selectedBarline_);
+    // 1. Marker hit?
+    if (markerModel_ && markerModel_->size() > 0) {
+        if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
+            const auto idx = markerModel_->indexOf(*markerHit);
+            if (idx) {
+                setSelectedMarkerId(*markerHit);
+                emit seekRequested(
+                    markerModel_->markers()[*idx].sourceMs);
+                event->accept();
+                return;
+            }
         }
-        // Seek to the barline's *exact* ms — not the click's ms —
-        // so the cursor lands on the tick the user just clicked.
-        emit seekRequested(barlineModel_->barlines()[*hit]);
-    } else {
-        // Click landed in empty staff — clear any existing selection
-        // and just seek to the clicked time.
-        if (selectedBarline_.has_value()) {
-            selectedBarline_.reset();
-            update();
-            emit barlineSelectionChanged(selectedBarline_);
-        }
-        emit seekRequested(ms);
     }
+
+    // 2. Barline hit?
+    if (barlineModel_ && barlineModel_->size() > 0) {
+        if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
+            setSelectedBarline(*barHit);
+            emit seekRequested(barlineModel_->barlines()[*barHit]);
+            event->accept();
+            return;
+        }
+    }
+
+    // 3. Plain seek — clear both selections.
+    if (selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        update();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        update();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    emit seekRequested(ms);
     event->accept();
 }
 
 void StaffWidget::keyPressEvent(QKeyEvent* event) {
-    if (!barlineModel_) {
+    const bool haveBarline = static_cast<bool>(barlineModel_);
+    const bool haveMarker  = static_cast<bool>(markerModel_);
+    if (!haveBarline && !haveMarker) {
         QWidget::keyPressEvent(event);
         return;
     }
-    const std::size_t count = barlineModel_->size();
 
     switch (event->key()) {
     case Qt::Key_Left:
@@ -291,16 +409,41 @@ void StaffWidget::keyPressEvent(QKeyEvent* event) {
             setSelectedBarline(*selectedBarline_ - 1);
             emit seekRequested(
                 barlineModel_->barlines()[*selectedBarline_]);
+        } else if (selectedMarkerId_ && markerModel_) {
+            const auto idx = markerModel_->indexOf(*selectedMarkerId_);
+            if (idx && *idx > 0) {
+                if (const auto prevId = markerModel_->idAt(*idx - 1)) {
+                    setSelectedMarkerId(*prevId);
+                    const auto newIdx = markerModel_->indexOf(*prevId);
+                    if (newIdx) {
+                        emit seekRequested(
+                            markerModel_->markers()[*newIdx].sourceMs);
+                    }
+                }
+            }
         }
         event->accept();
         return;
 
     case Qt::Key_Right:
-        if (selectedBarline_.has_value()
-            && *selectedBarline_ + 1 < count) {
+        if (selectedBarline_.has_value() && barlineModel_
+            && *selectedBarline_ + 1 < barlineModel_->size())
+        {
             setSelectedBarline(*selectedBarline_ + 1);
             emit seekRequested(
                 barlineModel_->barlines()[*selectedBarline_]);
+        } else if (selectedMarkerId_ && markerModel_) {
+            const auto idx = markerModel_->indexOf(*selectedMarkerId_);
+            if (idx && *idx + 1 < markerModel_->size()) {
+                if (const auto nextId = markerModel_->idAt(*idx + 1)) {
+                    setSelectedMarkerId(*nextId);
+                    const auto newIdx = markerModel_->indexOf(*nextId);
+                    if (newIdx) {
+                        emit seekRequested(
+                            markerModel_->markers()[*newIdx].sourceMs);
+                    }
+                }
+            }
         }
         event->accept();
         return;
@@ -308,17 +451,17 @@ void StaffWidget::keyPressEvent(QKeyEvent* event) {
     case Qt::Key_Escape:
         if (selectedBarline_.has_value()) {
             setSelectedBarline(std::nullopt);
+        } else if (selectedMarkerId_.has_value()) {
+            setSelectedMarkerId(std::nullopt);
         }
         event->accept();
         return;
 
     case Qt::Key_Delete:
         if (selectedBarline_.has_value()) {
-            // Don't reset selection here. Once MainWindow turns this
-            // signal into a model->removeAt() call, the model will
-            // emit its own `changed()` signal and
-            // onBarlineModelChanged() will drop the now-stale index.
             emit barlineDeleteRequested(*selectedBarline_);
+        } else if (selectedMarkerId_.has_value()) {
+            emit markerDeleteRequested(*selectedMarkerId_);
         }
         event->accept();
         return;

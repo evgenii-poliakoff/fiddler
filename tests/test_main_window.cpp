@@ -9,7 +9,9 @@
 #include "audio/Player.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/MarkerModel.h"
 #include "ui/MainWindow.h"
+#include "ui/ProjectViewerDock.h"
 #include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 #include "wav_fixture.h"
@@ -30,6 +32,7 @@
 using fiddler::test::fixtureWav;
 using fiddler::test::qtApp;
 using fiddler::ui::MainWindow;
+using fiddler::ui::ProjectViewerDock;
 using fiddler::ui::StaffWidget;
 using fiddler::ui::WaveformWidget;
 
@@ -458,4 +461,365 @@ TEST_CASE("MainWindow: full simulated user session — open, tap, undo, "
     window->close();
     window.reset();
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// Step 5.5 — markers + project viewer dock integration
+// ---------------------------------------------------------------------------
+//
+// MEMO[refactor]: each TEST_CASE pins one rule that crosses model /
+// widgets / dock / shortcuts. When refactoring any single layer
+// (e.g. simplifying MarkerModel, redoing the dock), read the
+// `MEMO:` comments in each test to know which assertions are the
+// load-bearing ones.
+
+TEST_CASE("MainWindow: starts with an empty MarkerModel and an attached ProjectViewerDock",
+          "[main-window][gui][integration][markers]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    REQUIRE(window->markerModel().empty());
+
+    // The dock is constructed in MainWindow::buildCentralWidget and
+    // added via addDockWidget(RightDockWidgetArea, ...). Tests find
+    // it via objectName so they don't depend on Qt's internal dock
+    // layout.
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock != nullptr);
+    REQUIRE(dock->markerModel() != nullptr);
+}
+
+TEST_CASE("MainWindow: 'M' shortcut places a marker at the player's position",
+          "[main-window][gui][integration][markers]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->loadFile(fixturePath));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Lock the player to position 0 so the assertion is deterministic
+    // on hosts with audio (Stop rewinds even when audio is absent).
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+
+    QTest::keyClick(window.get(), Qt::Key_M);
+
+    REQUIRE(window->markerModel().size() == 1);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 0);
+    // MEMO: load-bearing — the auto-name format is the user-visible
+    // contract for first-launch markers. If you change it, update
+    // memory/project_tap_to_place.md and the equivalent assertion
+    // in test_marker_model.cpp in lockstep.
+    REQUIRE(window->markerModel().markers()[0].name == "Mark 1");
+}
+
+TEST_CASE("MainWindow: tap M auto-selects the new marker across waveform / staff / dock",
+          "[main-window][gui][integration][markers]") {
+    // MEMO: three-way mirror — selection of the freshly-placed
+    // marker propagates from the originating widget (waveform, in
+    // this case, since onTapMarker calls waveform_->setSelectedMarkerId)
+    // to the staff and the dock via mirroringSelection_-guarded slots.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    QTest::mouseClick(window->findChild<QPushButton*>("playButton"),
+                      Qt::LeftButton);
+    QTest::mouseClick(window->findChild<QPushButton*>("stopButton"),
+                      Qt::LeftButton);
+    QTest::keyClick(window.get(), Qt::Key_M);
+
+    const auto id = window->markerModel().markers()[0].id;
+    REQUIRE(waveform->selectedMarkerId() == id);
+    REQUIRE(staff->selectedMarkerId()    == id);
+    REQUIRE(dock->selectedMarkerId()     == id);
+}
+
+TEST_CASE("MainWindow: combined Ctrl+Z LIFO peels the last placement regardless of kind",
+          "[main-window][gui][integration][markers][undo]") {
+    // The user's mental model: "Z = undo last", regardless of
+    // whether last was a barline or a marker. The placementHistory_
+    // LIFO at MainWindow level is what makes this work — neither
+    // model alone knows the global order.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    const auto durationMs = window->player().duration().count();
+
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+
+    // Place B at 0 ms. Then seek to 1/2 and place M. Then seek to
+    // 1/4 and place B. Sequence: B, M, B.
+    QTest::keyClick(window.get(), Qt::Key_B);
+    posSlider->setValue(static_cast<int>(durationMs / 2));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 2));
+    QTest::keyClick(window.get(), Qt::Key_M);
+    posSlider->setValue(static_cast<int>(durationMs / 4));
+    emit posSlider->sliderMoved(static_cast<int>(durationMs / 4));
+    QTest::keyClick(window.get(), Qt::Key_B);
+
+    REQUIRE(window->barlineModel().size() == 2);
+    REQUIRE(window->markerModel().size()  == 1);
+
+    // First Ctrl+Z peels the most recent — the second barline.
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->markerModel().size()  == 1);
+
+    // Second Ctrl+Z peels the marker (placed before the barline we
+    // just removed but after the first barline).
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->markerModel().size()  == 0);
+
+    // Third Ctrl+Z peels the first barline.
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().empty());
+    REQUIRE(window->markerModel().empty());
+
+    // Fourth Ctrl+Z is a quiet no-op (history drained).
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().empty());
+    REQUIRE(window->markerModel().empty());
+}
+
+TEST_CASE("MainWindow: window-level Del removes the selected marker",
+          "[main-window][gui][integration][markers]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->markerModel().size() == 1);
+
+    // Marker auto-selected on placement → Del removes it via the
+    // window-level shortcut, regardless of focus.
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->markerModel().empty());
+}
+
+TEST_CASE("MainWindow: dock click selects the marker in waveform + staff",
+          "[main-window][gui][integration][markers]") {
+    // MEMO: this is the inbound mirror direction (dock → widgets).
+    // The other directions are pinned by other tests; this one
+    // proves the dock is a first-class selection source.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+
+    // Place two markers so we have something distinct to select.
+    QTest::keyClick(window.get(), Qt::Key_M);
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+    QTest::keyClick(window.get(), Qt::Key_M);
+
+    REQUIRE(window->markerModel().size() == 2);
+    const auto firstId  = window->markerModel().markers()[0].id;
+    const auto secondId = window->markerModel().markers()[1].id;
+
+    // Programmatically select the first marker via the dock —
+    // simulates a click in the tree.
+    dock->setSelectedMarkerId(firstId);
+
+    REQUIRE(waveform->selectedMarkerId() == firstId);
+    REQUIRE(staff->selectedMarkerId()    == firstId);
+
+    // And switching the dock selection mirrors instantly.
+    dock->setSelectedMarkerId(secondId);
+    REQUIRE(waveform->selectedMarkerId() == secondId);
+    REQUIRE(staff->selectedMarkerId()    == secondId);
+}
+
+TEST_CASE("MainWindow: barline + marker selections are mutually exclusive",
+          "[main-window][gui][integration][markers]") {
+    // The property viewer's contract is "the selected artifact" —
+    // not "the selected barline AND the selected marker". This test
+    // pins that selecting one kind clears the other across all
+    // sibling widgets.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+
+    // One bar, one marker.
+    QTest::keyClick(window.get(), Qt::Key_B);   // selects the bar
+    REQUIRE(waveform->selectedBarline() == 0);
+    REQUIRE_FALSE(waveform->selectedMarkerId().has_value());
+
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+    QTest::keyClick(window.get(), Qt::Key_M);   // selects the marker
+
+    // Marker selection should now be set; barline selection cleared
+    // (because the marker auto-select mutual-exclusion-clears the bar).
+    REQUIRE(waveform->selectedMarkerId().has_value());
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+    REQUIRE_FALSE(staff->selectedBarline().has_value());
+}
+
+TEST_CASE("MainWindow: double-clicking a dock marker seeks player + starts playback",
+          "[main-window][gui][integration][markers]") {
+    // MEMO: end-to-end integration of the markerActivated signal.
+    // Verifies that the dock's double-click actually moves the
+    // player and (on hosts where Player::play is functional) flips
+    // the play button text to "Pause". The seek part is testable on
+    // any host; the playback-state side is best-effort because
+    // hosts without an audio output stay Stopped — we still verify
+    // the UI label flip since onMarkerActivated forces it.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn  = window->findChild<QPushButton*>("playButton");
+    auto* stopBtn  = window->findChild<QPushButton*>("stopButton");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Land at position 0 deterministically, then place a marker
+    // at ~1000 ms via slider+M so we have a non-zero target.
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->markerModel().size() == 1);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    // Move the player back to 0 so we can verify the marker
+    // double-click actually moved it back to ~1000.
+    posSlider->setValue(0);
+    emit posSlider->sliderMoved(0);
+    REQUIRE(window->player().position().count() == 0);
+
+    // Simulate the dock's double-click. The signal carries the
+    // marker ID; MainWindow's onMarkerActivated does the seek +
+    // play.
+    emit dock->markerActivated(markerId);
+
+    // Player should now be at the marker's position. Player::seek
+    // is synchronous (anchor-based) so the new anchor lands
+    // immediately. On a host with a real audio device, play() then
+    // starts the stream and a few ms can elapse before we read
+    // position() — hence the small tolerance window. On a no-audio
+    // host play() is a no-op and position is exactly the seek
+    // target.
+    const auto playerPosMs = window->player().position().count();
+    REQUIRE(playerPosMs >= 1000);
+    REQUIRE(playerPosMs <= 1050);
+
+    // Whether playback actually runs depends on whether
+    // Player::play() succeeds — that requires a real audio output.
+    // What we can pin universally is the UI side: the button text
+    // is forced to "Pause" by onMarkerActivated regardless of
+    // audio availability, so the user gets consistent feedback.
+    REQUIRE(playBtn->text() == "Pause");
+}
+
+TEST_CASE("MainWindow: opening a new file clears the marker model",
+          "[main-window][gui][integration][markers]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->loadFile(fixturePath));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* playButton = window->findChild<QPushButton*>("playButton");
+    auto* stopButton = window->findChild<QPushButton*>("stopButton");
+    QTest::mouseClick(playButton, Qt::LeftButton);
+    QTest::mouseClick(stopButton, Qt::LeftButton);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->markerModel().size() == 2);
+
+    // Reload: the previous file's annotations are no longer
+    // meaningful, so the marker model + the placement-history LIFO
+    // both reset.
+    REQUIRE(window->loadFile(fixturePath));
+    REQUIRE(window->markerModel().empty());
+
+    // After reload, Ctrl+Z is a no-op (history was cleared).
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().empty());
+    REQUIRE(window->barlineModel().empty());
 }

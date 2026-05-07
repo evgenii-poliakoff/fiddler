@@ -22,7 +22,16 @@ namespace {
 // hash map of loggers keyed on arbitrary strings.
 std::shared_ptr<spdlog::logger> g_logger;
 std::atomic<Level>              g_threshold{Level::Warn};
-std::string                     g_filter   = "*";
+
+// MEMO: g_filterPatterns is the parsed form of Config::filter — a
+// comma-separated list of globs split into individual entries. We
+// keep both (g_filterRaw retains the original string for any tooling
+// that wants it) but the matcher only consults the parsed vector.
+// Updates are guarded by g_initMutex; reads from categoryEnabled are
+// unlocked, on the same accept-the-data-race basis the rest of this
+// file already operates on (init is a one-shot at startup).
+std::string                     g_filterRaw = "*";
+std::vector<std::string>        g_filterPatterns{"*"};
 std::mutex                      g_initMutex;
 
 // Test capture: a function that receives every emitted log line.
@@ -64,6 +73,44 @@ std::string toLower(std::string_view s) {
     return out;
 }
 
+// Split a comma-separated filter into individual glob patterns.
+// Whitespace around each entry is trimmed; empty entries are
+// dropped; if the result is empty the filter falls back to "*".
+//
+// Examples:
+//   "*"                       → ["*"]
+//   "player.*"                → ["player.*"]
+//   "ui.*,player,waveform"    → ["ui.*", "player", "waveform"]
+//   "  ui.*  ,  player  "     → ["ui.*", "player"]
+//   ""                        → ["*"]
+std::vector<std::string> parseFilter(std::string_view filter) {
+    std::vector<std::string> out;
+    std::size_t              start = 0;
+    while (start <= filter.size()) {
+        const auto commaPos = filter.find(',', start);
+        const auto end =
+            (commaPos == std::string_view::npos) ? filter.size() : commaPos;
+
+        auto begin = start;
+        while (begin < end
+               && std::isspace(static_cast<unsigned char>(filter[begin]))) {
+            ++begin;
+        }
+        auto last = end;
+        while (last > begin
+               && std::isspace(static_cast<unsigned char>(filter[last - 1]))) {
+            --last;
+        }
+        if (last > begin) {
+            out.emplace_back(filter.substr(begin, last - begin));
+        }
+        if (commaPos == std::string_view::npos) break;
+        start = commaPos + 1;
+    }
+    if (out.empty()) out.emplace_back("*");
+    return out;
+}
+
 } // namespace
 
 std::optional<Level> parseLevel(std::string_view s) {
@@ -98,7 +145,8 @@ void init(const Config& cfg) {
     spdlog::set_default_logger(logger);
     g_logger = std::move(logger);
     g_threshold.store(cfg.level, std::memory_order_release);
-    g_filter = cfg.filter.empty() ? std::string{"*"} : cfg.filter;
+    g_filterRaw      = cfg.filter.empty() ? std::string{"*"} : cfg.filter;
+    g_filterPatterns = parseFilter(g_filterRaw);
 }
 
 Level threshold() noexcept {
@@ -106,9 +154,14 @@ Level threshold() noexcept {
 }
 
 bool categoryEnabled(std::string_view category) noexcept {
-    // Cheap-path: no filter set means everything's on.
-    if (g_filter == "*") return true;
-    return globMatch(g_filter, category);
+    // Any-match across the parsed pattern list. The common single-
+    // pattern case ("*", "player.*", etc.) just checks one entry;
+    // a comma-separated filter checks each pattern in turn until
+    // one matches.
+    for (const auto& pattern : g_filterPatterns) {
+        if (globMatch(pattern, category)) return true;
+    }
+    return false;
 }
 
 void setCapture(CaptureFn fn) {
