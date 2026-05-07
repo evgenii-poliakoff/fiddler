@@ -101,6 +101,46 @@ TEST_CASE("category filter matches prefixes via .* glob", "[log]") {
     REQUIRE(captured[1].category == "player.thread");
 }
 
+TEST_CASE("category filter accepts a comma-separated list of globs",
+          "[log]") {
+    // MEMO: regression for the bug surfaced during step-5.5 smoke
+    // testing — the documented filter form ("ui.*,player,waveform")
+    // had been silently treated as a single literal category name
+    // and dropped every log line. The fix splits on commas and
+    // any-matches; this test pins that behaviour.
+    initFacade(fiddler::log::Level::Trace,
+               "ui.*,player,waveform,score");
+    std::vector<Captured> captured;
+    CaptureGuard guard(captured);
+
+    FLOG_INFO("decoder",       "filtered (not in any pattern)");
+    FLOG_INFO("ui",            "matches ui.* prefix form");
+    FLOG_INFO("ui.score",      "matches ui.* subtree");
+    FLOG_INFO("player",        "matches literal 'player'");
+    FLOG_INFO("player.thread", "filtered ('player' is exact, not a prefix)");
+    FLOG_INFO("waveform",      "matches literal 'waveform'");
+    FLOG_INFO("score",         "matches literal 'score'");
+
+    REQUIRE(captured.size() == 5);
+    REQUIRE(captured[0].category == "ui");
+    REQUIRE(captured[1].category == "ui.score");
+    REQUIRE(captured[2].category == "player");
+    REQUIRE(captured[3].category == "waveform");
+    REQUIRE(captured[4].category == "score");
+}
+
+TEST_CASE("category filter trims whitespace around comma entries", "[log]") {
+    initFacade(fiddler::log::Level::Trace, "  ui.*  ,  player  ");
+    std::vector<Captured> captured;
+    CaptureGuard guard(captured);
+
+    FLOG_INFO("ui.score",      "matches first entry, whitespace ignored");
+    FLOG_INFO("player",        "matches second entry, whitespace ignored");
+    FLOG_INFO("decoder",       "filtered");
+
+    REQUIRE(captured.size() == 2);
+}
+
 TEST_CASE("Decoder::open emits an INFO line on success", "[log][decoder]") {
     namespace fs = std::filesystem;
     const auto wavPath = fs::temp_directory_path() / "fiddler_log_test.wav";

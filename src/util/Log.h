@@ -38,7 +38,15 @@ enum class Level { Trace, Debug, Info, Warn, Error, Off };
 
 struct Config {
     Level                                  level    = Level::Warn;
-    std::string                            filter   = "*";    // glob, e.g. "player.*"
+    // Comma-separated list of category globs. Each glob is either a
+    // bare "*" (matches everything), a trailing ".*" pattern
+    // (subtree match — "player.*" matches "player" and
+    // "player.thread"), or a literal category name (exact match).
+    // Whitespace around each entry is trimmed. Examples:
+    //   "*"
+    //   "player.*"
+    //   "ui.*,player,waveform,score"
+    std::string                            filter   = "*";
     std::optional<std::filesystem::path>   logFile;           // unset → no file sink
 };
 
