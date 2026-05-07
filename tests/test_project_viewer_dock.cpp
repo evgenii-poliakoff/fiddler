@@ -363,6 +363,55 @@ TEST_CASE("ProjectViewerDock: setMarkerModel(nullptr) clears the tree",
 }
 
 // ---------------------------------------------------------------------------
+// Double-click → markerActivated (jump-and-play)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ProjectViewerDock: double-clicking a marker row emits markerActivated",
+          "[project-viewer-dock][gui]") {
+    // MEMO: the dock fires a *separate* signal for double-click
+    // (markerActivated) on top of the usual selection signal —
+    // markerSelectionChanged is passive ("I now show this"),
+    // markerActivated is an action request ("seek + play").
+    // MainWindow distinguishes them: the first updates mirrors,
+    // the second additionally calls Player::seek + Player::play.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 1000, 2500 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+    const auto secondId = *model->idAt(1);
+
+    auto* tree = treeOf(dock);
+    auto* row  = findMarkerRow(*tree, secondId);
+    REQUIRE(row != nullptr);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::markerActivated);
+    // QTreeWidget doesn't have an emitDoubleClick helper; we emit
+    // its signal directly to simulate the gesture. (Real Qt would
+    // also fire currentItemChanged on the first click of the
+    // double-click pair, which onTreeCurrentItemChanged handles
+    // separately.)
+    emit tree->itemDoubleClicked(row, 0);
+
+    REQUIRE(spy.count() == 1);
+    REQUIRE(spy.takeFirst().at(0).value<std::int64_t>() == secondId);
+}
+
+TEST_CASE("ProjectViewerDock: double-clicking the category header does nothing",
+          "[project-viewer-dock][gui]") {
+    qtApp();
+    ProjectViewerDock dock;
+    dock.setMarkerModel(makeModelWith(std::span<const std::int64_t>{}));
+
+    auto* tree     = treeOf(dock);
+    auto* category = tree->topLevelItem(0);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::markerActivated);
+    emit tree->itemDoubleClicked(category, 0);
+    REQUIRE(spy.count() == 0);
+}
+
+// ---------------------------------------------------------------------------
 // Del key on a focused marker entry
 // ---------------------------------------------------------------------------
 

@@ -295,6 +295,9 @@ void MainWindow::buildCentralWidget() {
             &ProjectViewerDock::markerSelectionChanged,
             this, &MainWindow::onDockMarkerSelectionChanged);
     connect(projectViewerDock_,
+            &ProjectViewerDock::markerActivated,
+            this, &MainWindow::onMarkerActivated);
+    connect(projectViewerDock_,
             &ProjectViewerDock::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
 }
@@ -654,6 +657,29 @@ void MainWindow::onStaffMarkerSelectionChanged(
         FLOG_DEBUG("ui.score", "select-marker cleared via=staff size={}",
                    markerModel_->size());
     }
+}
+
+void MainWindow::onMarkerActivated(std::int64_t id) {
+    // "Jump and play" — double-click handler from the dock.
+    // We seek to the marker's exact source-time, then start
+    // playback if the player isn't already running.
+    if (!markerModel_ || !player_) return;
+    const auto idx = markerModel_->indexOf(id);
+    if (!idx) return;
+    const auto ms =
+        static_cast<int>(markerModel_->markers()[*idx].sourceMs);
+
+    // MEMO: route through onSeek so the existing seek log fires
+    // and the position slider updates via the timer chain.
+    onSeek(ms);
+
+    if (player_->state() != audio::TransportState::Playing) {
+        player_->play();
+        playButton_->setText(tr("Pause"));
+    }
+
+    FLOG_DEBUG("ui.score",
+               "marker-activated id={} ms={} via=dock", id, ms);
 }
 
 void MainWindow::onDockMarkerSelectionChanged(

@@ -100,6 +100,12 @@ private slots:
     void onStaffMarkerSelectionChanged   (std::optional<std::int64_t> id);
     void onDockMarkerSelectionChanged    (std::optional<std::int64_t> id);
 
+    // The user double-clicked a marker in the dock — seek the
+    // player to the marker's position and start playback.
+    // "Jump-and-play" is the standard DAW idiom for an
+    // activate-on-double-click marker list.
+    void onMarkerActivated(std::int64_t id);
+
     // 'Del' on a widget: turn the requested-by-key signal into an
     // actual model mutation.
     void onBarlineDeleteRequested(std::size_t index);

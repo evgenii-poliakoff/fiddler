@@ -725,6 +725,71 @@ TEST_CASE("MainWindow: barline + marker selections are mutually exclusive",
     REQUIRE_FALSE(staff->selectedBarline().has_value());
 }
 
+TEST_CASE("MainWindow: double-clicking a dock marker seeks player + starts playback",
+          "[main-window][gui][integration][markers]") {
+    // MEMO: end-to-end integration of the markerActivated signal.
+    // Verifies that the dock's double-click actually moves the
+    // player and (on hosts where Player::play is functional) flips
+    // the play button text to "Pause". The seek part is testable on
+    // any host; the playback-state side is best-effort because
+    // hosts without an audio output stay Stopped — we still verify
+    // the UI label flip since onMarkerActivated forces it.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn  = window->findChild<QPushButton*>("playButton");
+    auto* stopBtn  = window->findChild<QPushButton*>("stopButton");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Land at position 0 deterministically, then place a marker
+    // at ~1000 ms via slider+M so we have a non-zero target.
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->markerModel().size() == 1);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    // Move the player back to 0 so we can verify the marker
+    // double-click actually moved it back to ~1000.
+    posSlider->setValue(0);
+    emit posSlider->sliderMoved(0);
+    REQUIRE(window->player().position().count() == 0);
+
+    // Simulate the dock's double-click. The signal carries the
+    // marker ID; MainWindow's onMarkerActivated does the seek +
+    // play.
+    emit dock->markerActivated(markerId);
+
+    // Player should now be at the marker's position. Player::seek
+    // is synchronous (anchor-based) so the new anchor lands
+    // immediately. On a host with a real audio device, play() then
+    // starts the stream and a few ms can elapse before we read
+    // position() — hence the small tolerance window. On a no-audio
+    // host play() is a no-op and position is exactly the seek
+    // target.
+    const auto playerPosMs = window->player().position().count();
+    REQUIRE(playerPosMs >= 1000);
+    REQUIRE(playerPosMs <= 1050);
+
+    // Whether playback actually runs depends on whether
+    // Player::play() succeeds — that requires a real audio output.
+    // What we can pin universally is the UI side: the button text
+    // is forced to "Pause" by onMarkerActivated regardless of
+    // audio availability, so the user gets consistent feedback.
+    REQUIRE(playBtn->text() == "Pause");
+}
+
 TEST_CASE("MainWindow: opening a new file clears the marker model",
           "[main-window][gui][integration][markers]") {
     qtApp();

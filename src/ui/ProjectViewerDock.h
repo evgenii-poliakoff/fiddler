@@ -72,6 +72,12 @@ signals:
     // seeks the player to the marker's source-time.
     void markerSelectionChanged(std::optional<std::int64_t> id);
 
+    // The user double-clicked a marker entry — "jump and play".
+    // MainWindow seeks the player to the marker and starts
+    // playback. Different from markerSelectionChanged: that's a
+    // passive selection update, this is a request to act.
+    void markerActivated(std::int64_t id);
+
     // The user pressed Del while a marker entry was focused in the
     // tree. MainWindow turns this into a markerModel->remove() call.
     void markerDeleteRequested(std::int64_t id);
@@ -91,6 +97,10 @@ private slots:
     // markerSelectionChanged.
     void onTreeCurrentItemChanged(QTreeWidgetItem* current,
                                   QTreeWidgetItem* previous);
+
+    // Connected to QTreeWidget::itemDoubleClicked — emit
+    // markerActivated if the item is a marker row.
+    void onTreeItemDoubleClicked(QTreeWidgetItem* item, int column);
 
     // Property page edits round-trip into the model. The
     // updatingPropertyPage_ guard suppresses re-emit when *we* set

@@ -65,6 +65,8 @@ void ProjectViewerDock::buildUi() {
 
     connect(tree_, &QTreeWidget::currentItemChanged,
             this,  &ProjectViewerDock::onTreeCurrentItemChanged);
+    connect(tree_, &QTreeWidget::itemDoubleClicked,
+            this,  &ProjectViewerDock::onTreeItemDoubleClicked);
 
     layout->addWidget(tree_, /*stretch=*/1);
 
@@ -282,6 +284,16 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
     selectedMarkerId_ = newId;
     refreshPropertyPage();
     emit markerSelectionChanged(selectedMarkerId_);
+}
+
+void ProjectViewerDock::onTreeItemDoubleClicked(
+    QTreeWidgetItem* item, int /*column*/)
+{
+    // Only marker rows fire markerActivated — double-clicking the
+    // category header (and any future non-marker row) is a no-op.
+    if (!item || item->parent() != markersCategory_) return;
+    const auto id = item->data(0, kMarkerIdRole).toLongLong();
+    emit markerActivated(id);
 }
 
 void ProjectViewerDock::onNameEdited() {
