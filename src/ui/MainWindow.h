@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 class QAction;
 class QComboBox;
@@ -20,10 +21,14 @@ class QString;
 class QTimer;
 
 namespace fiddler::audio { class Player; }
-namespace fiddler::score { class BarlineModel; }
+namespace fiddler::score {
+class BarlineModel;
+class MarkerModel;
+}
 
 namespace fiddler::ui {
 
+class ProjectViewerDock;
 class StaffWidget;
 class WaveformWidget;
 
@@ -43,10 +48,11 @@ public:
     // through to the player.
     [[nodiscard]] const audio::Player& player() const noexcept { return *player_; }
 
-    // Access to the shared score model. Used by integration tests to
-    // verify that tap-to-place / Ctrl+Z / time-sig picker mutations
-    // actually reach the model.
+    // Access to the shared score models. Used by integration tests
+    // to verify that tap-to-place / Ctrl+Z / time-sig picker /
+    // marker-related mutations actually reach the models.
     [[nodiscard]] const score::BarlineModel& barlineModel() const noexcept;
+    [[nodiscard]] const score::MarkerModel&  markerModel()  const noexcept;
 
 protected:
     // MEMO: closeEvent is overridden purely to emit a `[ui.file] close`
@@ -68,30 +74,42 @@ private slots:
     // gesture for fiddle transcription (memory/project_tap_to_place.md).
     void onTapBarline();
 
-    // The 'Ctrl+Z' shortcut: peel the most-recently-added barline
-    // from the model. A degenerate undo, sufficient for the
-    // tap-along workflow (Rule 8 — full QUndoStack deferred).
-    void onUndoLastBarline();
+    // The 'M' shortcut: place a marker at the player's current
+    // source-time position. Auto-named "Mark N" by the model;
+    // user can rename via the project viewer dock.
+    void onTapMarker();
+
+    // The 'Ctrl+Z' shortcut: peel the most-recently-added artifact
+    // (barline or marker, whichever was most recent) from its
+    // model. MEMO: see placementHistory_ — this is the combined
+    // LIFO that makes "Z = undo last placement" feel right
+    // regardless of kind.
+    void onUndoLastPlacement();
 
     // The tune-type picker: looks up the chosen preset and pushes
     // its TimeSignature into the model.
     void onTuneTypePresetChosen(int comboIndex);
 
-    // Selection mirroring: when one of the two views changes its
-    // highlight, push it into the other so both stay in sync.
-    void onWaveformSelectionChanged(std::optional<std::size_t> index);
-    void onStaffSelectionChanged   (std::optional<std::size_t> index);
+    // Barline selection mirroring between waveform and staff.
+    void onWaveformBarlineSelectionChanged(std::optional<std::size_t> index);
+    void onStaffBarlineSelectionChanged   (std::optional<std::size_t> index);
 
-    // 'Del' on either widget: turn the requested-by-key signal into
-    // an actual model mutation.
+    // Marker selection mirroring across waveform / staff / dock —
+    // three-way mirror because the dock also shows the selection.
+    void onWaveformMarkerSelectionChanged(std::optional<std::int64_t> id);
+    void onStaffMarkerSelectionChanged   (std::optional<std::int64_t> id);
+    void onDockMarkerSelectionChanged    (std::optional<std::int64_t> id);
+
+    // 'Del' on a widget: turn the requested-by-key signal into an
+    // actual model mutation.
     void onBarlineDeleteRequested(std::size_t index);
+    void onMarkerDeleteRequested (std::int64_t id);
 
     // The window-level 'Del' shortcut: removes the currently-selected
-    // barline regardless of which child widget has focus. Without
-    // this, Del only worked when one of the score widgets was
-    // focused — which it usually wasn't right after a tap-to-place,
-    // since the focus tended to be on the transport buttons.
-    void onDeleteSelectedBarline();
+    // artifact (barline OR marker) regardless of which child widget
+    // has focus. Selection is mutually exclusive between the two
+    // kinds, so we can dispatch by checking which one is set.
+    void onDeleteSelectedArtifact();
 
 private:
     void buildMenus();
@@ -112,32 +130,46 @@ private:
     WaveformWidget* waveform_       = nullptr;
     StaffWidget*    staff_          = nullptr;
     QComboBox*      tuneTypeCombo_  = nullptr;
+    ProjectViewerDock* projectViewerDock_ = nullptr;
     QShortcut*      tapBarShortcut_    = nullptr;   // 'B'
+    QShortcut*      tapMarkerShortcut_ = nullptr;   // 'M'
     QShortcut*      undoShortcut_      = nullptr;   // Ctrl+Z
-    QShortcut*      deleteBarShortcut_ = nullptr;   // 'Del'
+    QShortcut*      deleteBarShortcut_ = nullptr;   // 'Del' (artifact-agnostic)
 
-    // The shared score model — owned here, observed by both widgets
-    // as a const view. shared_ptr (not unique_ptr) so the widgets'
-    // shared_ptr<const BarlineModel> handles can extend the
-    // lifetime if MainWindow tears down before they do (Qt's
-    // parent-child destruction order doesn't quite line up with
-    // member destruction here).
+    // The shared score models — owned here, observed by widgets +
+    // dock. shared_ptr (not unique_ptr) so widget handles can
+    // extend the lifetime if MainWindow tears down before they do
+    // (Qt's parent-child destruction order doesn't quite line up
+    // with member destruction here).
     std::shared_ptr<score::BarlineModel> barlineModel_;
+    std::shared_ptr<score::MarkerModel>  markerModel_;
 
     // MEMO: invariant — selection mirrors are one-shot, not loops.
-    // The waveform and staff each emit barlineSelectionChanged when
-    // their selection changes; MainWindow forwards each event to the
-    // *other* widget. Without a guard, "user clicks waveform" would
-    // bounce: waveform→staff→waveform→staff…  The setSelectedBarline
-    // no-op-on-equal short-circuits the loop after one round trip,
-    // but we still see the second emission and would log "select via
-    // staff" for what was actually a "select via waveform" event.
+    // Each widget (and now the dock) emits *SelectionChanged when
+    // its highlight changes; MainWindow forwards each event to the
+    // siblings. Without a guard, "user clicks waveform" would
+    // bounce: waveform→staff→waveform→staff…  setSelectedBarline /
+    // setSelectedMarkerId are no-op-on-equal so the bounce
+    // terminates anyway, but we still see the echo emissions and
+    // would log them as user actions in the wrong direction.
     // mirroringSelection_ is set true while we're propagating from
-    // one widget to the other; the receiving slot returns early when
-    // it sees the flag, so only the *originating* slot logs and
-    // forwards. Reset to false in the originating slot's outer scope
-    // after the forwarding call returns.
+    // an originating slot to its siblings; receiving slots return
+    // early when they see the flag, so only the originating slot
+    // logs and forwards. Reset after the forwarding calls return.
     bool mirroringSelection_ = false;
+
+    // Combined undo LIFO across barlines + markers, owned by
+    // MainWindow rather than by either model. Each tap pushes its
+    // kind; Ctrl+Z pops the back and dispatches to the matching
+    // model's undoLastAdd. MEMO: invariant — manual deletion of an
+    // artifact via Del does *not* update this stack, so a stale
+    // entry can sit at the top after a delete; onUndoLastPlacement
+    // peels through stale entries until either an undoLastAdd
+    // succeeds or the history drains. See feedback_simple_first.md
+    // — this is the simple route; a full QUndoStack would be richer
+    // but we don't need redo or cross-action undo yet.
+    enum class PlacementKind { Barline, Marker };
+    std::vector<PlacementKind> placementHistory_;
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't

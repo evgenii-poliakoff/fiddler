@@ -4,6 +4,8 @@
 #include "audio/Player.h"
 #include "audio/WaveformOverview.h"
 #include "score/BarlineModel.h"
+#include "score/MarkerModel.h"
+#include "ui/ProjectViewerDock.h"
 #include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 #include "util/Log.h"
@@ -79,7 +81,8 @@ constexpr std::array<TuneTypePreset, 10> kTuneTypePresets = {{
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , player_(std::make_unique<audio::Player>())
-    , barlineModel_(std::make_shared<score::BarlineModel>()) {
+    , barlineModel_(std::make_shared<score::BarlineModel>())
+    , markerModel_(std::make_shared<score::MarkerModel>()) {
     // Initialise the model with the first preset (Reel 4/4) so the
     // staff's tune-type label matches what the combo box shows on
     // first launch. The combo defaults to index 0; without this
@@ -110,29 +113,40 @@ MainWindow::MainWindow(QWidget* parent)
     connect(tapBarShortcut_, &QShortcut::activated,
             this, &MainWindow::onTapBarline);
 
-    // Ctrl+Z: peel the most-recently-placed barline (LIFO undo).
+    // 'M' anywhere in the window adds a marker at the player's
+    // current source-time position. Same shape as 'B' for barlines.
+    tapMarkerShortcut_ = new QShortcut(QKeySequence(Qt::Key_M), this);
+    tapMarkerShortcut_->setContext(Qt::WindowShortcut);
+    connect(tapMarkerShortcut_, &QShortcut::activated,
+            this, &MainWindow::onTapMarker);
+
+    // Ctrl+Z: peel the most-recently-placed artifact, regardless
+    // of kind. Dispatched via the combined placementHistory_ LIFO.
     undoShortcut_ = new QShortcut(QKeySequence::Undo, this);
     undoShortcut_->setContext(Qt::WindowShortcut);
     connect(undoShortcut_, &QShortcut::activated,
-            this, &MainWindow::onUndoLastBarline);
+            this, &MainWindow::onUndoLastPlacement);
 
-    // Del: remove the currently-selected barline. We install this at
-    // window scope (not just on the score widgets) so the shortcut
-    // works regardless of which child has focus — e.g. right after
-    // tap-to-place, when focus is still on the transport button the
-    // user clicked. The score widgets' own Key_Delete handlers stay
-    // in place for the standalone-widget unit tests; in MainWindow
-    // context this shortcut intercepts the key first.
+    // Del: remove the currently-selected artifact (barline or
+    // marker — selection is mutually exclusive between the two).
+    // Window-scope so the shortcut works regardless of which child
+    // has focus. The widgets' own Key_Delete handlers + the dock's
+    // tree event filter stay in place for standalone unit tests; in
+    // MainWindow context this shortcut intercepts the key first.
     deleteBarShortcut_ = new QShortcut(QKeySequence(Qt::Key_Delete), this);
     deleteBarShortcut_->setContext(Qt::WindowShortcut);
     connect(deleteBarShortcut_, &QShortcut::activated,
-            this, &MainWindow::onDeleteSelectedBarline);
+            this, &MainWindow::onDeleteSelectedArtifact);
 }
 
 MainWindow::~MainWindow() = default;
 
 const score::BarlineModel& MainWindow::barlineModel() const noexcept {
     return *barlineModel_;
+}
+
+const score::MarkerModel& MainWindow::markerModel() const noexcept {
+    return *markerModel_;
 }
 
 void MainWindow::buildMenus() {
@@ -192,6 +206,7 @@ void MainWindow::buildCentralWidget() {
     waveform_ = new WaveformWidget(central);
     waveform_->setObjectName("waveformWidget");
     waveform_->setBarlineModel(barlineModel_);
+    waveform_->setMarkerModel(markerModel_);
     connect(waveform_, &WaveformWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 // MEMO: log includes the source ("waveform-click")
@@ -203,16 +218,21 @@ void MainWindow::buildCentralWidget() {
                 onSeek(static_cast<int>(ms));
             });
     connect(waveform_, &WaveformWidget::barlineSelectionChanged,
-            this, &MainWindow::onWaveformSelectionChanged);
+            this, &MainWindow::onWaveformBarlineSelectionChanged);
+    connect(waveform_, &WaveformWidget::markerSelectionChanged,
+            this, &MainWindow::onWaveformMarkerSelectionChanged);
     connect(waveform_, &WaveformWidget::barlineDeleteRequested,
             this, &MainWindow::onBarlineDeleteRequested);
+    connect(waveform_, &WaveformWidget::markerDeleteRequested,
+            this, &MainWindow::onMarkerDeleteRequested);
     layout->addWidget(waveform_, /*stretch=*/1);
 
     // Staff: the lower view. Fixed-ish height (its sizeHint), shares
-    // the same BarlineModel and source-time axis as the waveform.
+    // the same models and source-time axis as the waveform.
     staff_ = new StaffWidget(central);
     staff_->setObjectName("staffWidget");
     staff_->setBarlineModel(barlineModel_);
+    staff_->setMarkerModel(markerModel_);
     connect(staff_, &StaffWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 FLOG_DEBUG("ui.score",
@@ -220,9 +240,13 @@ void MainWindow::buildCentralWidget() {
                 onSeek(static_cast<int>(ms));
             });
     connect(staff_, &StaffWidget::barlineSelectionChanged,
-            this, &MainWindow::onStaffSelectionChanged);
+            this, &MainWindow::onStaffBarlineSelectionChanged);
+    connect(staff_, &StaffWidget::markerSelectionChanged,
+            this, &MainWindow::onStaffMarkerSelectionChanged);
     connect(staff_, &StaffWidget::barlineDeleteRequested,
             this, &MainWindow::onBarlineDeleteRequested);
+    connect(staff_, &StaffWidget::markerDeleteRequested,
+            this, &MainWindow::onMarkerDeleteRequested);
     layout->addWidget(staff_);
 
     positionSlider_ = new QSlider(Qt::Horizontal, central);
@@ -258,6 +282,21 @@ void MainWindow::buildCentralWidget() {
     // No trailing addStretch — waveform_ already claims any extra
     // vertical space via its layout stretch factor.
     setCentralWidget(central);
+
+    // Right-side artifact viewer / inspector. MEMO: convention from
+    // editing-focused tools (DaVinci Resolve, Final Cut, Audition,
+    // GarageBand) — Inspector / properties panels live on the right.
+    // The dock displays markers and (future) loops, and edits them
+    // via the property page.
+    projectViewerDock_ = new ProjectViewerDock(this);
+    projectViewerDock_->setMarkerModel(markerModel_);
+    addDockWidget(Qt::RightDockWidgetArea, projectViewerDock_);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::markerSelectionChanged,
+            this, &MainWindow::onDockMarkerSelectionChanged);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::markerDeleteRequested,
+            this, &MainWindow::onMarkerDeleteRequested);
 }
 
 void MainWindow::onOpenFile() {
@@ -319,10 +358,13 @@ bool MainWindow::loadFile(const QString& path) {
     waveform_->setOverview(nullptr);
     waveform_->setPositionMs(0);
 
-    // A new file means the previous file's barlines are no longer
-    // meaningful — drop them. Both widgets are observing the model
-    // and will repaint to empty automatically.
+    // A new file means the previous file's annotations are no
+    // longer meaningful — drop them. The widgets + dock observe
+    // the models and will repaint to empty automatically. The
+    // combined undo history goes too.
     barlineModel_->clear();
+    markerModel_->clear();
+    placementHistory_.clear();
 
     // Tell the staff how long this file is (so its msToX mapping
     // works). The waveform gets its duration via the WaveformOverview
@@ -460,6 +502,10 @@ void MainWindow::onTapBarline() {
     }
 
     if (actuallyAdded) {
+        // Push to the combined LIFO so Ctrl+Z can peel this back as
+        // the most-recent placement, regardless of any markers
+        // placed in between.
+        placementHistory_.push_back(PlacementKind::Barline);
         FLOG_DEBUG("ui.score",
                    "tap-place ms={} index={} size={} sel={}",
                    pos, *inserted, barlineModel_->size(), *inserted);
@@ -470,16 +516,51 @@ void MainWindow::onTapBarline() {
     }
 }
 
-void MainWindow::onUndoLastBarline() {
-    // Ctrl+Z — peel the most-recently-added barline. The model
-    // returns false if the LIFO is empty; we just no-op in that case
-    // so an extra Ctrl+Z press doesn't do anything surprising.
-    const auto removed = barlineModel_->undoLastAdd();
-    if (removed) {
-        FLOG_DEBUG("ui.score", "undo-last size={}", barlineModel_->size());
-    } else {
-        FLOG_DEBUG("ui.score", "undo-last empty (no-op)");
+void MainWindow::onTapMarker() {
+    // The 'M' key — primary marker-placement gesture. Like 'B'
+    // for barlines, but markers are auto-named and never reject
+    // duplicates (two markers can sit at the same ms with
+    // different names — see MarkerModel::add).
+    if (!player_ || !player_->duration().count()) return;
+    const auto pos = player_->position().count();
+    const auto id  = markerModel_->add(pos);
+
+    // Auto-select the newly-placed marker. Same pattern as
+    // tap-place barline: makes "tap M, press Del" symmetric.
+    if (waveform_) waveform_->setSelectedMarkerId(id);
+
+    placementHistory_.push_back(PlacementKind::Marker);
+    FLOG_DEBUG("ui.score",
+               "tap-marker ms={} id={} size={}",
+               pos, id, markerModel_->size());
+}
+
+void MainWindow::onUndoLastPlacement() {
+    // Ctrl+Z — peel the most-recently-placed artifact regardless
+    // of kind. We may have to skip stale entries: if the user
+    // manually deleted an artifact via Del, its placementHistory_
+    // entry stays put, so undoLastAdd on the relevant model can
+    // return false. In that case we keep peeling until something
+    // gets removed or the history drains.
+    while (!placementHistory_.empty()) {
+        const auto kind = placementHistory_.back();
+        placementHistory_.pop_back();
+        const bool removed =
+            (kind == PlacementKind::Barline)
+            ? barlineModel_->undoLastAdd()
+            : markerModel_->undoLastAdd();
+        if (removed) {
+            const char* kindStr =
+                (kind == PlacementKind::Barline) ? "barline" : "marker";
+            FLOG_DEBUG("ui.score",
+                       "undo-last kind={} bar-size={} marker-size={}",
+                       kindStr,
+                       barlineModel_->size(), markerModel_->size());
+            return;
+        }
+        // else: stale entry, keep peeling.
     }
+    FLOG_DEBUG("ui.score", "undo-last empty (no-op)");
 }
 
 void MainWindow::onTuneTypePresetChosen(int comboIndex) {
@@ -498,7 +579,7 @@ void MainWindow::onTuneTypePresetChosen(int comboIndex) {
                preset.tuneType, preset.numerator, preset.denominator);
 }
 
-void MainWindow::onWaveformSelectionChanged(
+void MainWindow::onWaveformBarlineSelectionChanged(
     std::optional<std::size_t> index)
 {
     // MEMO: see the mirroringSelection_ comment in MainWindow.h —
@@ -518,7 +599,7 @@ void MainWindow::onWaveformSelectionChanged(
     }
 }
 
-void MainWindow::onStaffSelectionChanged(
+void MainWindow::onStaffBarlineSelectionChanged(
     std::optional<std::size_t> index)
 {
     if (mirroringSelection_) return;
@@ -535,6 +616,64 @@ void MainWindow::onStaffSelectionChanged(
     }
 }
 
+void MainWindow::onWaveformMarkerSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    // MEMO: three-way mirror across waveform / staff / dock. The
+    // mirroringSelection_ guard is shared with the barline mirror —
+    // a single bool is enough because at most one originating event
+    // is in flight at a time.
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (staff_)             staff_->setSelectedMarkerId(id);
+    if (projectViewerDock_) projectViewerDock_->setSelectedMarkerId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-marker id={} via=waveform size={}",
+                   *id, markerModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-marker cleared via=waveform size={}",
+                   markerModel_->size());
+    }
+}
+
+void MainWindow::onStaffMarkerSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (waveform_)          waveform_->setSelectedMarkerId(id);
+    if (projectViewerDock_) projectViewerDock_->setSelectedMarkerId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-marker id={} via=staff size={}",
+                   *id, markerModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-marker cleared via=staff size={}",
+                   markerModel_->size());
+    }
+}
+
+void MainWindow::onDockMarkerSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (waveform_) waveform_->setSelectedMarkerId(id);
+    if (staff_)    staff_->setSelectedMarkerId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-marker id={} via=dock size={}",
+                   *id, markerModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-marker cleared via=dock size={}",
+                   markerModel_->size());
+    }
+}
+
 void MainWindow::onBarlineDeleteRequested(std::size_t index) {
     // Either widget can fire this (via its Del-key handler) when it
     // has focus. Both route through the same slot — the model is
@@ -545,21 +684,36 @@ void MainWindow::onBarlineDeleteRequested(std::size_t index) {
                index, barlineModel_->size());
 }
 
-void MainWindow::onDeleteSelectedBarline() {
-    // Window-level Del shortcut. Looks up the currently-selected
-    // barline (the waveform and staff stay in sync via the mirror
-    // plumbing, so reading either is fine) and removes it from the
-    // model. With no current selection this is a quiet no-op — the
-    // user can tap B to add a new one, click on a tick to select an
-    // existing one, or Ctrl+Z to peel the most-recent placement.
+void MainWindow::onMarkerDeleteRequested(std::int64_t id) {
+    // Same shape as onBarlineDeleteRequested but keyed by the
+    // marker's stable ID. Fires from the score widgets' Del
+    // handlers OR the dock's tree-row Del filter (in standalone
+    // contexts; in MainWindow context the window-level Del
+    // shortcut takes precedence).
+    markerModel_->remove(id);
+    FLOG_DEBUG("ui.score", "delete-marker id={} via=widget-key size={}",
+               id, markerModel_->size());
+}
+
+void MainWindow::onDeleteSelectedArtifact() {
+    // Window-level Del shortcut. Selection is mutually exclusive
+    // between barlines and markers, so we just check both and
+    // dispatch to whichever has a value. With no selection at all
+    // this is a quiet no-op (the user can tap B/M to add, click an
+    // artifact to select, or Ctrl+Z to peel last placement).
     if (!waveform_) return;
-    const auto sel = waveform_->selectedBarline();
-    if (sel.has_value()) {
-        const auto idx = *sel;
+    if (const auto bar = waveform_->selectedBarline()) {
+        const auto idx = *bar;
         barlineModel_->removeAt(idx);
         FLOG_DEBUG("ui.score",
                    "delete index={} via=window-shortcut size={}",
                    idx, barlineModel_->size());
+    } else if (const auto mid = waveform_->selectedMarkerId()) {
+        const auto id = *mid;
+        markerModel_->remove(id);
+        FLOG_DEBUG("ui.score",
+                   "delete-marker id={} via=window-shortcut size={}",
+                   id, markerModel_->size());
     } else {
         FLOG_DEBUG("ui.score", "delete via=window-shortcut no-selection");
     }

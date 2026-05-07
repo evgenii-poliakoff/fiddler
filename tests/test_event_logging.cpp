@@ -411,12 +411,16 @@ TEST_CASE("ui.score: undo-last logs success and empty no-op cases",
     QTest::mouseClick(lw.stopButton, Qt::LeftButton);
     QTest::keyClick(lw.window.get(), Qt::Key_B);
 
-    SECTION("with at least one barline placed: 'undo-last size=…'") {
+    SECTION("with at least one barline placed: 'undo-last kind=barline …'") {
+        // MEMO: format change in step 5.5 — undo-last now reports
+        // the kind ("barline" / "marker") and both model sizes,
+        // because Ctrl+Z dispatches across the combined LIFO.
         CapturedLogs logs;
         QTest::keyClick(lw.window.get(), Qt::Key_Z, Qt::ControlModifier);
 
         const auto entries = logs.snapshot();
-        REQUIRE(containsLog(entries, "ui.score", "undo-last size=0"));
+        REQUIRE(containsLog(entries, "ui.score", "undo-last kind=barline"));
+        REQUIRE(containsLog(entries, "ui.score", "bar-size=0"));
         REQUIRE_FALSE(containsLog(entries, "ui.score", "no-op"));
     }
 
