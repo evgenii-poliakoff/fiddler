@@ -45,7 +45,12 @@ format `<verb> <params...> <state...>`. Categories:
 | `ui.file`      | open success / failure / cancelled, close               |
 | `ui.transport` | play, pause, stop, auto-pause, seek via position-slider |
 | `ui.tempo`     | tempo change (every applied step)                       |
-| `ui.score`     | tap-place, undo-last, time-sig pick, seek via waveform / staff click, select / clear, delete (widget key vs. window shortcut) |
+| `ui.score`     | tap-place (barline), tap-marker, undo-last (kind=barline\|marker), time-sig pick, seek via waveform / staff click, select / select-marker / clear, delete (widget key vs. window shortcut), marker-activated (double-click) |
+
+The `--log-filter` flag accepts a single glob or a comma-separated
+list. Each entry is either a bare `*`, a trailing `.*` subtree
+(`ui.*` matches `ui.file`, `ui.score`, …), or a literal exact
+category name. Whitespace around commas is trimmed.
 
 Below the UI layer, `[player]`, `[waveform]`, and `[score]` log lifecycle and
 resource events that are useful when a UI symptom traces back through
@@ -68,13 +73,15 @@ What is **not** in the log:
 14:23:12 debug [ui.transport] seek ms=12345 via=position-slider
 14:23:13 debug [ui.score]     tap-place ms=12345 index=0 size=1 sel=0
 14:23:14 debug [ui.score]     tap-place ms=14820 index=1 size=2 sel=1
-14:23:15 debug [ui.score]     undo-last size=1
+14:23:15 debug [ui.score]     undo-last kind=barline bar-size=1 marker-size=0
 14:23:16 debug [ui.score]     time-sig label=Single Jig numerator=6 denominator=8
-14:23:18 debug [ui.score]     select cleared via=waveform size=1
-14:23:19 debug [ui.score]     select index=0 via=waveform size=1
-14:23:20 debug [ui.score]     delete index=0 via=window-shortcut size=0
-14:23:21 debug [ui.transport] stop rewind=0
-14:23:22 debug [ui.file]      close
+14:23:18 debug [ui.score]     tap-marker ms=20100 id=1 size=1
+14:23:20 debug [ui.score]     select-marker id=1 via=dock size=1
+14:23:21 debug [ui.score]     marker-activated id=1 ms=20100 via=dock
+14:23:22 debug [ui.transport] play from=20100 ms audio=true
+14:23:30 debug [ui.score]     delete-marker id=1 via=window-shortcut size=0
+14:23:32 debug [ui.transport] stop rewind=0
+14:23:33 debug [ui.file]      close
 ```
 
 A reader who has never met this user can reconstruct the session
@@ -115,13 +122,25 @@ TEST_CASE("regression: <one-sentence summary of the bug>",
     //   [ui.tempo] tempo=N%                  → tempoSlider->setValue(N)
     //   [ui.score] tap-place ms=…            → keyClick(window, Qt::Key_B)
     //                                          (after seeking to that ms)
-    //   [ui.score] undo-last …               → keyClick(window, Qt::Key_Z, Ctrl)
+    //   [ui.score] tap-marker ms=… id=…      → keyClick(window, Qt::Key_M)
+    //                                          (after seeking to that ms)
+    //   [ui.score] undo-last kind=…          → keyClick(window, Qt::Key_Z, Ctrl)
     //   [ui.score] time-sig label=… …        → tuneCombo->setCurrentIndex(idx);
     //                                          emit tuneCombo->activated(idx)
     //   [ui.score] seek … via=waveform-click → mouseClick(waveform, …)
     //   [ui.score] seek … via=staff-click    → mouseClick(staff, …)
+    //   [ui.score] select-marker id=… via=dock
+    //                                        → dock->setSelectedMarkerId(id)
+    //                                          (or QTreeWidget::setCurrentItem
+    //                                           on the matching row)
+    //   [ui.score] marker-activated id=…     → emit dock->markerActivated(id)
+    //                                          (simulates a double-click on
+    //                                           the marker row)
     //   [ui.score] delete … via=window-shortcut
     //                                        → keyClick(window, Qt::Key_Delete)
+    //   [ui.score] delete-marker … via=window-shortcut
+    //                                        → keyClick(window, Qt::Key_Delete)
+    //                                          (with a marker selected)
     //   [ui.file] close                      → window->close()
     //
     // Then assert the bug-fix invariant.

@@ -146,6 +146,108 @@ The model is a `QObject` so widgets can observe `changed()` and
 repaint, but it owns no widget references and pulls no UI types
 beyond `QString` for the tune-type label.
 
+### Score model: markers (named cue points)
+
+`score::MarkerModel` is the second project-artifact model. Distinct
+from `BarlineModel`:
+
+- **Sparse, not dense.** A user typically has a handful of markers
+  per tune ("intro", "hard bit", "modulation"), versus dozens of
+  barlines.
+- **Named, not anonymous.** Each marker carries a `QString name`
+  that auto-defaults to "Mark N" via a monotonic counter (so a
+  rename + add cycle never produces duplicate auto-names) and the
+  user renames freely via the project viewer dock.
+- **Repositionable.** `MarkerModel::setPosition(id, ms)` moves a
+  marker to a new source-time and re-sorts; the marker's index
+  changes, but it carries a stable `int64_t id` that survives the
+  move. Selection in the widgets and the dock is therefore by ID,
+  not by index. `BarlineModel` doesn't need this because barlines
+  aren't repositioned — they're placed and removed, never moved.
+- **Duplicates allowed at the same ms.** Two markers can sit at
+  the same instant ("Section A start" and "Theme entry"); sort
+  ties are broken by ID so paint order stays deterministic.
+
+A small `undoLastAdd` LIFO mirrors `BarlineModel`'s, but the
+authoritative undo across both models lives at MainWindow level
+(see "Combined `Ctrl+Z`" below). The model's own LIFO becomes
+incidental in MainWindow context — kept around because the model
+is unit-tested standalone.
+
+### Project viewer dock
+
+`ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts
+the project's "artifacts" — markers today, loops in the next PR,
+notes / sections later. Layout is two-pane vertical:
+
+```
+┌───────────────────────────┐
+│ Project                   │ ← QDockWidget title
+├───────────────────────────┤
+│ ▾ Markers                 │
+│   Mark 1   (1000 ms)      │ ← QTreeWidget; one row per artifact
+│   Mark 2   (1500 ms)      │
+├───────────────────────────┤
+│ Properties                │
+│   Name:     [Mark 1____]  │ ← QStackedWidget; per-type page
+│   Position: [1000   ↕]    │   (here, the Marker page)
+└───────────────────────────┘
+```
+
+**`Qt::RightDockWidgetArea`** by convention — DaVinci Resolve,
+Final Cut, Adobe Audition, GarageBand all put their inspector /
+project panel on the right. Browsers (track lists, file libraries)
+go on the left in DAWs; this dock is more inspector than browser,
+so right is the right call.
+
+**Selection mirrored three ways.** Clicking a marker row in the
+dock emits `markerSelectionChanged(id)`; MainWindow forwards to
+both score widgets so all three views show the same highlight.
+Symmetric in the other directions — clicking a marker on the
+waveform or staff also navigates the tree. The
+`mirroringSelection_` flag on MainWindow stops the bounce.
+
+**Property-page editing.**
+- Name → `editingFinished` → `MarkerModel::rename`.
+- Position (ms) → `editingFinished` → `MarkerModel::setPosition`.
+  We bind to `editingFinished` (Enter / Tab / focus-loss), *not*
+  `valueChanged` — `valueChanged` would round-trip through the
+  model on every keystroke and re-format the spinbox text, which
+  strips leading zeros. The user editing "30004" by deleting the
+  '3' expects "0004" to remain in the field; with editingFinished
+  the in-progress text survives until the user signals "done".
+
+**Double-click on a marker row** emits `markerActivated(id)`
+(distinct from the passive `markerSelectionChanged`) — MainWindow
+seeks the player to the marker's source-time and starts playback.
+"Jump and play" is the standard DAW idiom for activate-on-
+double-click in a marker / clip / region list.
+
+**Adding a new artifact category** (loops in the next PR) is one
+new top-level item under the tree's invisible root, plus one new
+page in the property `QStackedWidget`. No restructuring required.
+
+### Combined `Ctrl+Z` across barlines + markers
+
+The user's mental model is "Z = undo last placement", regardless
+of whether the last thing placed was a barline or a marker. Each
+model has its own placement-history LIFO, but neither alone knows
+the global order across kinds. MainWindow keeps a small additional
+LIFO of `PlacementKind` enums:
+
+```cpp
+std::vector<PlacementKind> placementHistory_;   // Barline | Marker
+```
+
+`onTapBarline` / `onTapMarker` push the kind on a successful add;
+`onUndoLastPlacement` pops the back and dispatches to the matching
+model's `undoLastAdd`, walking past stale entries (a manual Del
+between placements leaves the history slightly out of sync, but
+the loop tolerates that). This is a degenerate undo — placements
+only, no redo, no edit history — which is sufficient for the tap-
+along workflow. A full `QUndoStack` is deferred until something
+demands it (Rule 8).
+
 ### Time-signature picker: tradition-named, technical-form deferred
 
 The combo box surfaces ten Irish-trad presets — Reel (4/4), Hornpipe
@@ -163,30 +265,46 @@ why traditional names lead the picker rather than bare technical form.
 
 ### Score widgets: WaveformWidget overlay + StaffWidget
 
-Both widgets observe the same `BarlineModel` (held as
-`shared_ptr<const BarlineModel>`) and the same source-time axis, so
-their barline ticks line up 1:1 horizontally. Each widget is small,
-self-contained, and emits a narrow set of signals
-(`seekRequested`, `barlineSelectionChanged`, `barlineDeleteRequested`)
-that MainWindow turns into model mutations and seek calls. Selection
-is a per-widget UI state; MainWindow mirrors it across the two so the
-highlight always matches.
+Both widgets observe the same `BarlineModel` *and* `MarkerModel`
+(each held as `shared_ptr<const ...>`) and the same source-time
+axis, so their barline ticks and marker labels line up 1:1
+horizontally. Each widget is small, self-contained, and emits a
+narrow set of signals (`seekRequested`, `barlineSelectionChanged`,
+`markerSelectionChanged`, `barlineDeleteRequested`,
+`markerDeleteRequested`) that MainWindow turns into model
+mutations and seek calls.
 
-Things deliberately not built in step 5 (deferred to a follow-on PR
-or a later step):
+**Selection is mutually exclusive** between barlines and markers.
+A widget can have at most one of `selectedBarline_` /
+`selectedMarkerId_` populated; the click handler enforces this
+("hit a marker → select marker, clear barline; hit a barline →
+select barline, clear marker; hit empty → clear both"). The user
+wanted "the selected artifact" to be a single concept (the
+property viewer in the dock shows its properties), and this is
+the simplest way to deliver that.
 
-- Markers (named timestamps for navigation) and practice loops —
-  separate concerns, separate models, separate UI. Will be the
-  next PR after step 5 lands.
-- Tap-latency compensation (subtracting ~150 ms from `player.position()`
-  at tap time to account for human reaction lag).
-- Drag-to-nudge a placed barline.
+**Marker visual** is a vertical tick (cyan to distinguish from
+the amber barline ticks) plus a small label flag at the top of
+the widget bearing the marker's name. The flag is elided if the
+name is too long; the rendering colour brightens for the
+currently-selected marker.
+
+Things deliberately not built in this PR (deferred to follow-on
+work):
+
+- Practice loops — model + UI for `start_ms` / `end_ms` /
+  pause-between-repeats, plus `Player`-side wrap-around. The
+  next PR after this one.
+- Tap-latency compensation (subtracting ~150 ms from
+  `player.position()` at tap time to account for human reaction
+  lag).
+- Drag-to-nudge a placed barline or marker.
 - Auto-suggestion of bar positions.
 - Free-meter / Air / "Other..." entries in the time-sig picker.
-- A generic overlay-layer registration API. Step 5 paints barlines
-  directly inside each widget's `paintEvent` because we have one
-  concrete overlay; the abstraction can wait until markers + loops
-  + note ranges arrive and we know the real shape.
+- A generic overlay-layer registration API. We have two concrete
+  overlays now (barlines + markers); the abstraction can wait
+  until note ranges arrive in step 6+ and we have a third
+  example to design from.
 
 ### Logging: spdlog (behind a facade)
 
@@ -463,12 +581,16 @@ Synchronization primitives:
   the generation that was active when they were spawned and drop
   their result if it no longer matches when the queued post-back
   reaches the GUI thread.
-- `score::BarlineModel` — owned by MainWindow, observed by both
-  score widgets via `shared_ptr<const ...>`. All mutations happen on
-  the GUI thread; no cross-thread access. The `changed()` Qt signal
-  is the one synchronisation point — widgets connect to it and call
-  `update()`, which hops naturally onto the GUI thread's paint
-  queue.
+- `score::BarlineModel`, `score::MarkerModel` — both owned by
+  MainWindow, observed by the score widgets and (for markers)
+  the project viewer dock. All mutations happen on the GUI
+  thread; no cross-thread access. Each model's `changed()` Qt
+  signal is the one synchronisation point — observers connect
+  and call `update()`, which hops naturally onto the GUI
+  thread's paint queue.
+- `MainWindow::placementHistory_` — `std::vector<PlacementKind>`,
+  GUI-thread-only. Combined `Ctrl+Z` LIFO across barlines +
+  markers; pop dispatches to the matching model's `undoLastAdd`.
 
 ## Logging
 
@@ -540,18 +662,20 @@ fiddler/
 ├── src/
 │   ├── main.cpp                    # CLI parsing + log init + Qt app
 │   ├── ui/
-│   │   ├── MainWindow.{h,cpp}      # transport + tempo + tune-type picker
-│   │   ├── WaveformWidget.{h,cpp}  # peaks + cursor + barline overlay
-│   │   └── StaffWidget.{h,cpp}     # 5-line staff + time sig + barlines
+│   │   ├── MainWindow.{h,cpp}        # transport + tempo + tune-type picker + dock
+│   │   ├── WaveformWidget.{h,cpp}    # peaks + cursor + barline + marker overlays
+│   │   ├── StaffWidget.{h,cpp}       # 5-line staff + time sig + barlines + markers
+│   │   └── ProjectViewerDock.{h,cpp} # right-side artifact viewer / inspector
 │   ├── audio/
-│   │   ├── Decoder.{h,cpp}         # FFmpeg wrapper, opaque interface
-│   │   ├── Stretcher.{h,cpp}       # Rubber Band wrapper (pImpl)
-│   │   ├── WaveformOverview.{h,cpp}# downsampled peak summary
-│   │   ├── Player.{h,cpp}          # PortAudio + decoder thread
-│   │   └── RingBuffer.h            # lock-free SPSC, header-only
+│   │   ├── Decoder.{h,cpp}           # FFmpeg wrapper, opaque interface
+│   │   ├── Stretcher.{h,cpp}         # Rubber Band wrapper (pImpl)
+│   │   ├── WaveformOverview.{h,cpp}  # downsampled peak summary
+│   │   ├── Player.{h,cpp}            # PortAudio + decoder thread
+│   │   └── RingBuffer.h              # lock-free SPSC, header-only
 │   ├── score/
-│   │   └── BarlineModel.{h,cpp}    # barlines + time signature
-│   └── util/Log.{h,cpp}            # logging facade over spdlog
+│   │   ├── BarlineModel.{h,cpp}      # barlines + time signature
+│   │   └── MarkerModel.{h,cpp}       # named cue points (stable IDs)
+│   └── util/Log.{h,cpp}              # logging facade over spdlog
 └── tests/
     ├── CMakeLists.txt              # Catch2 v3 + Qt6::Test
     ├── data/audio/                 # corpus dir, scanned at test time
@@ -593,6 +717,8 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. `Stretcher` (R3 engine) sits between the decoder and the ring buffer on the decoder thread; `Player::setTempoRatio()` is the GUI-visible knob. Position tracking uses the simple anchor model (Rule 8).
 - ✅ **Step 4** — Waveform view synchronised with playback position. `audio::WaveformOverview` (peak buckets keyed on source-time ms) is built on a detached worker thread on file open; `ui::WaveformWidget` paints peaks plus a cursor and emits `seekRequested(ms)` on click. Decoupled from `Player`; public `xToMs`/`msToX` so step 5's overlays plug in without restructuring.
 - ✅ **Step 5** — Empty staff widget; user-placed barlines mapped to audio timestamps. `score::BarlineModel` is the shared data layer (descriptive `TimeSignature`, no uniformity enforcement — supports crooked tunes); `ui::StaffWidget` and `ui::WaveformWidget` both observe it. Tap-to-place is the primary gesture (`B`); `Ctrl+Z` undoes the last placement; `Del` removes the selected (auto-selected on tap) bar. Tradition-named time-signature picker; `QPainter` rather than `QGraphicsView` — see "Score widgets" above for the deferred features.
+- ✅ **Step 5.5 (part A)** — Markers + project viewer dock. `score::MarkerModel` is the second project-artifact model (stable IDs, auto-named, repositionable, free-text rename). `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts the marker list and a property editor; double-click on a marker row "jump and plays". Tap-to-place is `M`; `Ctrl+Z` is now combined across barlines + markers; `Del` removes whichever is selected (mutually-exclusive selection). Loops + practice-pause are part B (the next PR).
+- 🔜 **Step 5.5 (part B)** — Practice loops. Loop = `start_ms` + `end_ms` + optional name + pause-between-repeats; created from two anchors (any combination of barlines + markers) by selecting them and pressing `L`. Selecting a saved loop "arms" it — Play/Pause/Stop then operate on the loop region; Stop deselects, returning to normal mode. Player wrap-around handled by the GUI timer (~50 ms jitter — acceptable for practice; sample-accurate hook deferred until needed).
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 

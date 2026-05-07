@@ -7,9 +7,11 @@ the tune onto a synchronised musical staff — clicking a bar in the staff
 seeks the audio, scrubbing the audio moves the staff cursor. Place a note
 on the staff to hear a reference tone for pitch-matching.
 
-**Status:** step 5 done — open audio, play with pitch-preserving tempo
-control 25–100 %, see and seek through a synchronised waveform, place
-barlines on a staff by tapping along to the recording.
+**Status:** step 5.5 part A done — open audio, play with pitch-
+preserving tempo control 25–100 %, see and seek through a
+synchronised waveform, place barlines and named markers on a staff
+by tapping along to the recording, navigate / rename / re-position
+markers from a right-side project viewer dock.
 
 ## Roadmap
 
@@ -19,6 +21,8 @@ barlines on a staff by tapping along to the recording.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change.
 - ✅ **Step 4** — Waveform view synchronised with playback position; click to seek.
 - ✅ **Step 5** — Empty staff widget + user-placed barlines + tradition-named time-signature picker. Tap `B` to place at the playback position; `Ctrl+Z` undoes; `Del` removes.
+- ✅ **Step 5.5 (part A)** — Markers + project viewer dock. Tap `M` to drop a named cue point at the playback position; the dock on the right lists all markers, lets you rename / re-position them, and double-clicking a row jumps the player there and starts playback.
+- 🔜 **Step 5.5 (part B)** — Practice loops. Loop = two anchors (markers or barlines) + optional pause-between-repeats; selecting an armed loop redirects Play/Pause/Stop to the loop region.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 
@@ -73,13 +77,13 @@ If the directory is empty, the corpus test prints a warning and passes
 ```
 fiddler/
 ├── CMakeLists.txt              # top-level
-├── docs/                       # architecture notes, ADRs
+├── docs/                       # architecture notes, debugging guide, ADRs
 ├── scripts/                    # dev helper scripts
 ├── src/
 │   ├── main.cpp
-│   ├── ui/                     # Qt widgets (main window, waveform, staff)
+│   ├── ui/                     # Qt widgets (main window, waveform, staff, project dock)
 │   ├── audio/                  # decoder, stretcher, overview, ring buffer, player
-│   └── score/                  # barlines + time signature
+│   └── score/                  # barlines + time signature, markers
 └── tests/                      # Catch2 + Qt6::Test
 ```
 
