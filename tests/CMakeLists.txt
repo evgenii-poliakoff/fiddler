@@ -7,6 +7,7 @@ add_executable(fiddler_tests
     test_decoder_corpus.cpp
     test_event_logging.cpp
     test_log.cpp
+    test_loop_model.cpp
     test_main_window.cpp
     test_marker_model.cpp
     test_project_viewer_dock.cpp
@@ -52,6 +53,7 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/MarkerModel.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/ProjectViewerDock.cpp
