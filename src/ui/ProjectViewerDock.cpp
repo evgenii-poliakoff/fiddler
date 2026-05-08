@@ -1,7 +1,9 @@
 #include "ui/ProjectViewerDock.h"
 
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
+#include <QCheckBox>
 #include <QFormLayout>
 #include <QHeaderView>
 #include <QKeyEvent>
@@ -20,14 +22,24 @@ namespace fiddler::ui {
 
 namespace {
 
-// MEMO: user-data role for the marker ID stored on each tree item.
-// Picked Qt::UserRole + 1 to leave the base UserRole free for any
-// future "kind" tag we'd want when categories multiply.
+// MEMO: user-data roles for the artifact ID stored on each tree
+// item. Separate roles per kind let us use the *role itself* as a
+// kind tag when interpreting a tree row — checking which role
+// returns a valid value tells us whether the row is a marker or a
+// loop. Marker rows only have kMarkerIdRole; loop rows only have
+// kLoopIdRole.
 constexpr int kMarkerIdRole = Qt::UserRole + 1;
+constexpr int kLoopIdRole   = Qt::UserRole + 2;
 
 // Property-stack page indices.
 constexpr int kPageNoSelection = 0;
 constexpr int kPageMarker      = 1;
+constexpr int kPageLoop        = 2;
+
+// Glyph prefix for the armed loop's tree row. Plain ASCII (▶ would
+// also work but the play-symbol arrow looks busier next to other
+// rows).
+constexpr const char* kArmedGlyph = "▶ ";
 
 } // namespace
 
@@ -63,6 +75,11 @@ void ProjectViewerDock::buildUi() {
     markersCategory_->setFlags(Qt::ItemIsEnabled);   // not selectable
     markersCategory_->setExpanded(true);
 
+    loopsCategory_ = new QTreeWidgetItem(tree_);
+    loopsCategory_->setText(0, tr("Loops"));
+    loopsCategory_->setFlags(Qt::ItemIsEnabled);     // not selectable
+    loopsCategory_->setExpanded(true);
+
     connect(tree_, &QTreeWidget::currentItemChanged,
             this,  &ProjectViewerDock::onTreeCurrentItemChanged);
     connect(tree_, &QTreeWidget::itemDoubleClicked,
@@ -81,7 +98,8 @@ void ProjectViewerDock::buildUi() {
         auto* l    = new QVBoxLayout(page);
         l->setContentsMargins(4, 4, 4, 4);
         auto* hint = new QLabel(
-            tr("Select a marker above to view its properties."), page);
+            tr("Select a marker or loop above to view its properties."),
+            page);
         hint->setEnabled(false);
         l->addWidget(hint);
         l->addStretch();
@@ -97,7 +115,7 @@ void ProjectViewerDock::buildUi() {
         markerNameEdit_ = new QLineEdit(page);
         markerNameEdit_->setObjectName("markerNameEdit");
         connect(markerNameEdit_, &QLineEdit::editingFinished,
-                this,            &ProjectViewerDock::onNameEdited);
+                this,            &ProjectViewerDock::onMarkerNameEdited);
         form->addRow(tr("Name:"), markerNameEdit_);
 
         markerPositionBox_ = new QSpinBox(page);
@@ -107,7 +125,7 @@ void ProjectViewerDock::buildUi() {
         // MEMO: bind to editingFinished (Enter or focus-loss) — NOT
         // valueChanged. valueChanged fires after every keystroke,
         // and that round-trips through the model
-        // (onPositionEdited → setPosition → emit changed →
+        // (onMarkerPositionEdited → setPosition → emit changed →
         // refreshPropertyPage → setValue), which forces the spinbox
         // to re-format its text on every edit. That re-formatting
         // strips leading zeros: editing "30004" by deleting the '3'
@@ -117,10 +135,61 @@ void ProjectViewerDock::buildUi() {
         // user intent (Enter / Tab / focus-loss), so the in-progress
         // text is left alone.
         connect(markerPositionBox_, &QSpinBox::editingFinished,
-                this, &ProjectViewerDock::onPositionEdited);
+                this, &ProjectViewerDock::onMarkerPositionEdited);
         form->addRow(tr("Position:"), markerPositionBox_);
 
         propertyStack_->insertWidget(kPageMarker, page);
+    }
+
+    // Page 2: loop properties — name, start, end, pause-between-repeats,
+    // and an Arm checkbox that mirrors transport state.
+    {
+        auto* page = new QWidget(propertyStack_);
+        auto* form = new QFormLayout(page);
+        form->setContentsMargins(4, 4, 4, 4);
+
+        loopNameEdit_ = new QLineEdit(page);
+        loopNameEdit_->setObjectName("loopNameEdit");
+        connect(loopNameEdit_, &QLineEdit::editingFinished,
+                this,          &ProjectViewerDock::onLoopNameEdited);
+        form->addRow(tr("Name:"), loopNameEdit_);
+
+        loopStartBox_ = new QSpinBox(page);
+        loopStartBox_->setObjectName("loopStartBox");
+        loopStartBox_->setRange(0, INT_MAX);
+        loopStartBox_->setSuffix(tr(" ms"));
+        connect(loopStartBox_, &QSpinBox::editingFinished,
+                this, &ProjectViewerDock::onLoopStartEdited);
+        form->addRow(tr("Start:"), loopStartBox_);
+
+        loopEndBox_ = new QSpinBox(page);
+        loopEndBox_->setObjectName("loopEndBox");
+        loopEndBox_->setRange(1, INT_MAX);    // end > start; 1 is the floor
+        loopEndBox_->setSuffix(tr(" ms"));
+        connect(loopEndBox_, &QSpinBox::editingFinished,
+                this, &ProjectViewerDock::onLoopEndEdited);
+        form->addRow(tr("End:"), loopEndBox_);
+
+        loopPauseBox_ = new QSpinBox(page);
+        loopPauseBox_->setObjectName("loopPauseBox");
+        loopPauseBox_->setRange(0, 60'000);   // up to 60s pause is plenty
+        loopPauseBox_->setSuffix(tr(" ms"));
+        connect(loopPauseBox_, &QSpinBox::editingFinished,
+                this, &ProjectViewerDock::onLoopPauseEdited);
+        form->addRow(tr("Pause:"), loopPauseBox_);
+
+        loopArmedCheck_ = new QCheckBox(tr("Armed"), page);
+        loopArmedCheck_->setObjectName("loopArmedCheck");
+        // MEMO: connect to toggled(bool) (not stateChanged) because
+        // we only ever use two states and toggled gives us the
+        // boolean directly. The `updatingPropertyPage_` guard
+        // suppresses re-emit when the dock pushes the armed state
+        // back from MainWindow via setArmedLoopId().
+        connect(loopArmedCheck_, &QCheckBox::toggled,
+                this, &ProjectViewerDock::onLoopArmedToggled);
+        form->addRow(QString(), loopArmedCheck_);
+
+        propertyStack_->insertWidget(kPageLoop, page);
     }
 
     propertyStack_->setCurrentIndex(kPageNoSelection);
@@ -142,13 +211,37 @@ void ProjectViewerDock::setMarkerModel(
         connect(markerModel_.get(), &score::MarkerModel::changed,
                 this, &ProjectViewerDock::onMarkerModelChanged);
     }
-    // Drop any stale selection before rebuilding — the tree may not
-    // have an entry matching the previous ID anymore.
+    // Drop any stale marker selection before rebuilding.
     if (selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
-    rebuildTree();
+    rebuildMarkerSection();
+    refreshPropertyPage();
+}
+
+void ProjectViewerDock::setLoopModel(
+    std::shared_ptr<score::LoopModel> model)
+{
+    if (loopModel_) {
+        disconnect(loopModel_.get(), nullptr, this, nullptr);
+    }
+    loopModel_ = std::move(model);
+    if (loopModel_) {
+        connect(loopModel_.get(), &score::LoopModel::changed,
+                this, &ProjectViewerDock::onLoopModelChanged);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (armedLoopId_.has_value()) {
+        // The armed loop belongs to the model that's now gone; drop
+        // it. MainWindow gets the cleared signal indirectly when the
+        // user (re-)arms via the new model.
+        armedLoopId_.reset();
+    }
+    rebuildLoopSection();
     refreshPropertyPage();
 }
 
@@ -161,7 +254,22 @@ void ProjectViewerDock::setSelectedMarkerId(
         && !markerModel_->indexOf(*id).has_value()) {
         id = std::nullopt;
     }
-    if (selectedMarkerId_ == id) return;
+    // MEMO: cross-kind mutual exclusion in the dock — selecting a
+    // marker clears any active loop selection. MainWindow's mirror
+    // plumbing already enforces this for the score widgets; the
+    // dock has to enforce it locally too because the tree is the
+    // origin of selection events when the user clicks a row.
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (selectedMarkerId_ == id) {
+        // Even on a no-op marker selection we may still need to
+        // refresh the property page if the loop slot was the
+        // previous occupant (cleared above).
+        refreshPropertyPage();
+        return;
+    }
     selectedMarkerId_ = id;
 
     // MEMO: temporarily block tree signals while we set the current
@@ -183,6 +291,60 @@ void ProjectViewerDock::setSelectedMarkerId(
     emit markerSelectionChanged(selectedMarkerId_);
 }
 
+void ProjectViewerDock::setSelectedLoopId(
+    std::optional<std::int64_t> id)
+{
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    // Mirror of setSelectedMarkerId: cross-kind mutual exclusion.
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_ == id) {
+        refreshPropertyPage();
+        return;
+    }
+    selectedLoopId_ = id;
+
+    const QSignalBlocker treeBlock(tree_);
+    if (id.has_value()) {
+        if (auto* item = findLoopItem(*id)) {
+            tree_->setCurrentItem(item);
+        } else {
+            tree_->setCurrentItem(nullptr);
+        }
+    } else {
+        tree_->setCurrentItem(nullptr);
+    }
+
+    refreshPropertyPage();
+    emit loopSelectionChanged(selectedLoopId_);
+}
+
+void ProjectViewerDock::setArmedLoopId(
+    std::optional<std::int64_t> id)
+{
+    // Coerce a dangling ID to nullopt — defensive against
+    // callers that have a stale view of the model.
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    if (armedLoopId_ == id) return;
+    armedLoopId_ = id;
+    // MEMO: rebuild the loop section so the armed glyph (▶) moves
+    // to the new row. The selection-by-ID is preserved by
+    // rebuildLoopSection's signal-blocked re-application.
+    rebuildLoopSection();
+    // Sync the Arm checkbox if the property page is currently
+    // showing the armed (or just-disarmed) loop. The
+    // updatingPropertyPage_ guard suppresses the re-emit.
+    refreshPropertyPage();
+}
+
 // ---- model → ui ---------------------------------------------------------
 
 void ProjectViewerDock::onMarkerModelChanged() {
@@ -196,44 +358,105 @@ void ProjectViewerDock::onMarkerModelChanged() {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
-    rebuildTree();
+    rebuildMarkerSection();
     refreshPropertyPage();
 }
 
-void ProjectViewerDock::rebuildTree() {
+void ProjectViewerDock::onLoopModelChanged() {
+    // Mirror of onMarkerModelChanged. Range edits (setRange) keep
+    // the same ID, so a selected loop survives a re-sort; only an
+    // outright remove drops the selection.
+    if (selectedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*selectedLoopId_).has_value())
+    {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (armedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*armedLoopId_).has_value())
+    {
+        // Armed loop was removed — quietly clear; MainWindow detects
+        // the dropped armedLoopId via its own listener on the model.
+        armedLoopId_.reset();
+    }
+    rebuildLoopSection();
+    refreshPropertyPage();
+}
+
+void ProjectViewerDock::rebuildMarkerSection() {
     // MEMO: block tree signals during the rebuild. Without this,
     // deleting the currently-selected QTreeWidgetItem fires
-    // currentItemChanged(nullptr) which would wipe selectedMarkerId_
-    // — turning a setPosition (which should preserve selection by ID)
-    // into a selection-clearing event.
+    // currentItemChanged(nullptr) which would wipe selection IDs —
+    // turning a setPosition / setRange (which should preserve
+    // selection by ID) into a selection-clearing event.
     const QSignalBlocker rebuildBlock(tree_);
 
-    // Drop existing marker children. We don't preserve QTreeWidgetItem
-    // pointers across rebuilds — they're cheap to recreate, and the
-    // user-data role round-trips the marker ID either way.
     while (markersCategory_->childCount() > 0) {
         delete markersCategory_->takeChild(0);
     }
-    if (!markerModel_) return;
-
-    for (const auto& m : markerModel_->markers()) {
-        auto* item = new QTreeWidgetItem(markersCategory_);
-        // MEMO: user-visible text combines the user-given name with
-        // the timestamp so the user can scan the list and locate
-        // entries by either. Format mirrors what a transcription
-        // editor reader would expect ("Mark 1   (1000 ms)").
-        item->setText(0, QString("%1   (%2 ms)")
-                            .arg(m.name)
-                            .arg(m.sourceMs));
-        item->setData(0, kMarkerIdRole,
-                      QVariant::fromValue<std::int64_t>(m.id));
+    if (markerModel_) {
+        for (const auto& m : markerModel_->markers()) {
+            auto* item = new QTreeWidgetItem(markersCategory_);
+            // MEMO: user-visible text combines the user-given name
+            // with the timestamp so the user can scan the list and
+            // locate entries by either. Format mirrors what a
+            // transcription editor reader would expect.
+            item->setText(0, QString("%1   (%2 ms)")
+                                .arg(m.name)
+                                .arg(m.sourceMs));
+            item->setData(0, kMarkerIdRole,
+                          QVariant::fromValue<std::int64_t>(m.id));
+        }
+        markersCategory_->setExpanded(true);
     }
-    markersCategory_->setExpanded(true);
 
-    // Re-apply the current selection in the rebuilt tree. The
-    // outer rebuildBlock above keeps this from re-firing the
+    // Re-apply the current selection (whatever kind it is). The
+    // outer rebuildBlock keeps this from re-firing the
     // currentItemChanged slot.
     if (selectedMarkerId_.has_value()) {
+        if (auto* item = findMarkerItem(*selectedMarkerId_)) {
+            tree_->setCurrentItem(item);
+        }
+    } else if (selectedLoopId_.has_value()) {
+        if (auto* item = findLoopItem(*selectedLoopId_)) {
+            tree_->setCurrentItem(item);
+        }
+    }
+}
+
+void ProjectViewerDock::rebuildLoopSection() {
+    const QSignalBlocker rebuildBlock(tree_);
+
+    while (loopsCategory_->childCount() > 0) {
+        delete loopsCategory_->takeChild(0);
+    }
+    if (loopModel_) {
+        for (const auto& l : loopModel_->loops()) {
+            auto* item = new QTreeWidgetItem(loopsCategory_);
+            // MEMO: armed loop gets a "▶ " prefix in the row text so
+            // the user can see at a glance which loop is currently
+            // wrapping the transport.
+            const bool armed = (armedLoopId_ == l.id);
+            const QString text =
+                QString("%1%2   (%3–%4 ms)")
+                    .arg(armed ? QString::fromUtf8(kArmedGlyph)
+                               : QString())
+                    .arg(l.name)
+                    .arg(l.startMs)
+                    .arg(l.endMs);
+            item->setText(0, text);
+            item->setData(0, kLoopIdRole,
+                          QVariant::fromValue<std::int64_t>(l.id));
+        }
+        loopsCategory_->setExpanded(true);
+    }
+
+    // Same selection re-apply as the marker section.
+    if (selectedLoopId_.has_value()) {
+        if (auto* item = findLoopItem(*selectedLoopId_)) {
+            tree_->setCurrentItem(item);
+        }
+    } else if (selectedMarkerId_.has_value()) {
         if (auto* item = findMarkerItem(*selectedMarkerId_)) {
             tree_->setCurrentItem(item);
         }
@@ -241,23 +464,40 @@ void ProjectViewerDock::rebuildTree() {
 }
 
 void ProjectViewerDock::refreshPropertyPage() {
-    if (!selectedMarkerId_.has_value() || !markerModel_) {
-        propertyStack_->setCurrentIndex(kPageNoSelection);
-        return;
+    if (selectedMarkerId_.has_value() && markerModel_) {
+        const auto idx = markerModel_->indexOf(*selectedMarkerId_);
+        if (idx) {
+            const auto& m = markerModel_->markers()[*idx];
+            updatingPropertyPage_ = true;
+            markerNameEdit_->setText(m.name);
+            markerPositionBox_->setValue(static_cast<int>(m.sourceMs));
+            updatingPropertyPage_ = false;
+            propertyStack_->setCurrentIndex(kPageMarker);
+            return;
+        }
     }
-    const auto idx = markerModel_->indexOf(*selectedMarkerId_);
-    if (!idx) {
-        propertyStack_->setCurrentIndex(kPageNoSelection);
-        return;
+    if (selectedLoopId_.has_value() && loopModel_) {
+        const auto idx = loopModel_->indexOf(*selectedLoopId_);
+        if (idx) {
+            const auto& l = loopModel_->loops()[*idx];
+            updatingPropertyPage_ = true;
+            loopNameEdit_->setText(l.name);
+            loopStartBox_->setValue(static_cast<int>(l.startMs));
+            // MEMO: keep the End spinbox's lower bound one above the
+            // current Start so the invariant end > start can never
+            // be entered through the UI. Same trick the other way
+            // for the Start spinbox's upper bound below.
+            loopEndBox_->setMinimum(static_cast<int>(l.startMs) + 1);
+            loopEndBox_->setValue(static_cast<int>(l.endMs));
+            loopStartBox_->setMaximum(static_cast<int>(l.endMs) - 1);
+            loopPauseBox_->setValue(l.pauseMs);
+            loopArmedCheck_->setChecked(armedLoopId_ == l.id);
+            updatingPropertyPage_ = false;
+            propertyStack_->setCurrentIndex(kPageLoop);
+            return;
+        }
     }
-    const auto& m = markerModel_->markers()[*idx];
-
-    updatingPropertyPage_ = true;
-    markerNameEdit_->setText(m.name);
-    markerPositionBox_->setValue(static_cast<int>(m.sourceMs));
-    updatingPropertyPage_ = false;
-
-    propertyStack_->setCurrentIndex(kPageMarker);
+    propertyStack_->setCurrentIndex(kPageNoSelection);
 }
 
 QTreeWidgetItem*
@@ -271,39 +511,102 @@ ProjectViewerDock::findMarkerItem(std::int64_t id) const {
     return nullptr;
 }
 
+QTreeWidgetItem*
+ProjectViewerDock::findLoopItem(std::int64_t id) const {
+    for (int i = 0; i < loopsCategory_->childCount(); ++i) {
+        auto* child = loopsCategory_->child(i);
+        if (child->data(0, kLoopIdRole).toLongLong() == id) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
 // ---- ui → model ---------------------------------------------------------
 
 void ProjectViewerDock::onTreeCurrentItemChanged(
     QTreeWidgetItem* current, QTreeWidgetItem* /*previous*/)
 {
-    std::optional<std::int64_t> newId;
+    // MEMO: the row's category determines which kind of selection
+    // we're emitting. Reading the parent pointer is more robust
+    // than role-presence checks because category headers and
+    // non-data items both fail any role check.
     if (current && current->parent() == markersCategory_) {
-        newId = current->data(0, kMarkerIdRole).toLongLong();
+        std::optional<std::int64_t> newId =
+            current->data(0, kMarkerIdRole).toLongLong();
+        // Cross-kind mutual exclusion: if a loop was selected,
+        // clear it before promoting the marker.
+        if (selectedLoopId_.has_value()) {
+            selectedLoopId_.reset();
+            emit loopSelectionChanged(selectedLoopId_);
+        }
+        if (selectedMarkerId_ != newId) {
+            selectedMarkerId_ = newId;
+            refreshPropertyPage();
+            emit markerSelectionChanged(selectedMarkerId_);
+        } else {
+            refreshPropertyPage();
+        }
+        return;
     }
-    if (selectedMarkerId_ == newId) return;
-    selectedMarkerId_ = newId;
-    refreshPropertyPage();
-    emit markerSelectionChanged(selectedMarkerId_);
+    if (current && current->parent() == loopsCategory_) {
+        std::optional<std::int64_t> newId =
+            current->data(0, kLoopIdRole).toLongLong();
+        if (selectedMarkerId_.has_value()) {
+            selectedMarkerId_.reset();
+            emit markerSelectionChanged(selectedMarkerId_);
+        }
+        if (selectedLoopId_ != newId) {
+            selectedLoopId_ = newId;
+            refreshPropertyPage();
+            emit loopSelectionChanged(selectedLoopId_);
+        } else {
+            refreshPropertyPage();
+        }
+        return;
+    }
+
+    // Current is null or a category header — clear both kinds.
+    bool emittedAny = false;
+    if (selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+        emittedAny = true;
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+        emittedAny = true;
+    }
+    if (emittedAny) refreshPropertyPage();
 }
 
 void ProjectViewerDock::onTreeItemDoubleClicked(
     QTreeWidgetItem* item, int /*column*/)
 {
-    // Only marker rows fire markerActivated — double-clicking the
-    // category header (and any future non-marker row) is a no-op.
-    if (!item || item->parent() != markersCategory_) return;
-    const auto id = item->data(0, kMarkerIdRole).toLongLong();
-    emit markerActivated(id);
+    if (!item) return;
+    if (item->parent() == markersCategory_) {
+        const auto id = item->data(0, kMarkerIdRole).toLongLong();
+        emit markerActivated(id);
+        return;
+    }
+    if (item->parent() == loopsCategory_) {
+        const auto id = item->data(0, kLoopIdRole).toLongLong();
+        emit loopActivated(id);
+        return;
+    }
+    // Category header double-click is a no-op (Qt's default
+    // expand/collapse behaviour is what we want here).
 }
 
-void ProjectViewerDock::onNameEdited() {
+void ProjectViewerDock::onMarkerNameEdited() {
     if (updatingPropertyPage_) return;
     if (!selectedMarkerId_ || !markerModel_) return;
     markerModel_->rename(*selectedMarkerId_, markerNameEdit_->text());
-    // Tree text refreshes via onMarkerModelChanged → rebuildTree.
+    // Tree text refreshes via onMarkerModelChanged → rebuildMarkerSection.
 }
 
-void ProjectViewerDock::onPositionEdited() {
+void ProjectViewerDock::onMarkerPositionEdited() {
     if (updatingPropertyPage_) return;
     if (!selectedMarkerId_ || !markerModel_) return;
     // editingFinished doesn't pass the new value, so we read it
@@ -315,21 +618,71 @@ void ProjectViewerDock::onPositionEdited() {
         static_cast<std::int64_t>(markerPositionBox_->value()));
 }
 
+void ProjectViewerDock::onLoopNameEdited() {
+    if (updatingPropertyPage_) return;
+    if (!selectedLoopId_ || !loopModel_) return;
+    loopModel_->rename(*selectedLoopId_, loopNameEdit_->text());
+}
+
+void ProjectViewerDock::onLoopStartEdited() {
+    if (updatingPropertyPage_) return;
+    if (!selectedLoopId_ || !loopModel_) return;
+    const auto idx = loopModel_->indexOf(*selectedLoopId_);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    const std::int64_t newStart = loopStartBox_->value();
+    // The spinbox bounds (clamped at refreshPropertyPage time)
+    // already prevent newStart >= currentEnd; defensively re-check
+    // anyway in case the bounds ever drift.
+    if (newStart >= l.endMs) return;
+    loopModel_->setRange(*selectedLoopId_, newStart, l.endMs);
+}
+
+void ProjectViewerDock::onLoopEndEdited() {
+    if (updatingPropertyPage_) return;
+    if (!selectedLoopId_ || !loopModel_) return;
+    const auto idx = loopModel_->indexOf(*selectedLoopId_);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    const std::int64_t newEnd = loopEndBox_->value();
+    if (newEnd <= l.startMs) return;
+    loopModel_->setRange(*selectedLoopId_, l.startMs, newEnd);
+}
+
+void ProjectViewerDock::onLoopPauseEdited() {
+    if (updatingPropertyPage_) return;
+    if (!selectedLoopId_ || !loopModel_) return;
+    loopModel_->setPauseMs(*selectedLoopId_, loopPauseBox_->value());
+}
+
+void ProjectViewerDock::onLoopArmedToggled(bool checked) {
+    if (updatingPropertyPage_) return;
+    if (!selectedLoopId_) return;
+    // MainWindow holds the actual transport state. We just relay
+    // the request — MainWindow will flip our armedLoopId_ via
+    // setArmedLoopId() once the change has actually taken effect.
+    emit loopArmToggleRequested(*selectedLoopId_, checked);
+}
+
 // ---- input forwarding ---------------------------------------------------
 
 bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
-    // MEMO: forward Del on a focused marker entry to the
-    // markerDeleteRequested signal. Lets the same key work in the
-    // dock as on the score widgets without a separate window-level
-    // shortcut. Other keys fall through to the tree's defaults
+    // MEMO: forward Del on a focused tree entry to whichever delete
+    // signal matches the current selection's kind. Mutual exclusion
+    // means at most one selection is set, so the dispatch is
+    // unambiguous. Other keys fall through to the tree's defaults
     // (arrow nav, Tab, etc.).
     if (watched == tree_ && event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
-        if (keyEvent->key() == Qt::Key_Delete
-            && selectedMarkerId_.has_value())
-        {
-            emit markerDeleteRequested(*selectedMarkerId_);
-            return true;
+        if (keyEvent->key() == Qt::Key_Delete) {
+            if (selectedMarkerId_.has_value()) {
+                emit markerDeleteRequested(*selectedMarkerId_);
+                return true;
+            }
+            if (selectedLoopId_.has_value()) {
+                emit loopDeleteRequested(*selectedLoopId_);
+                return true;
+            }
         }
     }
     return QDockWidget::eventFilter(watched, event);
