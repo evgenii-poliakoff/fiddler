@@ -1053,3 +1053,180 @@ TEST_CASE("MainWindow: opening a new file clears the loop model",
     REQUIRE(window->loopModel().empty());
     REQUIRE(window->markerModel().empty());
 }
+
+// ---------------------------------------------------------------------------
+// Loop activation (commit 5)
+//
+// MEMO[refactor]: these tests pin the arming state machine and the
+// dock<->MainWindow handshake. The wrap-around itself depends on
+// audio playback advancing the position, which isn't reliable in
+// headless CI — those paths are exercised end-to-end in manual
+// smoke tests, while the unit tests here verify the deterministic
+// arm / disarm transitions.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a fresh window with one loop spanning [start, end] ms.
+// Returns the (window, loopId) pair so the test can drive arming.
+struct LoadedWithLoop {
+    std::unique_ptr<MainWindow> window;
+    std::int64_t                loopId = 0;
+};
+
+LoadedWithLoop makeWindowWithLoop(std::int64_t start = 500,
+                                  std::int64_t end   = 1500) {
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, start);
+    seekAndTapMarker(*window, end);
+    waveform->setSecondaryAnchorMs(start);
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    LoadedWithLoop out;
+    out.loopId = window->loopModel().loops()[0].id;
+    out.window = std::move(window);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: loopActivated arms the loop, seeks to start, flips Play→Pause",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: load-bearing — double-click in the dock should be a
+    // single user gesture that lands the user at the loop's
+    // starting bar with playback running. Mirrors the marker-
+    // activated jump-and-play idiom.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+
+    // Move the player away from the loop's startMs so we can verify
+    // the seek lands.
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(0);
+    emit posSlider->sliderMoved(0);
+
+    emit dock->loopActivated(loaded.loopId);
+
+    REQUIRE(*dock->armedLoopId() == loaded.loopId);
+    REQUIRE(playBtn->text() == "Pause");
+    // Player::seek is synchronous; on no-audio hosts position is
+    // exactly the seek target. On an audio host a few ms can have
+    // elapsed by the time we read it.
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 500);
+    REQUIRE(pos <= 550);
+}
+
+TEST_CASE("MainWindow: Arm checkbox arms without seeking or auto-playing",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: the checkbox path is intentionally less aggressive than
+    // double-click — the user might be mid-listen and just want
+    // wrap-around enabled at endMs. A seek would be jarring, and
+    // auto-play would change transport state without an explicit
+    // intent.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(2000);
+    emit posSlider->sliderMoved(2000);
+    const auto posBefore = loaded.window->player().position().count();
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+
+    REQUIRE(*dock->armedLoopId() == loaded.loopId);
+    // Player did NOT move.
+    REQUIRE(loaded.window->player().position().count() == posBefore);
+}
+
+TEST_CASE("MainWindow: unchecking the Arm checkbox disarms",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    emit dock->loopArmToggleRequested(loaded.loopId, false);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: Stop disarms the armed loop",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: per design — Stop is the user's "exit loop mode"
+    // gesture. The next Play press resumes normal (non-wrapping)
+    // playback.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* stopBtn = loaded.window->findChild<QPushButton*>("stopButton");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: deleting the armed loop disarms transport",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    emit dock->loopDeleteRequested(loaded.loopId);
+    REQUIRE(loaded.window->loopModel().empty());
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: loadFile clears any armed-loop state",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    REQUIRE(loaded.window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: arming an unknown loop ID is a quiet no-op",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: defensive — the dock should never emit a stale ID, but
+    // we double-check at the MainWindow boundary so a future bug
+    // can't land us in an "armed but no loop" inconsistent state.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopArmToggleRequested(99999, true);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}

@@ -85,6 +85,13 @@ MainWindow::MainWindow(QWidget* parent)
     , barlineModel_(std::make_shared<score::BarlineModel>())
     , markerModel_(std::make_shared<score::MarkerModel>())
     , loopModel_(std::make_shared<score::LoopModel>()) {
+    // Listen for loop removals so we can drop armedLoopId_ if the
+    // armed loop disappears (Del or Ctrl+Z). The model's signal is
+    // the only way to find out; widgets and the dock route their
+    // delete-requested signals through us, but a third party (e.g.
+    // a future scripted edit) could remove a loop too.
+    connect(loopModel_.get(), &score::LoopModel::changed,
+            this, &MainWindow::onLoopModelChanged);
     // Initialise the model with the first preset (Reel 4/4) so the
     // staff's tune-type label matches what the combo box shows on
     // first launch. The combo defaults to index 0; without this
@@ -331,12 +338,12 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopDeleteRequested,
             this, &MainWindow::onLoopDeleteRequested);
-    // MEMO: dock's loopActivated and loopArmToggleRequested are
-    // wired in the next commit (5), where the actual transport
-    // arming + wrap-around lives. Leaving them disconnected here
-    // means double-click and the Arm checkbox are no-ops for now,
-    // matching the staged commits' "creation first, activation next"
-    // breakdown.
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopActivated,
+            this, &MainWindow::onLoopActivated);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopArmToggleRequested,
+            this, &MainWindow::onLoopArmToggleRequested);
 }
 
 void MainWindow::onOpenFile() {
@@ -406,6 +413,14 @@ bool MainWindow::loadFile(const QString& path) {
     markerModel_->clear();
     loopModel_->clear();
     placementHistory_.clear();
+
+    // Disarm any previously-armed loop. loopModel_->clear() above
+    // would have invalidated armedLoopId_ via onLoopModelChanged
+    // anyway, but resetting wrapPending_ is the explicit reason for
+    // doing it here too.
+    armedLoopId_.reset();
+    wrapPending_ = false;
+    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
 
     // Tell the staff how long this file is (so its msToX mapping
     // works). The waveform gets its duration via the WaveformOverview
@@ -481,7 +496,20 @@ void MainWindow::onStop() {
     playButton_->setText(tr("Play"));
     QSignalBlocker block(positionSlider_);
     positionSlider_->setValue(0);
-    FLOG_DEBUG("ui.transport", "stop rewind=0");
+
+    // MEMO: Stop is also the user's "exit loop mode" gesture, per
+    // the design discussion. Disarm here so the next Play button
+    // press resumes normal (non-wrapping) playback. wrapPending_
+    // resets too — any in-flight pause-between-repeats timer
+    // becomes a no-op when its lambda checks armedLoopId_.
+    const bool wasArmed = armedLoopId_.has_value();
+    armedLoopId_.reset();
+    wrapPending_ = false;
+    if (wasArmed && projectViewerDock_) {
+        projectViewerDock_->setArmedLoopId(std::nullopt);
+    }
+
+    FLOG_DEBUG("ui.transport", "stop rewind=0 disarmed={}", wasArmed);
 }
 
 void MainWindow::onSeek(int positionMs) {
@@ -780,6 +808,67 @@ void MainWindow::onMarkerActivated(std::int64_t id) {
                "marker-activated id={} ms={} via=dock", id, ms);
 }
 
+void MainWindow::onLoopActivated(std::int64_t id) {
+    // "Jump and play" for loops — arm + seek to startMs + play.
+    // The transport then wraps around back to startMs whenever the
+    // GUI poll sees position >= endMs.
+    if (!loopModel_ || !player_) return;
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto& loop = loopModel_->loops()[*idx];
+
+    armedLoopId_ = id;
+    wrapPending_ = false;
+    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(id);
+
+    onSeek(static_cast<int>(loop.startMs));
+    if (player_->state() != audio::TransportState::Playing) {
+        player_->play();
+        playButton_->setText(tr("Pause"));
+    }
+
+    FLOG_DEBUG("ui.score",
+               "loop-activated id={} start={} end={} pause={} via=dock",
+               id, loop.startMs, loop.endMs, loop.pauseMs);
+}
+
+void MainWindow::onLoopArmToggleRequested(std::int64_t id, bool armed) {
+    // The Armed checkbox path. Differs from onLoopActivated in two
+    // ways: (1) no auto-seek (the user might be mid-listen — arming
+    // should just enable wrap-around at endMs, not jolt them back to
+    // start), (2) no auto-play (same rationale).
+    if (!loopModel_) return;
+    if (armed) {
+        if (!loopModel_->indexOf(id)) return;
+        armedLoopId_ = id;
+        wrapPending_ = false;
+        if (projectViewerDock_) projectViewerDock_->setArmedLoopId(id);
+        FLOG_DEBUG("ui.score", "loop-armed id={} via=checkbox", id);
+    } else {
+        if (armedLoopId_ != id) return;
+        armedLoopId_.reset();
+        wrapPending_ = false;
+        if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
+        FLOG_DEBUG("ui.score", "loop-disarmed id={} via=checkbox", id);
+    }
+}
+
+void MainWindow::onLoopModelChanged() {
+    // If the armed loop has been removed (Del or Ctrl+Z, or any
+    // future scripted mutation), drop the armed state. Edits to
+    // start/end/pause keep the same ID so they don't disturb arming.
+    if (!armedLoopId_.has_value()) return;
+    if (loopModel_ && loopModel_->indexOf(*armedLoopId_).has_value()) {
+        return;   // loop still exists, possibly with new range
+    }
+    const auto droppedId = *armedLoopId_;
+    armedLoopId_.reset();
+    wrapPending_ = false;
+    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
+    FLOG_DEBUG("ui.score", "loop-disarmed id={} reason=removed-from-model",
+               droppedId);
+}
+
 void MainWindow::onDockMarkerSelectionChanged(
     std::optional<std::int64_t> id)
 {
@@ -957,7 +1046,65 @@ void MainWindow::updatePosition() {
     if (staff_) {
         staff_->setPositionMs(pos.count());
     }
-    // Auto-pause when we reach the end.
+
+    // Loop wrap-around — armed and we've crossed the loop's endMs.
+    // MEMO: GUI-poll-driven (50 ms timer) per the design discussion;
+    // wrap jitter of up to ~50 ms is inaudible during practice and
+    // simpler than threading the loop region through the audio
+    // callback. wrapPending_ blocks re-entry while a pause-between-
+    // repeats single-shot timer is in flight.
+    if (armedLoopId_.has_value() && !wrapPending_ && loopModel_
+        && player_->state() == audio::TransportState::Playing)
+    {
+        const auto idx = loopModel_->indexOf(*armedLoopId_);
+        if (idx) {
+            const auto& loop = loopModel_->loops()[*idx];
+            if (pos.count() >= loop.endMs) {
+                const auto loopId  = *armedLoopId_;
+                const auto startMs = loop.startMs;
+                const auto pauseMs = loop.pauseMs;
+
+                if (pauseMs <= 0) {
+                    // Tight wrap: seek back to startMs without
+                    // pausing. Keep the player in Playing state.
+                    player_->seek(std::chrono::milliseconds{startMs});
+                    FLOG_DEBUG("ui.transport",
+                               "loop-wrap id={} from={} to={} pause=0",
+                               loopId, pos.count(), startMs);
+                } else {
+                    wrapPending_ = true;
+                    player_->pause();
+                    // Seek now so the visible position slides back
+                    // to startMs immediately; the user sees the
+                    // pause as silence at the loop's beginning, not
+                    // dead air at the end.
+                    player_->seek(std::chrono::milliseconds{startMs});
+                    FLOG_DEBUG("ui.transport",
+                               "loop-wrap id={} from={} to={} pause={}",
+                               loopId, pos.count(), startMs, pauseMs);
+                    QPointer<MainWindow> self(this);
+                    QTimer::singleShot(pauseMs, this,
+                        [self, loopId, startMs]() {
+                            if (!self) return;
+                            self->wrapPending_ = false;
+                            // The user may have disarmed during the
+                            // pause (Stop, Del, file-load); the
+                            // checks below cover all those exits.
+                            if (self->armedLoopId_ != loopId) return;
+                            if (!self->player_) return;
+                            self->player_->play();
+                            self->playButton_->setText(self->tr("Pause"));
+                            (void)startMs;
+                        });
+                }
+                // Don't fall through to the auto-pause-at-end logic
+                // below — the loop is what governs the transport now.
+                return;
+            }
+        }
+    }
+
+    // Auto-pause when we reach the end (no armed loop).
     if (player_->state() == audio::TransportState::Playing
         && player_->duration().count() > 0
         && pos >= player_->duration()) {

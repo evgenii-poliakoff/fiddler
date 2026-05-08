@@ -126,6 +126,22 @@ private slots:
     // activate-on-double-click marker list.
     void onMarkerActivated(std::int64_t id);
 
+    // The user double-clicked a loop in the dock — arm it,
+    // seek to its startMs, and start playback. Same jump-and-play
+    // idiom as markers; the difference is that arming switches the
+    // transport into wrap-around mode (see updatePosition).
+    void onLoopActivated(std::int64_t id);
+
+    // The Arm checkbox on the loop property page was toggled.
+    // `armed=true` arms the loop *without* seeking or auto-playing
+    // (the user might be mid-listen and just want wrap-around to
+    // start happening at endMs); `armed=false` disarms.
+    void onLoopArmToggleRequested(std::int64_t id, bool armed);
+
+    // Connected to LoopModel::changed — drops the armed state if
+    // the armed loop has been removed from the model.
+    void onLoopModelChanged();
+
     // 'Del' on a widget: turn the requested-by-key signal into an
     // actual model mutation.
     void onBarlineDeleteRequested(std::size_t index);
@@ -199,6 +215,20 @@ private:
     // but we don't need redo or cross-action undo yet.
     enum class PlacementKind { Barline, Marker, Loop };
     std::vector<PlacementKind> placementHistory_;
+
+    // MEMO: armedLoopId_ is the canonical "transport is wrapping
+    // around this loop" state. The dock mirrors it via setArmedLoopId
+    // so the Armed checkbox + tree glyph match. Stop disarms; file
+    // load disarms; removing the armed loop from the model disarms.
+    std::optional<std::int64_t> armedLoopId_;
+
+    // Suppress re-entering the wrap path while a pause-between-
+    // repeats timer is in flight. Without this, the GUI poll could
+    // see pos > endMs on subsequent ticks (the player paused but
+    // the position didn't fully reset until the seek lands) and
+    // schedule duplicate wraps. Reset by the timer's lambda when
+    // the loop is rearmed at startMs.
+    bool wrapPending_ = false;
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't
