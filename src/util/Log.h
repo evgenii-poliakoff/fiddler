@@ -37,7 +37,13 @@ namespace fiddler::log {
 enum class Level { Trace, Debug, Info, Warn, Error, Off };
 
 struct Config {
-    Level                                  level    = Level::Warn;
+    // MEMO: default level is Info (not Warn) so the startup banner
+    // and lifecycle events ("fiddler X.Y starting up", "open: path=…")
+    // are visible without any flags. Tap-place / select / wrap-around
+    // are still Debug-level — pass --log-level=debug or set a
+    // narrower --log-filter (which auto-promotes to debug — see
+    // resolveLogConfig) to surface them.
+    Level                                  level    = Level::Info;
     // Comma-separated list of category globs. Each glob is either a
     // bare "*" (matches everything), a trailing ".*" pattern
     // (subtree match — "player.*" matches "player" and
@@ -49,6 +55,49 @@ struct Config {
     std::string                            filter   = "*";
     std::optional<std::filesystem::path>   logFile;           // unset → no file sink
 };
+
+// Inputs collected from the CLI + environment, kept as plain
+// strings + booleans so the resolver is independent of QCommandLineParser
+// (and therefore unit-testable without a QApplication).
+struct CliInputs {
+    // --log-level value. levelStr is ignored unless levelExplicit is
+    // true, so callers can pass an empty string when the flag wasn't
+    // set.
+    bool        levelExplicit  = false;
+    std::string levelStr;
+
+    // --log-filter value. filterStr is ignored unless filterExplicit
+    // is true; an unset flag falls back to the documented "*" default.
+    bool        filterExplicit = false;
+    std::string filterStr;
+
+    // --log-file. Empty string when unset.
+    std::string logFile;
+
+    // FIDDLER_LOG_LEVEL env var value. Empty string when unset.
+    std::string envLevel;
+};
+
+// Resolution outcome — either a Config or an error message (for
+// malformed --log-level / FIDDLER_LOG_LEVEL values).
+struct ResolveResult {
+    Config                       config;
+    std::optional<std::string>   error;
+};
+
+// Resolve CLI + environment into a Config.
+//
+// Precedence for level: CLI > env > default.
+// Filter: CLI value if set, else "*".
+//
+// MEMO: load-bearing UX rule — when --log-filter is explicitly set
+// and no level is otherwise specified, level is promoted to Debug.
+// The user's intent in passing a filter is "I want to see X"; if we
+// left the level at Info they'd get the filter-matching INFO+ lines
+// but miss every Debug call (which is where almost all gestural
+// logging lives), and quietly conclude the filter is broken. A past
+// debugging session burned exactly that hour. See docs/debugging.md.
+ResolveResult resolveLogConfig(const CliInputs& in);
 
 // Parse "trace" | "debug" | "info" | "warn" | "error" | "off"
 // (case-insensitive). Returns std::nullopt on unknown input.

@@ -39,30 +39,44 @@ int main(int argc, char* argv[]) {
     parser.addOption(logFileOpt);
     parser.process(app);
 
-    fiddler::log::Config logCfg;
-    logCfg.level  = fiddler::log::Level::Warn;
-    logCfg.filter = parser.value(logFilterOpt).toStdString();
-
-    // Env var first, then CLI overrides it.
-    if (const char* env = std::getenv("FIDDLER_LOG_LEVEL")) {
-        if (auto lvl = fiddler::log::parseLevel(env)) {
-            logCfg.level = *lvl;
-        }
-    }
-    if (parser.isSet(logLevelOpt)) {
-        const auto s = parser.value(logLevelOpt).toStdString();
-        if (auto lvl = fiddler::log::parseLevel(s)) {
-            logCfg.level = *lvl;
-        } else {
-            std::cerr << "Unknown log level: " << s << "\n";
-            return 2;
-        }
-    }
+    fiddler::log::CliInputs in;
+    in.levelExplicit  = parser.isSet(logLevelOpt);
+    in.levelStr       = parser.value(logLevelOpt).toStdString();
+    in.filterExplicit = parser.isSet(logFilterOpt);
+    in.filterStr      = parser.value(logFilterOpt).toStdString();
     if (parser.isSet(logFileOpt)) {
-        logCfg.logFile = parser.value(logFileOpt).toStdString();
+        in.logFile = parser.value(logFileOpt).toStdString();
+    }
+    if (const char* env = std::getenv("FIDDLER_LOG_LEVEL")) {
+        in.envLevel = env;
     }
 
-    fiddler::log::init(logCfg);
+    auto resolved = fiddler::log::resolveLogConfig(in);
+    if (resolved.error) {
+        std::cerr << *resolved.error << "\n";
+        return 2;
+    }
+
+    fiddler::log::init(resolved.config);
+    // MEMO: print the effective config to stderr unconditionally, so
+    // the user always knows what level + filter are active —
+    // independent of whatever --log-filter they passed. Going through
+    // FLOG_INFO would tag this with category "app" which a narrow
+    // filter like "ui.*,score" silently excludes; the banner would
+    // then be invisible exactly when it's most useful.
+    const char* levelStr = "info";
+    switch (resolved.config.level) {
+    case fiddler::log::Level::Trace: levelStr = "trace"; break;
+    case fiddler::log::Level::Debug: levelStr = "debug"; break;
+    case fiddler::log::Level::Info:  levelStr = "info";  break;
+    case fiddler::log::Level::Warn:  levelStr = "warn";  break;
+    case fiddler::log::Level::Error: levelStr = "error"; break;
+    case fiddler::log::Level::Off:   levelStr = "off";   break;
+    }
+    std::cerr << "fiddler "
+              << QApplication::applicationVersion().toStdString()
+              << " | log level=" << levelStr
+              << " filter='"     << resolved.config.filter << "'\n";
     FLOG_INFO("app", "fiddler {} starting up",
               QApplication::applicationVersion().toStdString());
 

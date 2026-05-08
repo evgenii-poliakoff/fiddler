@@ -188,3 +188,127 @@ TEST_CASE("Decoder::open emits an INFO line on success", "[log][decoder]") {
     std::error_code ec;
     fs::remove(wavPath, ec);
 }
+
+// ---------------------------------------------------------------------------
+// resolveLogConfig — CLI + env → Config resolution
+//
+// MEMO[refactor]: each TEST_CASE pins one rule of the level/filter
+// resolution. The load-bearing one is the auto-promote-to-Debug
+// behaviour: a user passing `--log-filter='ui.*'` without a level
+// flag expects to see logs, not silence. A previous bug where the
+// default level was Warn and no auto-promote existed buried two
+// debugging sessions; these tests pin the fix.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("resolveLogConfig: no flags → default level Info, filter '*'",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level  == fiddler::log::Level::Info);
+    REQUIRE(out.config.filter == "*");
+    REQUIRE_FALSE(out.config.logFile.has_value());
+}
+
+TEST_CASE("resolveLogConfig: --log-filter alone promotes level to Debug",
+          "[log][cli]") {
+    // MEMO: load-bearing rule. Without this auto-promote, a user
+    // who passes only --log-filter sees nothing (because all
+    // gestural FLOG_DEBUG calls are below the Info threshold).
+    fiddler::log::CliInputs in;
+    in.filterExplicit = true;
+    in.filterStr      = "ui.*,score";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level  == fiddler::log::Level::Debug);
+    REQUIRE(out.config.filter == "ui.*,score");
+}
+
+TEST_CASE("resolveLogConfig: explicit --log-level overrides the auto-promote",
+          "[log][cli]") {
+    // The user knows what they want — a filter + an explicit level
+    // means honour the level even if it's quieter than Debug.
+    fiddler::log::CliInputs in;
+    in.filterExplicit = true;
+    in.filterStr      = "ui.*";
+    in.levelExplicit  = true;
+    in.levelStr       = "warn";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level  == fiddler::log::Level::Warn);
+    REQUIRE(out.config.filter == "ui.*");
+}
+
+TEST_CASE("resolveLogConfig: env FIDDLER_LOG_LEVEL is honoured",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    in.envLevel = "trace";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level == fiddler::log::Level::Trace);
+}
+
+TEST_CASE("resolveLogConfig: --log-level overrides env",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    in.envLevel       = "trace";
+    in.levelExplicit  = true;
+    in.levelStr       = "error";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level == fiddler::log::Level::Error);
+}
+
+TEST_CASE("resolveLogConfig: env-set level + filter does NOT auto-promote",
+          "[log][cli]") {
+    // The user already chose a level via env; respect it.
+    fiddler::log::CliInputs in;
+    in.envLevel       = "warn";
+    in.filterExplicit = true;
+    in.filterStr      = "ui.*";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.level == fiddler::log::Level::Warn);
+}
+
+TEST_CASE("resolveLogConfig: bad --log-level returns an error",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    in.levelExplicit = true;
+    in.levelStr      = "bogus";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE(out.error.has_value());
+    REQUIRE(out.error->find("bogus") != std::string::npos);
+}
+
+TEST_CASE("resolveLogConfig: bad FIDDLER_LOG_LEVEL returns an error",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    in.envLevel = "bogus";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE(out.error.has_value());
+}
+
+TEST_CASE("resolveLogConfig: empty --log-filter falls back to '*'",
+          "[log][cli]") {
+    // Defensive — QCommandLineOption defaults to "*" when not set,
+    // but if a user passes an empty value explicitly we still
+    // produce a working filter (and auto-promote to Debug since
+    // they did pass the flag).
+    fiddler::log::CliInputs in;
+    in.filterExplicit = true;
+    in.filterStr      = "";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE_FALSE(out.error.has_value());
+    REQUIRE(out.config.filter == "*");
+    REQUIRE(out.config.level  == fiddler::log::Level::Debug);
+}
+
+TEST_CASE("resolveLogConfig: --log-file is passed through",
+          "[log][cli]") {
+    fiddler::log::CliInputs in;
+    in.logFile = "/tmp/fiddler.log";
+    auto out = fiddler::log::resolveLogConfig(in);
+    REQUIRE(out.config.logFile.has_value());
+    REQUIRE(out.config.logFile->string() == "/tmp/fiddler.log");
+}
