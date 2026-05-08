@@ -187,6 +187,30 @@ void WaveformWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     emit markerSelectionChanged(selectedMarkerId_);
 }
 
+std::optional<std::int64_t>
+WaveformWidget::primaryAnchorMs() const noexcept {
+    if (selectedBarline_.has_value() && barlineModel_
+        && *selectedBarline_ < barlineModel_->size())
+    {
+        return barlineModel_->barlines()[*selectedBarline_];
+    }
+    if (selectedMarkerId_.has_value() && markerModel_) {
+        if (const auto idx = markerModel_->indexOf(*selectedMarkerId_)) {
+            return markerModel_->markers()[*idx].sourceMs;
+        }
+    }
+    return std::nullopt;
+}
+
+void WaveformWidget::setSecondaryAnchorMs(
+    std::optional<std::int64_t> ms)
+{
+    if (secondaryAnchorMs_ == ms) return;
+    secondaryAnchorMs_ = ms;
+    update();
+    emit secondaryAnchorChanged(secondaryAnchorMs_);
+}
+
 void WaveformWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
     // Validate against current model — drop dangling IDs.
     if (id.has_value() && loopModel_
@@ -443,6 +467,23 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
+    // Secondary anchor — a dashed tick at the captured ms. Drawn
+    // after the artifact ticks so it sits visually on top, but
+    // before the cursor so the playhead always wins z-order.
+    if (secondaryAnchorMs_.has_value()) {
+        const int x = msToX(*secondaryAnchorMs_);
+        if (x >= 0 && x < width()) {
+            QPen pen(QColor(255, 200, 90), 2);
+            // MEMO: dashed style differentiates the secondary anchor
+            // from a regular selected barline (solid yellow). The
+            // dashed line reads as "armed for combination, not yet
+            // committed" — same convention as DAW ghost cursors.
+            pen.setStyle(Qt::DashLine);
+            painter.setPen(pen);
+            painter.drawLine(x, 0, x, height());
+        }
+    }
+
     // Playhead cursor.
     const int cursorX = msToX(positionMs_);
     if (cursorX >= 0 && cursorX < width()) {
@@ -459,11 +500,12 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     const int x  = event->pos().x();
     const auto ms = xToMs(x);
+    const bool ctrlHeld =
+        (event->modifiers() & Qt::ControlModifier) != 0;
 
-    // MEMO: hit-test priority — markers FIRST (they're labelled and
-    // visually atop barlines, so a click on a flag should select
-    // the marker), then barlines, then plain seek. This matches
-    // the user's "annotation > structural meta" mental model.
+    // MEMO: hit-test priority — markers FIRST (labelled and visually
+    // atop barlines, so a click on a flag should select the marker),
+    // then barlines, then plain seek.
 
     std::int64_t tolMs = 0;
     if (overview_ && width() > 0) {
@@ -474,12 +516,30 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
         }
     }
 
+    // MEMO: Ctrl+click semantics — "add as second anchor for loop
+    // creation". The current primary's ms is captured into the
+    // secondary slot before the new selection is installed; the
+    // dashed tick at that ms persists until cleared. Plain click
+    // clears the secondary slot as a side effect (the user is
+    // starting a fresh selection). See commit 4 for the reason this
+    // is widget-level (rather than MainWindow-level) state.
+    auto prepareClickStateChange = [&]() {
+        if (ctrlHeld) {
+            if (const auto primMs = primaryAnchorMs()) {
+                setSecondaryAnchorMs(*primMs);
+            }
+        } else {
+            setSecondaryAnchorMs(std::nullopt);
+        }
+    };
+
     // 1. Marker hit?
     if (markerModel_ && markerModel_->size() > 0 && tolMs >= 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
             const auto idx = markerModel_->indexOf(*markerHit);
             if (idx) {
-                setSelectedMarkerId(*markerHit);   // also clears barline sel
+                prepareClickStateChange();
+                setSelectedMarkerId(*markerHit);
                 emit seekRequested(
                     markerModel_->markers()[*idx].sourceMs);
                 event->accept();
@@ -491,14 +551,21 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
     // 2. Barline hit?
     if (barlineModel_ && barlineModel_->size() > 0 && tolMs >= 0) {
         if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
-            setSelectedBarline(*barHit);           // also clears marker sel
+            prepareClickStateChange();
+            setSelectedBarline(*barHit);
             emit seekRequested(barlineModel_->barlines()[*barHit]);
             event->accept();
             return;
         }
     }
 
-    // 3. Plain seek — clear both selections.
+    // 3. No artifact hit. Ctrl+click on empty space is a no-op so
+    // the user can't accidentally lose their second anchor by
+    // missing a tick. Plain click clears everything and seeks.
+    if (ctrlHeld) {
+        event->accept();
+        return;
+    }
     if (selectedBarline_.has_value()) {
         selectedBarline_.reset();
         update();
@@ -508,6 +575,9 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
         selectedMarkerId_.reset();
         update();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (secondaryAnchorMs_.has_value()) {
+        setSecondaryAnchorMs(std::nullopt);
     }
     emit seekRequested(ms);
     event->accept();
@@ -577,6 +647,11 @@ void WaveformWidget::keyPressEvent(QKeyEvent* event) {
             setSelectedBarline(std::nullopt);
         } else if (selectedMarkerId_.has_value()) {
             setSelectedMarkerId(std::nullopt);
+        }
+        // Also drop any secondary anchor — Esc means "I'm done with
+        // the in-flight selection state, including loop anchors".
+        if (secondaryAnchorMs_.has_value()) {
+            setSecondaryAnchorMs(std::nullopt);
         }
         event->accept();
         return;

@@ -924,3 +924,147 @@ TEST_CASE("WaveformWidget: setLoopModel(nullptr) detaches and clears selection",
     REQUIRE(w.loopModel() == nullptr);
     REQUIRE_FALSE(w.selectedLoopId().has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Secondary anchor (Ctrl+click multi-select for loop creation)
+//
+// MEMO[refactor]: each TEST_CASE pins one rule of the Ctrl+click
+// gesture. The widget's job is narrow: capture the previous primary
+// selection's ms when Ctrl+click hits a new artifact, and clear it
+// on a plain click or Esc. MainWindow consumes this in the L
+// shortcut (covered by integration tests against MainWindow).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("WaveformWidget: primaryAnchorMs returns nullopt with no selection",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    REQUIRE_FALSE(w.primaryAnchorMs().has_value());
+}
+
+TEST_CASE("WaveformWidget: primaryAnchorMs resolves selectedBarline to its ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    barlines->add(2500);
+    w.setBarlineModel(barlines);
+
+    w.setSelectedBarline(1);
+    REQUIRE(w.primaryAnchorMs() == 2500);
+}
+
+TEST_CASE("WaveformWidget: primaryAnchorMs resolves selectedMarkerId to its ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    w.setSelectedMarkerId(*model->idAt(0));
+    REQUIRE(w.primaryAnchorMs() == 1500);
+}
+
+TEST_CASE("WaveformWidget: Ctrl+click on a marker promotes prior primary to secondary",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: this is the load-bearing rule of the Ctrl+click gesture.
+    // The widget captures the *previous* primary's ms into the
+    // secondary slot, then installs the clicked marker as the new
+    // primary. Without this, MainWindow's L shortcut couldn't see
+    // two anchors at once.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    // Two markers at 1000 ms and 3000 ms — given a 4-second file
+    // and an 800-pixel widget, those land at x=200 and x=600.
+    const std::int64_t stamps[] = { 1000, 3000 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    QSignalSpy secondarySpy(&w, &WaveformWidget::secondaryAnchorChanged);
+
+    // Click marker 1 (no Ctrl) → primary at 1000 ms, no secondary.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 60));
+    REQUIRE(w.primaryAnchorMs() == 1000);
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+
+    // Ctrl+click marker 2 → primary at 3000, secondary at 1000.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
+                      QPoint(600, 60));
+    REQUIRE(w.primaryAnchorMs() == 3000);
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+    REQUIRE(secondarySpy.count() >= 1);   // at least one signal emitted
+}
+
+TEST_CASE("WaveformWidget: plain click clears any active secondary anchor",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    // Pre-seed a secondary anchor; then click an empty patch.
+    w.setSecondaryAnchorMs(1500);
+    REQUIRE(w.secondaryAnchorMs().has_value());
+
+    QSignalSpy spy(&w, &WaveformWidget::secondaryAnchorChanged);
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(700, 60));
+
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+    REQUIRE(spy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: Ctrl+click on empty space leaves secondary intact",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: a Ctrl+click that doesn't land on an artifact should not
+    // disturb the user's already-captured anchors. Otherwise a
+    // missed click would silently abort the loop-creation gesture.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    w.setSecondaryAnchorMs(1500);
+    REQUIRE(w.secondaryAnchorMs() == 1500);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
+                      QPoint(700, 60));   // nothing here
+    REQUIRE(w.secondaryAnchorMs() == 1500);
+}
+
+TEST_CASE("WaveformWidget: Esc clears secondary anchor along with primary",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+    w.setSecondaryAnchorMs(2500);
+    REQUIRE(w.secondaryAnchorMs().has_value());
+
+    QTest::keyClick(&w, Qt::Key_Escape);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    QSignalSpy spy(&w, &WaveformWidget::secondaryAnchorChanged);
+
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE(spy.count() == 1);
+    w.setSecondaryAnchorMs(1000);    // same value
+    REQUIRE(spy.count() == 1);        // no re-emit
+    w.setSecondaryAnchorMs(std::nullopt);
+    REQUIRE(spy.count() == 2);
+    w.setSecondaryAnchorMs(std::nullopt);
+    REQUIRE(spy.count() == 2);
+}

@@ -671,3 +671,49 @@ TEST_CASE("StaffWidget: setLoopModel(nullptr) detaches and clears selection",
     REQUIRE(w.loopModel() == nullptr);
     REQUIRE_FALSE(w.selectedLoopId().has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Secondary anchor (Ctrl+click multi-select for loop creation)
+//
+// MEMO[refactor]: the StaffWidget mirrors the WaveformWidget rules
+// for the loop-creation gesture; canonical commentary lives in the
+// waveform tests. These cases verify the staff implementation
+// follows the same shape, since both widgets feed MainWindow's L
+// shortcut.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("StaffWidget: Ctrl+click on a marker promotes prior primary to secondary",
+          "[staff-widget][gui][secondary-anchor]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::int64_t stamps[] = { 1000, 3000 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    // 4-second file, 800-pixel widget: 1000ms → x=200, 3000ms → x=600.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 50));
+    REQUIRE(w.primaryAnchorMs() == 1000);
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
+                      QPoint(600, 50));
+    REQUIRE(w.primaryAnchorMs() == 3000);
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+}
+
+TEST_CASE("StaffWidget: Esc clears the secondary anchor",
+          "[staff-widget][gui][secondary-anchor]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    w.setSecondaryAnchorMs(1500);
+    REQUIRE(w.secondaryAnchorMs().has_value());
+
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+
+    QTest::keyClick(&w, Qt::Key_Escape);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+}

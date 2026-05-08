@@ -194,6 +194,28 @@ void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     emit markerSelectionChanged(selectedMarkerId_);
 }
 
+std::optional<std::int64_t>
+StaffWidget::primaryAnchorMs() const noexcept {
+    if (selectedBarline_.has_value() && barlineModel_
+        && *selectedBarline_ < barlineModel_->size())
+    {
+        return barlineModel_->barlines()[*selectedBarline_];
+    }
+    if (selectedMarkerId_.has_value() && markerModel_) {
+        if (const auto idx = markerModel_->indexOf(*selectedMarkerId_)) {
+            return markerModel_->markers()[*idx].sourceMs;
+        }
+    }
+    return std::nullopt;
+}
+
+void StaffWidget::setSecondaryAnchorMs(std::optional<std::int64_t> ms) {
+    if (secondaryAnchorMs_ == ms) return;
+    secondaryAnchorMs_ = ms;
+    update();
+    emit secondaryAnchorChanged(secondaryAnchorMs_);
+}
+
 void StaffWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
     if (id.has_value() && loopModel_
         && !loopModel_->indexOf(*id).has_value()) {
@@ -288,6 +310,7 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     paintTimeSignature(painter);
     paintBarlines(painter);
     paintMarkers(painter);
+    paintSecondaryAnchor(painter);
     paintCursor(painter);
 }
 
@@ -449,6 +472,16 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
     }
 }
 
+void StaffWidget::paintSecondaryAnchor(QPainter& painter) const {
+    if (!secondaryAnchorMs_.has_value()) return;
+    const int x = msToX(*secondaryAnchorMs_);
+    if (x < 0 || x >= width()) return;
+    QPen pen(QColor(255, 200, 90), 2);
+    pen.setStyle(Qt::DashLine);
+    painter.setPen(pen);
+    painter.drawLine(x, 0, x, height());
+}
+
 void StaffWidget::paintCursor(QPainter& painter) const {
     const int cursorX = msToX(positionMs_);
     if (cursorX < 0 || cursorX >= width()) return;
@@ -469,21 +502,33 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
 
     const int          clickX = event->pos().x();
     const std::int64_t ms     = xToMs(clickX);
+    const bool ctrlHeld =
+        (event->modifiers() & Qt::ControlModifier) != 0;
 
-    // MEMO: same hit-test priority as WaveformWidget — markers
-    // first (labelled, visually above), then barlines, then plain
-    // seek with both selections cleared.
     std::int64_t tolMs = 0;
     if (width() > 0) {
         tolMs = static_cast<std::int64_t>(kHitTolerancePx)
                 * durationMs_ / width();
     }
 
+    // MEMO: same Ctrl+click semantics as WaveformWidget — see the
+    // canonical comment there.
+    auto prepareClickStateChange = [&]() {
+        if (ctrlHeld) {
+            if (const auto primMs = primaryAnchorMs()) {
+                setSecondaryAnchorMs(*primMs);
+            }
+        } else {
+            setSecondaryAnchorMs(std::nullopt);
+        }
+    };
+
     // 1. Marker hit?
     if (markerModel_ && markerModel_->size() > 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
             const auto idx = markerModel_->indexOf(*markerHit);
             if (idx) {
+                prepareClickStateChange();
                 setSelectedMarkerId(*markerHit);
                 emit seekRequested(
                     markerModel_->markers()[*idx].sourceMs);
@@ -496,6 +541,7 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
     // 2. Barline hit?
     if (barlineModel_ && barlineModel_->size() > 0) {
         if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
+            prepareClickStateChange();
             setSelectedBarline(*barHit);
             emit seekRequested(barlineModel_->barlines()[*barHit]);
             event->accept();
@@ -503,7 +549,11 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
         }
     }
 
-    // 3. Plain seek — clear both selections.
+    // 3. No artifact hit. Ctrl+click on empty space is a no-op.
+    if (ctrlHeld) {
+        event->accept();
+        return;
+    }
     if (selectedBarline_.has_value()) {
         selectedBarline_.reset();
         update();
@@ -513,6 +563,9 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
         selectedMarkerId_.reset();
         update();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (secondaryAnchorMs_.has_value()) {
+        setSecondaryAnchorMs(std::nullopt);
     }
     emit seekRequested(ms);
     event->accept();
@@ -576,6 +629,9 @@ void StaffWidget::keyPressEvent(QKeyEvent* event) {
             setSelectedBarline(std::nullopt);
         } else if (selectedMarkerId_.has_value()) {
             setSelectedMarkerId(std::nullopt);
+        }
+        if (secondaryAnchorMs_.has_value()) {
+            setSecondaryAnchorMs(std::nullopt);
         }
         event->accept();
         return;

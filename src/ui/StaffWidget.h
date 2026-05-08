@@ -87,6 +87,15 @@ public:
     [[nodiscard]] std::optional<std::int64_t>
         selectedLoopId() const noexcept { return selectedLoopId_; }
 
+    // See WaveformWidget for the full secondary-anchor rationale —
+    // the staff mirrors the same shape (Ctrl+left-click promotes the
+    // current primary's ms to a secondary anchor; dashed tick at the
+    // captured ms; cleared by plain click or Esc).
+    [[nodiscard]] std::optional<std::int64_t>
+        secondaryAnchorMs() const noexcept { return secondaryAnchorMs_; }
+    [[nodiscard]] std::optional<std::int64_t>
+        primaryAnchorMs() const noexcept;
+
     // Coordinate transforms — public so other code can map between
     // pixel columns and source-time milliseconds without
     // reimplementing the math. xToMs() returns 0 when no duration
@@ -106,6 +115,7 @@ public slots:
     void setSelectedBarline(std::optional<std::size_t> index);
     void setSelectedMarkerId(std::optional<std::int64_t> id);
     void setSelectedLoopId  (std::optional<std::int64_t> id);
+    void setSecondaryAnchorMs(std::optional<std::int64_t> ms);
 
 signals:
     // Fires on left-click. The argument is the source-time the user
@@ -121,6 +131,7 @@ signals:
     // selection clears as a side effect of mutual exclusion or model
     // invalidation. The widget never originates loop selection.
     void loopSelectionChanged   (std::optional<std::int64_t> id);
+    void secondaryAnchorChanged (std::optional<std::int64_t> ms);
 
     // User pressed Del while an artifact was selected.
     void barlineDeleteRequested(std::size_t index);
@@ -144,6 +155,7 @@ private:
     void paintLoops(QPainter& painter)         const;
     void paintBarlines(QPainter& painter)      const;
     void paintMarkers(QPainter& painter)       const;
+    void paintSecondaryAnchor(QPainter& painter) const;
     void paintCursor(QPainter& painter)        const;
 
     // Pixel y-coordinates of the top and bottom staff lines.
@@ -158,6 +170,7 @@ private:
     std::optional<std::size_t>                 selectedBarline_;
     std::optional<std::int64_t>                selectedMarkerId_;
     std::optional<std::int64_t>                selectedLoopId_;
+    std::optional<std::int64_t>                secondaryAnchorMs_;
 };
 
 } // namespace fiddler::ui
