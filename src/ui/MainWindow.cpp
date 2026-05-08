@@ -481,13 +481,47 @@ void MainWindow::onPlayPause() {
         player_->pause();
         playButton_->setText(tr("Play"));
         FLOG_DEBUG("ui.transport", "pause at={} ms", pos);
-    } else {
-        const auto pos = player_->position().count();
-        player_->play();
-        playButton_->setText(tr("Pause"));
-        FLOG_DEBUG("ui.transport",
-                   "play from={} ms audio={}", pos, player_->hasAudioOutput());
+        return;
     }
+    // Transitioning to Play.
+    auto pos = player_->position().count();
+
+    // MEMO: load-bearing UX rule for the armed-loop path. If the
+    // user has armed a loop (via the Arm checkbox or by selecting
+    // it and reaching here without a double-click) and presses Play
+    // while the cursor is OUTSIDE [startMs, endMs), seek to
+    // startMs first. The intent of pressing Play with a loop armed
+    // is "play the loop now". Without this seek, two confusing
+    // cases bite the user:
+    //
+    //   * pos < startMs: they hear the whole tune up to endMs once
+    //     before the loop starts wrapping (could be 30+ seconds of
+    //     "wrong" playback before the first wrap fires).
+    //
+    //   * pos >= endMs: the wrap path fires once on the first GUI
+    //     poll, but the user still spent that one frame at the
+    //     wrong position. Cleaner to land at startMs immediately.
+    //
+    // Inside [startMs, endMs) we leave the position alone — that's
+    // the "armed mid-listen and resumed" case, where preserving
+    // continuity matters.
+    if (armedLoopId_.has_value() && loopModel_) {
+        if (const auto idx = loopModel_->indexOf(*armedLoopId_)) {
+            const auto& loop = loopModel_->loops()[*idx];
+            if (pos < loop.startMs || pos >= loop.endMs) {
+                player_->seek(std::chrono::milliseconds{loop.startMs});
+                pos = loop.startMs;
+                FLOG_DEBUG("ui.transport",
+                           "play-armed-seek id={} to={}",
+                           *armedLoopId_, loop.startMs);
+            }
+        }
+    }
+
+    player_->play();
+    playButton_->setText(tr("Pause"));
+    FLOG_DEBUG("ui.transport",
+               "play from={} ms audio={}", pos, player_->hasAudioOutput());
 }
 
 void MainWindow::onStop() {

@@ -1230,3 +1230,118 @@ TEST_CASE("MainWindow: arming an unknown loop ID is a quiet no-op",
     emit dock->loopArmToggleRequested(99999, true);
     REQUIRE_FALSE(dock->armedLoopId().has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Press-Play-with-armed-loop seek rule
+//
+// MEMO[refactor]: load-bearing UX — pressing Play with a loop armed
+// should land the user at the loop's startMs unless they're already
+// inside the loop (mid-listen continuity). Three branches:
+//   * pos < startMs   → seek
+//   * pos in loop     → no seek (continuity)
+//   * pos >= endMs    → seek
+// Without the seek branches, the user either waits 30+ seconds for
+// the tune to reach endMs before wrap engages, or sits at a stale
+// post-loop position.
+// ---------------------------------------------------------------------------
+
+// MEMO: the test fixture WAV is 2 seconds long, so all ms values
+// in this block stay strictly inside [0, 2000].
+
+TEST_CASE("MainWindow: Play with armed loop and pos before startMs seeks to startMs",
+          "[main-window][gui][integration][loops][play-armed]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/1000, /*end=*/1800);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    // Arm via checkbox path (no auto-seek), then move position to
+    // BEFORE startMs to set up the "user wants to drill the loop"
+    // scenario.
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(300);
+    emit posSlider->sliderMoved(300);
+    REQUIRE(loaded.window->player().position().count() == 300);
+
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    // Player now sits at startMs (or up to ~50ms past on hosts
+    // where audio is actually advancing).
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 1000);
+    REQUIRE(pos <= 1050);
+}
+
+TEST_CASE("MainWindow: Play with armed loop and pos inside the loop preserves position",
+          "[main-window][gui][integration][loops][play-armed]") {
+    // MEMO: the "armed mid-listen and resumed" case. The user was
+    // already inside the loop region; pressing Play after a pause
+    // should resume from where they paused, not jump back to start.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1800);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 1000);
+    REQUIRE(pos <= 1050);   // no seek to startMs
+}
+
+TEST_CASE("MainWindow: Play with armed loop and pos past endMs seeks to startMs",
+          "[main-window][gui][integration][loops][play-armed]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/400, /*end=*/1000);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 400);
+    REQUIRE(pos <= 450);
+}
+
+TEST_CASE("MainWindow: Play with no armed loop does not jump",
+          "[main-window][gui][integration][loops][play-armed]") {
+    // MEMO: regression — the seek branch is gated on armedLoopId_.
+    // Disarmed playback should always resume from the current
+    // position, never silently jump.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* playBtn   = window->findChild<QPushButton*>("playButton");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = window->player().position().count();
+    REQUIRE(pos >= 1500);
+    REQUIRE(pos <= 1550);
+}
