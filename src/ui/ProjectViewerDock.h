@@ -129,6 +129,19 @@ signals:
     void markerDeleteRequested(std::int64_t id);
     void loopDeleteRequested  (std::int64_t id);
 
+    // Loop-creation gesture from the dock — Ctrl+left-click on a
+    // marker row asks MainWindow to capture the *current* primary
+    // anchor's ms as the secondary. The dock doesn't know what's
+    // primary on the score widgets (it could be a barline), so the
+    // signal is intentionally parameterless: MainWindow reads the
+    // primary's ms from the waveform widget. Mirrors the Ctrl+click
+    // gesture already on the score widgets.
+    void loopAnchorAddRequested();
+    // Plain left-click anywhere else in the tree clears any active
+    // secondary anchor — same as a plain (non-Ctrl) click on the
+    // score widgets.
+    void loopAnchorClearRequested();
+
 protected:
     // Forward Del key on the tree to the markerDeleteRequested
     // signal; let everything else fall through.
@@ -176,6 +189,10 @@ private:
     void rebuildMarkerSection();
     void rebuildLoopSection();
     void refreshPropertyPage();
+    // Decide which loop-anchor signal to fire for a tree mouse-press.
+    // Pulled out as a helper because eventFilter() should stay
+    // narrowly focused on dispatch.
+    void handleTreeMousePress(class QMouseEvent* me);
 
     // Find the QTreeWidgetItem (under the appropriate category) whose
     // user-data ID matches `id`. Returns nullptr if not found.

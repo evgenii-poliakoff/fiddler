@@ -114,11 +114,18 @@ private slots:
     void onStaffLoopSelectionChanged   (std::optional<std::int64_t> id);
     void onDockLoopSelectionChanged    (std::optional<std::int64_t> id);
 
-    // Secondary-anchor mirroring (waveform <-> staff). The dock has
-    // no secondary anchor — the L gesture only originates from the
-    // score widgets, so two participants are sufficient.
+    // Secondary-anchor mirroring (waveform <-> staff). The dock
+    // doesn't track its own secondary anchor — it just emits gesture
+    // signals that we translate into setSecondaryAnchorMs calls on
+    // the score widgets here.
     void onWaveformSecondaryAnchorChanged(std::optional<std::int64_t> ms);
     void onStaffSecondaryAnchorChanged   (std::optional<std::int64_t> ms);
+    // Ctrl+left-click on a marker row in the dock — capture the
+    // current primary anchor's ms (read from the waveform widget,
+    // which is the canonical primary holder) as the secondary.
+    void onDockLoopAnchorAddRequested();
+    // Plain left-click elsewhere in the dock tree — clear secondary.
+    void onDockLoopAnchorClearRequested();
 
     // The user double-clicked a marker in the dock — seek the
     // player to the marker's position and start playback.

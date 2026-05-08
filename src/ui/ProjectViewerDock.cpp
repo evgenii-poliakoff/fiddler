@@ -9,6 +9,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTreeWidget>
@@ -66,9 +67,14 @@ void ProjectViewerDock::buildUi() {
     tree_->setObjectName("projectViewerTree");
     tree_->setHeaderHidden(true);
     tree_->setSelectionMode(QAbstractItemView::SingleSelection);
-    // MEMO: install ourselves as the tree's event filter so we can
-    // intercept Del on focused items without subclassing QTreeWidget.
+    // MEMO: install ourselves as event filters on BOTH the tree and
+    // its viewport. Keyboard events (Del) go to the tree; mouse
+    // events (the new Ctrl+click gesture) go to the viewport. With
+    // only one of them filtered we'd silently miss half of the
+    // input — Qt's QAbstractItemView delegates click handling to
+    // its internal viewport widget.
     tree_->installEventFilter(this);
+    tree_->viewport()->installEventFilter(this);
 
     markersCategory_ = new QTreeWidgetItem(tree_);
     markersCategory_->setText(0, tr("Markers"));
@@ -667,25 +673,59 @@ void ProjectViewerDock::onLoopArmedToggled(bool checked) {
 // ---- input forwarding ---------------------------------------------------
 
 bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
-    // MEMO: forward Del on a focused tree entry to whichever delete
-    // signal matches the current selection's kind. Mutual exclusion
-    // means at most one selection is set, so the dispatch is
-    // unambiguous. Other keys fall through to the tree's defaults
-    // (arrow nav, Tab, etc.).
-    if (watched == tree_ && event->type() == QEvent::KeyPress) {
-        auto* keyEvent = static_cast<QKeyEvent*>(event);
-        if (keyEvent->key() == Qt::Key_Delete) {
-            if (selectedMarkerId_.has_value()) {
-                emit markerDeleteRequested(*selectedMarkerId_);
-                return true;
+    const bool isTreeViewport =
+        (tree_ && watched == tree_->viewport());
+    if (watched == tree_ || isTreeViewport) {
+        // MEMO: dispatch in two branches — a left-click might extend
+        // a loop-creation anchor pair (Ctrl+click on a marker row),
+        // and Del fires the per-kind delete signal. Other events
+        // fall through to the tree's defaults (arrow nav, Tab,
+        // double-click handled by the standard signal, etc.).
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                handleTreeMousePress(mouseEvent);
+                // Don't consume — Qt still needs to update the
+                // selection in response to the click.
             }
-            if (selectedLoopId_.has_value()) {
-                emit loopDeleteRequested(*selectedLoopId_);
-                return true;
+        }
+        if (event->type() == QEvent::KeyPress) {
+            auto* keyEvent = static_cast<QKeyEvent*>(event);
+            if (keyEvent->key() == Qt::Key_Delete) {
+                if (selectedMarkerId_.has_value()) {
+                    emit markerDeleteRequested(*selectedMarkerId_);
+                    return true;
+                }
+                if (selectedLoopId_.has_value()) {
+                    emit loopDeleteRequested(*selectedLoopId_);
+                    return true;
+                }
             }
         }
     }
     return QDockWidget::eventFilter(watched, event);
+}
+
+void ProjectViewerDock::handleTreeMousePress(QMouseEvent* me) {
+    // MEMO: emit the loop-anchor request BEFORE Qt processes the
+    // click. The handler in MainWindow reads the *current* primary
+    // anchor's ms (still the previous selection at this point),
+    // captures it as the secondary, and only then does the click
+    // proceed and change selection to the new marker. That ordering
+    // is what makes Ctrl+click in the dock match Ctrl+click on the
+    // score widgets — both capture the prior primary's ms.
+    auto* item = tree_->itemAt(me->pos());
+    const bool ctrlHeld =
+        (me->modifiers() & Qt::ControlModifier) != 0;
+
+    if (ctrlHeld && item && item->parent() == markersCategory_) {
+        emit loopAnchorAddRequested();
+        return;
+    }
+    // Plain click anywhere else (including loop rows or empty
+    // space) clears the secondary anchor — the user is no longer
+    // building a loop.
+    emit loopAnchorClearRequested();
 }
 
 } // namespace fiddler::ui

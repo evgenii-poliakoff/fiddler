@@ -779,6 +779,96 @@ TEST_CASE("ProjectViewerDock: loop setRange keeps selection alive across re-sort
     REQUIRE(*model->indexOf(firstId) == 1);
 }
 
+TEST_CASE("ProjectViewerDock: Ctrl+click on a marker row emits loopAnchorAddRequested",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    // MEMO: load-bearing — the dock's Ctrl+click gesture is the
+    // mirror of the score widgets' Ctrl+click. It fires a signal
+    // *before* the click changes selection, so MainWindow's handler
+    // can capture the prior primary's ms.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 500, 1500 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* secondRow = findMarkerRow(*tree, *model->idAt(1));
+    REQUIRE(secondRow);
+
+    // Select first marker so there's a "prior primary" to capture.
+    dock.setSelectedMarkerId(*model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    // Drive a Ctrl+left-click via QTest. The viewport is the
+    // QTreeWidget's actual mouse target.
+    const QRect rowRect = tree->visualItemRect(secondRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 1);
+    REQUIRE(clearSpy.count() == 0);
+}
+
+TEST_CASE("ProjectViewerDock: plain click on a marker emits loopAnchorClearRequested",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 1000 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* row  = findMarkerRow(*tree, *model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    const QRect rowRect = tree->visualItemRect(row);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 0);
+    REQUIRE(clearSpy.count() >= 1);
+}
+
+TEST_CASE("ProjectViewerDock: Ctrl+click on a loop row emits clear, not add",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    // MEMO: loops are regions, not anchors — Ctrl+click on a loop
+    // row is treated as "exit loop-creation mode", same as a plain
+    // click. Pinning this rule keeps a future visual-only refactor
+    // from accidentally promoting loops to anchor candidates.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* row  = findLoopRow(*tree, *model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    const QRect rowRect = tree->visualItemRect(row);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 0);
+    REQUIRE(clearSpy.count() >= 1);
+}
+
 TEST_CASE("ProjectViewerDock: removing the selected loop clears selection",
           "[project-viewer-dock][gui][loops]") {
     qtApp();

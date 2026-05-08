@@ -23,6 +23,8 @@
 #include <QSlider>
 #include <QString>
 #include <QTest>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1318,6 +1320,109 @@ TEST_CASE("MainWindow: Play with armed loop and pos past endMs seeks to startMs"
     const auto pos = loaded.window->player().position().count();
     REQUIRE(pos >= 400);
     REQUIRE(pos <= 450);
+}
+
+TEST_CASE("MainWindow: dock Ctrl+click on a marker creates a loop with L",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: end-to-end — click marker A in the dock, Ctrl+click
+    // marker B in the dock, press L. The window-scoped L shortcut
+    // fires regardless of which child has focus, so the whole
+    // gesture works without ever touching the score widgets. This
+    // pins the user's request: "same selection mechanics in the
+    // list of markers in the property editor".
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Two markers at known positions.
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->markerModel().size() == 2);
+
+    auto* tree = dock->findChild<QTreeWidget*>("projectViewerTree");
+    REQUIRE(tree);
+    // After tap-place, the auto-selection put marker 2 (id from
+    // idAt(1) — sorted-order index 1) on the primary; reset to
+    // marker 1 via plain click in the dock so the test is explicit
+    // about both gestures.
+    const auto firstId  = window->markerModel().markers()[0].id;
+    const auto secondId = window->markerModel().markers()[1].id;
+
+    auto findRow = [&](std::int64_t markerId) -> QTreeWidgetItem* {
+        constexpr int kRole = Qt::UserRole + 1;   // mirrors dock impl
+        auto* category = tree->topLevelItem(0);   // Markers
+        for (int i = 0; i < category->childCount(); ++i) {
+            auto* child = category->child(i);
+            if (child->data(0, kRole).toLongLong() == markerId) {
+                return child;
+            }
+        }
+        return nullptr;
+    };
+
+    // Plain click marker 1 in the dock.
+    auto* firstRow = findRow(firstId);
+    REQUIRE(firstRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      tree->visualItemRect(firstRow).center());
+    REQUIRE(*waveform->selectedMarkerId() == firstId);
+
+    // Ctrl+click marker 2 in the dock.
+    auto* secondRow = findRow(secondId);
+    REQUIRE(secondRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier,
+                      tree->visualItemRect(secondRow).center());
+    REQUIRE(*waveform->selectedMarkerId() == secondId);
+    // The dashed tick should be sitting at marker 1's ms now.
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+
+    // Press L — window-scoped shortcut, fires regardless of focus.
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    const auto& loop = window->loopModel().loops()[0];
+    REQUIRE(loop.startMs == 500);
+    REQUIRE(loop.endMs   == 1500);
+}
+
+TEST_CASE("MainWindow: dock secondary-anchor mirrors to staff",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: when the dock fires loopAnchorAddRequested, MainWindow
+    // pushes the captured ms to BOTH score widgets directly so the
+    // dashed tick is visible in both views.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 700);
+
+    // Simulate the dock's gesture signal directly — the unit tests
+    // already cover that the click path emits it.
+    emit dock->loopAnchorAddRequested();
+    REQUIRE(waveform->secondaryAnchorMs() == 700);
+    REQUIRE(staff->secondaryAnchorMs()    == 700);
+
+    emit dock->loopAnchorClearRequested();
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+    REQUIRE_FALSE(staff->secondaryAnchorMs().has_value());
 }
 
 TEST_CASE("MainWindow: Play with no armed loop does not jump",

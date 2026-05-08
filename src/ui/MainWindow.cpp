@@ -344,6 +344,12 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopArmToggleRequested,
             this, &MainWindow::onLoopArmToggleRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopAnchorAddRequested,
+            this, &MainWindow::onDockLoopAnchorAddRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopAnchorClearRequested,
+            this, &MainWindow::onDockLoopAnchorClearRequested);
 }
 
 void MainWindow::onOpenFile() {
@@ -1006,6 +1012,40 @@ void MainWindow::onStaffSecondaryAnchorChanged(
     } else {
         FLOG_DEBUG("ui.score", "secondary-anchor cleared via=staff");
     }
+}
+
+void MainWindow::onDockLoopAnchorAddRequested() {
+    // MEMO: the dock doesn't know whether the current primary is a
+    // marker or a barline (or even on a different widget) — the
+    // canonical answer lives on the waveform via primaryAnchorMs().
+    // This handler reads that value at the moment of the Ctrl+click
+    // (BEFORE the dock's own selection change has been processed)
+    // and pushes it as the secondary. If there's no primary yet it's
+    // a no-op — same rule as Ctrl+click on the widget when nothing
+    // is selected.
+    if (!waveform_) return;
+    const auto ms = waveform_->primaryAnchorMs();
+    if (!ms.has_value()) return;
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    waveform_->setSecondaryAnchorMs(ms);
+    if (staff_) staff_->setSecondaryAnchorMs(ms);
+    mirroringSelection_ = false;
+    FLOG_DEBUG("ui.score",
+               "secondary-anchor ms={} via=dock-ctrl-click", *ms);
+}
+
+void MainWindow::onDockLoopAnchorClearRequested() {
+    if (!waveform_) return;
+    // Skip the no-op case so the log line only fires when the
+    // secondary actually clears.
+    if (!waveform_->secondaryAnchorMs().has_value()) return;
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    waveform_->setSecondaryAnchorMs(std::nullopt);
+    if (staff_) staff_->setSecondaryAnchorMs(std::nullopt);
+    mirroringSelection_ = false;
+    FLOG_DEBUG("ui.score", "secondary-anchor cleared via=dock-click");
 }
 
 void MainWindow::onBarlineDeleteRequested(std::size_t index) {
