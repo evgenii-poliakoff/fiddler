@@ -4,6 +4,7 @@
 #include "audio/Player.h"
 #include "audio/WaveformOverview.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/ProjectViewerDock.h"
 #include "ui/StaffWidget.h"
@@ -82,7 +83,8 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , player_(std::make_unique<audio::Player>())
     , barlineModel_(std::make_shared<score::BarlineModel>())
-    , markerModel_(std::make_shared<score::MarkerModel>()) {
+    , markerModel_(std::make_shared<score::MarkerModel>())
+    , loopModel_(std::make_shared<score::LoopModel>()) {
     // Initialise the model with the first preset (Reel 4/4) so the
     // staff's tune-type label matches what the combo box shows on
     // first launch. The combo defaults to index 0; without this
@@ -120,6 +122,14 @@ MainWindow::MainWindow(QWidget* parent)
     connect(tapMarkerShortcut_, &QShortcut::activated,
             this, &MainWindow::onTapMarker);
 
+    // 'L' anywhere in the window creates a loop spanning the user's
+    // primary selection's ms and the secondary anchor's ms. Both
+    // come from the score widgets via Ctrl+click multi-select.
+    createLoopShortcut_ = new QShortcut(QKeySequence(Qt::Key_L), this);
+    createLoopShortcut_->setContext(Qt::WindowShortcut);
+    connect(createLoopShortcut_, &QShortcut::activated,
+            this, &MainWindow::onCreateLoop);
+
     // Ctrl+Z: peel the most-recently-placed artifact, regardless
     // of kind. Dispatched via the combined placementHistory_ LIFO.
     undoShortcut_ = new QShortcut(QKeySequence::Undo, this);
@@ -147,6 +157,10 @@ const score::BarlineModel& MainWindow::barlineModel() const noexcept {
 
 const score::MarkerModel& MainWindow::markerModel() const noexcept {
     return *markerModel_;
+}
+
+const score::LoopModel& MainWindow::loopModel() const noexcept {
+    return *loopModel_;
 }
 
 void MainWindow::buildMenus() {
@@ -207,6 +221,7 @@ void MainWindow::buildCentralWidget() {
     waveform_->setObjectName("waveformWidget");
     waveform_->setBarlineModel(barlineModel_);
     waveform_->setMarkerModel(markerModel_);
+    waveform_->setLoopModel(loopModel_);
     connect(waveform_, &WaveformWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 // MEMO: log includes the source ("waveform-click")
@@ -221,6 +236,10 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onWaveformBarlineSelectionChanged);
     connect(waveform_, &WaveformWidget::markerSelectionChanged,
             this, &MainWindow::onWaveformMarkerSelectionChanged);
+    connect(waveform_, &WaveformWidget::loopSelectionChanged,
+            this, &MainWindow::onWaveformLoopSelectionChanged);
+    connect(waveform_, &WaveformWidget::secondaryAnchorChanged,
+            this, &MainWindow::onWaveformSecondaryAnchorChanged);
     connect(waveform_, &WaveformWidget::barlineDeleteRequested,
             this, &MainWindow::onBarlineDeleteRequested);
     connect(waveform_, &WaveformWidget::markerDeleteRequested,
@@ -233,6 +252,7 @@ void MainWindow::buildCentralWidget() {
     staff_->setObjectName("staffWidget");
     staff_->setBarlineModel(barlineModel_);
     staff_->setMarkerModel(markerModel_);
+    staff_->setLoopModel(loopModel_);
     connect(staff_, &StaffWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 FLOG_DEBUG("ui.score",
@@ -243,6 +263,10 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onStaffBarlineSelectionChanged);
     connect(staff_, &StaffWidget::markerSelectionChanged,
             this, &MainWindow::onStaffMarkerSelectionChanged);
+    connect(staff_, &StaffWidget::loopSelectionChanged,
+            this, &MainWindow::onStaffLoopSelectionChanged);
+    connect(staff_, &StaffWidget::secondaryAnchorChanged,
+            this, &MainWindow::onStaffSecondaryAnchorChanged);
     connect(staff_, &StaffWidget::barlineDeleteRequested,
             this, &MainWindow::onBarlineDeleteRequested);
     connect(staff_, &StaffWidget::markerDeleteRequested,
@@ -290,6 +314,7 @@ void MainWindow::buildCentralWidget() {
     // via the property page.
     projectViewerDock_ = new ProjectViewerDock(this);
     projectViewerDock_->setMarkerModel(markerModel_);
+    projectViewerDock_->setLoopModel(loopModel_);
     addDockWidget(Qt::RightDockWidgetArea, projectViewerDock_);
     connect(projectViewerDock_,
             &ProjectViewerDock::markerSelectionChanged,
@@ -300,6 +325,18 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopSelectionChanged,
+            this, &MainWindow::onDockLoopSelectionChanged);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopDeleteRequested,
+            this, &MainWindow::onLoopDeleteRequested);
+    // MEMO: dock's loopActivated and loopArmToggleRequested are
+    // wired in the next commit (5), where the actual transport
+    // arming + wrap-around lives. Leaving them disconnected here
+    // means double-click and the Arm checkbox are no-ops for now,
+    // matching the staged commits' "creation first, activation next"
+    // breakdown.
 }
 
 void MainWindow::onOpenFile() {
@@ -367,6 +404,7 @@ bool MainWindow::loadFile(const QString& path) {
     // combined undo history goes too.
     barlineModel_->clear();
     markerModel_->clear();
+    loopModel_->clear();
     placementHistory_.clear();
 
     // Tell the staff how long this file is (so its msToX mapping
@@ -548,22 +586,82 @@ void MainWindow::onUndoLastPlacement() {
     while (!placementHistory_.empty()) {
         const auto kind = placementHistory_.back();
         placementHistory_.pop_back();
-        const bool removed =
-            (kind == PlacementKind::Barline)
-            ? barlineModel_->undoLastAdd()
-            : markerModel_->undoLastAdd();
+        bool removed = false;
+        const char* kindStr = "?";
+        switch (kind) {
+        case PlacementKind::Barline:
+            removed = barlineModel_->undoLastAdd();
+            kindStr = "barline";
+            break;
+        case PlacementKind::Marker:
+            removed = markerModel_->undoLastAdd();
+            kindStr = "marker";
+            break;
+        case PlacementKind::Loop:
+            removed = loopModel_->undoLastAdd();
+            kindStr = "loop";
+            break;
+        }
         if (removed) {
-            const char* kindStr =
-                (kind == PlacementKind::Barline) ? "barline" : "marker";
             FLOG_DEBUG("ui.score",
-                       "undo-last kind={} bar-size={} marker-size={}",
+                       "undo-last kind={} bar-size={} marker-size={} loop-size={}",
                        kindStr,
-                       barlineModel_->size(), markerModel_->size());
+                       barlineModel_->size(), markerModel_->size(),
+                       loopModel_->size());
             return;
         }
         // else: stale entry, keep peeling.
     }
     FLOG_DEBUG("ui.score", "undo-last empty (no-op)");
+}
+
+void MainWindow::onCreateLoop() {
+    // MEMO: read primary + secondary anchors from the waveform —
+    // staff and dock mirror the same values. Both must be populated
+    // for the gesture to fire.
+    if (!waveform_ || !loopModel_) return;
+    const auto primMs = waveform_->primaryAnchorMs();
+    const auto secMs  = waveform_->secondaryAnchorMs();
+    if (!primMs || !secMs) {
+        FLOG_DEBUG("ui.score",
+                   "create-loop ignored need=2-anchors primary={} secondary={}",
+                   primMs.has_value() ? *primMs : -1,
+                   secMs.has_value()  ? *secMs  : -1);
+        return;
+    }
+    if (*primMs == *secMs) {
+        // Both anchors at the same ms — a degenerate range. Refuse
+        // rather than create a 1-ms loop the user almost certainly
+        // didn't mean.
+        FLOG_DEBUG("ui.score",
+                   "create-loop ignored degenerate ms={}", *primMs);
+        return;
+    }
+    const std::int64_t startMs = std::min(*primMs, *secMs);
+    const std::int64_t endMs   = std::max(*primMs, *secMs);
+    const auto id = loopModel_->add(startMs, endMs);
+    if (id == 0) {
+        // Should be unreachable given the start<end guard above, but
+        // log defensively in case LoopModel grows new validation.
+        FLOG_DEBUG("ui.score",
+                   "create-loop rejected by model start={} end={}",
+                   startMs, endMs);
+        return;
+    }
+    placementHistory_.push_back(PlacementKind::Loop);
+
+    // Clear the secondary anchor so the gesture is "spent" and a
+    // fresh L press needs a fresh Ctrl+click.
+    waveform_->setSecondaryAnchorMs(std::nullopt);
+
+    // Auto-select the new loop in the dock so its property page
+    // shows immediately. Mirrors the auto-select pattern from
+    // tap-place barline / marker.
+    if (waveform_) waveform_->setSelectedLoopId(id);
+
+    FLOG_DEBUG("ui.score",
+               "create-loop id={} start={} end={} size={}",
+               id, startMs, endMs, loopModel_->size());
 }
 
 void MainWindow::onTuneTypePresetChosen(int comboIndex) {
@@ -700,6 +798,93 @@ void MainWindow::onDockMarkerSelectionChanged(
     }
 }
 
+void MainWindow::onWaveformLoopSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (staff_)             staff_->setSelectedLoopId(id);
+    if (projectViewerDock_) projectViewerDock_->setSelectedLoopId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-loop id={} via=waveform size={}",
+                   *id, loopModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-loop cleared via=waveform size={}",
+                   loopModel_->size());
+    }
+}
+
+void MainWindow::onStaffLoopSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (waveform_)          waveform_->setSelectedLoopId(id);
+    if (projectViewerDock_) projectViewerDock_->setSelectedLoopId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-loop id={} via=staff size={}",
+                   *id, loopModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-loop cleared via=staff size={}",
+                   loopModel_->size());
+    }
+}
+
+void MainWindow::onDockLoopSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (waveform_) waveform_->setSelectedLoopId(id);
+    if (staff_)    staff_->setSelectedLoopId(id);
+    mirroringSelection_ = false;
+
+    if (id.has_value()) {
+        FLOG_DEBUG("ui.score", "select-loop id={} via=dock size={}",
+                   *id, loopModel_->size());
+    } else {
+        FLOG_DEBUG("ui.score", "select-loop cleared via=dock size={}",
+                   loopModel_->size());
+    }
+}
+
+void MainWindow::onWaveformSecondaryAnchorChanged(
+    std::optional<std::int64_t> ms)
+{
+    // MEMO: secondary anchor mirror — staff visualisation should
+    // match the waveform when the user Ctrl+clicks on either widget.
+    // Reuses the same single-bool guard the selection mirrors share.
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (staff_) staff_->setSecondaryAnchorMs(ms);
+    mirroringSelection_ = false;
+
+    if (ms.has_value()) {
+        FLOG_DEBUG("ui.score", "secondary-anchor ms={} via=waveform", *ms);
+    } else {
+        FLOG_DEBUG("ui.score", "secondary-anchor cleared via=waveform");
+    }
+}
+
+void MainWindow::onStaffSecondaryAnchorChanged(
+    std::optional<std::int64_t> ms)
+{
+    if (mirroringSelection_) return;
+    mirroringSelection_ = true;
+    if (waveform_) waveform_->setSecondaryAnchorMs(ms);
+    mirroringSelection_ = false;
+
+    if (ms.has_value()) {
+        FLOG_DEBUG("ui.score", "secondary-anchor ms={} via=staff", *ms);
+    } else {
+        FLOG_DEBUG("ui.score", "secondary-anchor cleared via=staff");
+    }
+}
+
 void MainWindow::onBarlineDeleteRequested(std::size_t index) {
     // Either widget can fire this (via its Del-key handler) when it
     // has focus. Both route through the same slot — the model is
@@ -721,12 +906,20 @@ void MainWindow::onMarkerDeleteRequested(std::int64_t id) {
                id, markerModel_->size());
 }
 
+void MainWindow::onLoopDeleteRequested(std::int64_t id) {
+    // Fired by the dock when the user presses Del on a loop row.
+    // (Score widgets don't yet have a loop-Del handler — loops are
+    // dock-driven.)
+    loopModel_->remove(id);
+    FLOG_DEBUG("ui.score", "delete-loop id={} via=dock-key size={}",
+               id, loopModel_->size());
+}
+
 void MainWindow::onDeleteSelectedArtifact() {
     // Window-level Del shortcut. Selection is mutually exclusive
-    // between barlines and markers, so we just check both and
-    // dispatch to whichever has a value. With no selection at all
-    // this is a quiet no-op (the user can tap B/M to add, click an
-    // artifact to select, or Ctrl+Z to peel last placement).
+    // across barlines / markers / loops, so we check each in turn
+    // and dispatch to whichever has a value. With no selection at
+    // all this is a quiet no-op.
     if (!waveform_) return;
     if (const auto bar = waveform_->selectedBarline()) {
         const auto idx = *bar;
@@ -740,6 +933,12 @@ void MainWindow::onDeleteSelectedArtifact() {
         FLOG_DEBUG("ui.score",
                    "delete-marker id={} via=window-shortcut size={}",
                    id, markerModel_->size());
+    } else if (const auto lid = waveform_->selectedLoopId()) {
+        const auto id = *lid;
+        loopModel_->remove(id);
+        FLOG_DEBUG("ui.score",
+                   "delete-loop id={} via=window-shortcut size={}",
+                   id, loopModel_->size());
     } else {
         FLOG_DEBUG("ui.score", "delete via=window-shortcut no-selection");
     }

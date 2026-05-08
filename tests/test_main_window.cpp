@@ -9,6 +9,7 @@
 #include "audio/Player.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/MainWindow.h"
 #include "ui/ProjectViewerDock.h"
@@ -822,4 +823,233 @@ TEST_CASE("MainWindow: opening a new file clears the marker model",
     QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
     REQUIRE(window->markerModel().empty());
     REQUIRE(window->barlineModel().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Loop creation (L gesture) + Ctrl+Z + Del integration
+//
+// MEMO[refactor]: these are end-to-end tests against MainWindow —
+// they exercise the L shortcut, the secondary anchor mirror, the
+// combined-Ctrl+Z LIFO with the new Loop kind, and the
+// onDeleteSelectedArtifact dispatch on the Loop branch. Per
+// feedback_logs_drive_tests.md, each test pins a user gesture
+// reproducible from the logs alone.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Convenience: tap a marker at the player's current position via M.
+// The widgets pick it up and auto-select on the waveform; tests
+// chain a seek + tap to drop a marker at a known ms.
+void seekAndTapMarker(MainWindow& window, std::int64_t ms) {
+    auto* slider = window.findChild<QSlider*>("positionSlider");
+    REQUIRE(slider);
+    slider->setValue(static_cast<int>(ms));
+    // sliderMoved is what the widget connects to onSeek; setValue
+    // alone wouldn't trigger the player. Emit it directly.
+    emit slider->sliderMoved(static_cast<int>(ms));
+    QTest::keyClick(&window, Qt::Key_M);
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: L creates a loop spanning the two anchored markers",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->markerModel().size() == 2);
+
+    // After tapping the second marker, it's the auto-selected
+    // primary. We need to also have a secondary anchor — set it
+    // directly via the widget API (the user gesture would be
+    // Ctrl+click on the first marker, but driving that via QTest is
+    // covered in the widget-level tests; here we focus on what
+    // MainWindow does once both anchors are present).
+    waveform->setSecondaryAnchorMs(500);
+    REQUIRE(waveform->primaryAnchorMs()   == 1500);
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    const auto& loop = window->loopModel().loops()[0];
+    REQUIRE(loop.startMs == 500);
+    REQUIRE(loop.endMs   == 1500);
+    REQUIRE(loop.pauseMs == 500);   // model default
+    // Loop is auto-selected on creation so the dock's property
+    // page jumps straight to it.
+    REQUIRE(waveform->selectedLoopId().has_value());
+    // Secondary anchor was consumed.
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("MainWindow: L without two anchors is a no-op",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Just one marker; no secondary anchor.
+    seekAndTapMarker(*window, 1000);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: L on identical primary + secondary refuses degenerate range",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1000);
+    waveform->setSecondaryAnchorMs(1000);   // same as primary
+
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: Ctrl+Z peels the most-recently-created loop",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: load-bearing — the combined LIFO must include Loop and
+    // dispatch to LoopModel::undoLastAdd on Ctrl+Z. Without the new
+    // PlacementKind::Loop branch this would fall through to one of
+    // the marker / barline models and leave the loop in place.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->loopModel().empty());
+    // Markers are untouched — Ctrl+Z peeled the loop only.
+    REQUIRE(window->markerModel().size() == 2);
+}
+
+TEST_CASE("MainWindow: Del with a selected loop removes it",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(waveform->selectedLoopId().has_value());
+
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: secondary anchor mirrors waveform → staff",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    waveform->setSecondaryAnchorMs(1234);
+    REQUIRE(staff->secondaryAnchorMs() == 1234);
+
+    waveform->setSecondaryAnchorMs(std::nullopt);
+    REQUIRE_FALSE(staff->secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("MainWindow: loop selection mirrors across waveform / staff / dock",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    const auto loopId = *waveform->selectedLoopId();
+    REQUIRE(staff->selectedLoopId()  == loopId);
+    REQUIRE(*dock->selectedLoopId()  == loopId);
+
+    // Clear via the dock — the score widgets should follow.
+    dock->setSelectedLoopId(std::nullopt);
+    REQUIRE_FALSE(waveform->selectedLoopId().has_value());
+    REQUIRE_FALSE(staff->selectedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: opening a new file clears the loop model",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->loadFile(fixturePath));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+
+    REQUIRE(window->loadFile(fixturePath));
+    REQUIRE(window->loopModel().empty());
+    REQUIRE(window->markerModel().empty());
 }
