@@ -1,6 +1,7 @@
 #include "ui/WaveformWidget.h"
 
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
 #include <QColor>
@@ -34,6 +35,24 @@ constexpr int kMarkerFlagHeightPx     = 14;
 constexpr int kMarkerFlagPaddingPx    = 4;
 constexpr int kMarkerFlagFontPointSz  = 8;
 constexpr int kMarkerFlagMaxWidthPx   = 120;
+
+// Loop bands — translucent, full-height. Selected loop renders with
+// higher alpha than unselected so a glance at the waveform tells you
+// which loop the dock's property page is editing. Colors chosen to
+// be visibly distinct from the cyan markers and yellow barlines: a
+// soft sage green that doesn't fight peaks-blue.
+//
+// MEMO: the loop label sits in the BOTTOM of the band (the bottom
+// kLoopLabelHeightPx pixels) on purpose — putting it at the top
+// would clash with the marker flag row, since loops and markers
+// commonly share start positions when the user converts a loop's
+// "starts here" into a marker for orientation.
+constexpr int kLoopBandAlphaUnselected = 35;
+constexpr int kLoopBandAlphaSelected   = 90;
+constexpr int kLoopLabelHeightPx       = 14;
+constexpr int kLoopLabelPaddingPx      = 4;
+constexpr int kLoopLabelFontPointSz    = 8;
+constexpr int kLoopLabelMaxWidthPx     = 120;
 } // namespace
 
 WaveformWidget::WaveformWidget(QWidget* parent) : QWidget(parent) {
@@ -88,6 +107,24 @@ void WaveformWidget::setMarkerModel(
     update();
 }
 
+void WaveformWidget::setLoopModel(
+    std::shared_ptr<const score::LoopModel> model)
+{
+    if (loopModel_) {
+        disconnect(loopModel_.get(), nullptr, this, nullptr);
+    }
+    loopModel_ = std::move(model);
+    if (loopModel_) {
+        connect(loopModel_.get(), &score::LoopModel::changed,
+                this, &WaveformWidget::onLoopModelChanged);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    update();
+}
+
 void WaveformWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
@@ -99,19 +136,23 @@ void WaveformWidget::setSelectedBarline(std::optional<std::size_t> index) {
         && *index >= barlineModel_->size()) {
         index = std::nullopt;
     }
-    // MEMO: mutual exclusion — setting a barline selection clears
-    // any active marker selection. The user wanted "the selected
-    // artifact" to be a single concept (the project viewer shows
-    // its properties), so even though both selection slots exist
+    // MEMO: mutual exclusion — setting a barline selection clears any
+    // active marker AND loop selection. The user wanted "the selected
+    // artifact" to be a single concept (the project viewer shows its
+    // properties), so even though all three selection slots exist
     // they're never simultaneously populated.
     if (index.has_value() && selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
+    if (index.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
     if (selectedBarline_ == index) {
-        // The marker-clear above may still have caused a repaint
-        // need (the marker was highlighted). Repaint just in case;
-        // update() is a cheap no-op when nothing actually moved.
+        // The marker/loop-clear above may still have caused a repaint
+        // need (the cleared selection was highlighted). Repaint just
+        // in case; update() is a cheap no-op when nothing moved.
         update();
         return;
     }
@@ -128,10 +169,14 @@ void WaveformWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
         id = std::nullopt;
     }
     // Mirror of setSelectedBarline: setting a marker selection clears
-    // any active barline selection.
+    // barline AND loop selections.
     if (id.has_value() && selectedBarline_.has_value()) {
         selectedBarline_.reset();
         emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     if (selectedMarkerId_ == id) {
         update();
@@ -140,6 +185,31 @@ void WaveformWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     selectedMarkerId_ = id;
     update();
     emit markerSelectionChanged(selectedMarkerId_);
+}
+
+void WaveformWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
+    // Validate against current model — drop dangling IDs.
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    // Mirror of the others: setting a loop selection clears
+    // barline AND marker selections.
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_ == id) {
+        update();
+        return;
+    }
+    selectedLoopId_ = id;
+    update();
+    emit loopSelectionChanged(selectedLoopId_);
 }
 
 void WaveformWidget::onBarlineModelChanged() {
@@ -162,6 +232,18 @@ void WaveformWidget::onMarkerModelChanged() {
         && !markerModel_->indexOf(*selectedMarkerId_).has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    update();
+}
+
+void WaveformWidget::onLoopModelChanged() {
+    // Mirror of onMarkerModelChanged: range edits keep the same ID
+    // (so selection survives), but a remove genuinely drops the ID
+    // and we have to clear the selection slot to match.
+    if (selectedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*selectedLoopId_).has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     update();
 }
@@ -240,6 +322,69 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             const int yBot = laneCenter -
                 static_cast<int>(std::clamp(pmin, -1.0f, 1.0f) * laneScale);
             painter.drawLine(x, yTop, x, yBot);
+        }
+    }
+
+    // Loop bands — drawn first so barlines, markers, and the cursor
+    // all paint on top (otherwise the band's translucent fill would
+    // smudge over a tick that the user wants to read clearly).
+    if (loopModel_) {
+        const auto loops = loopModel_->loops();
+        QFont labelFont = painter.font();
+        labelFont.setPointSize(kLoopLabelFontPointSz);
+        labelFont.setBold(true);
+        const QFontMetrics fm(labelFont);
+
+        for (const auto& l : loops) {
+            const int xStart = msToX(l.startMs);
+            const int xEnd   = msToX(l.endMs);
+            // Skip degenerate or off-screen bands. msToX() clamps to
+            // [0, w-1] so we still get a one-pixel-wide rect at the
+            // edge for loops that start before x=0; that's fine.
+            if (xEnd <= 0 || xStart >= width()) continue;
+
+            const int xLeft  = std::max(0, xStart);
+            const int xRight = std::min(width(), xEnd);
+            const int bandW  = std::max(1, xRight - xLeft);
+
+            const bool selected = (selectedLoopId_ == l.id);
+            const int  alpha    = selected
+                ? kLoopBandAlphaSelected
+                : kLoopBandAlphaUnselected;
+
+            // Soft sage green — chosen to be visibly distinct from
+            // the cyan markers and yellow barlines, and not to fight
+            // the peaks-blue waveform.
+            const QColor bandCol(120, 200, 140, alpha);
+            painter.fillRect(QRect(xLeft, 0, bandW, height()), bandCol);
+
+            // Vertical edges of the band, drawn slightly more opaque
+            // so the boundary is legible even when alpha is low.
+            const QColor edgeCol(140, 220, 160,
+                                 std::min(255, alpha + 60));
+            painter.setPen(QPen(edgeCol, selected ? 2.0 : 1.0));
+            painter.drawLine(xLeft,      0, xLeft,      height());
+            painter.drawLine(xRight - 1, 0, xRight - 1, height());
+
+            // Loop name label in the BOTTOM strip of the band
+            // (avoids overlapping the marker flag row at the top
+            // when a loop and a marker share a start position).
+            painter.setFont(labelFont);
+            const int rawTextWidth = fm.horizontalAdvance(l.name);
+            const int textWidth =
+                std::min(rawTextWidth, kLoopLabelMaxWidthPx
+                         - 2 * kLoopLabelPaddingPx);
+            const int labelW = std::min(bandW,
+                                        textWidth + 2 * kLoopLabelPaddingPx);
+            const QRect labelRect(xLeft, height() - kLoopLabelHeightPx,
+                                  labelW, kLoopLabelHeightPx);
+            painter.fillRect(labelRect, bandCol.darker(180));
+            painter.setPen(QColor(220, 240, 220));
+            painter.drawText(labelRect.adjusted(kLoopLabelPaddingPx, 0,
+                                                -kLoopLabelPaddingPx, 0),
+                             Qt::AlignVCenter | Qt::AlignLeft,
+                             fm.elidedText(l.name, Qt::ElideRight,
+                                           textWidth));
         }
     }
 

@@ -6,6 +6,7 @@
 
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/StaffWidget.h"
 
@@ -19,6 +20,7 @@
 #include <span>
 
 using fiddler::score::BarlineModel;
+using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::StaffWidget;
@@ -504,4 +506,168 @@ TEST_CASE("StaffWidget: marker setPosition keeps ID-based selection alive",
     REQUIRE(model->setPosition(firstId, 3000));   // moves past second
     REQUIRE(w.selectedMarkerId() == firstId);
     REQUIRE(*model->indexOf(firstId) == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Loop overlay
+//
+// MEMO[refactor]: same scope as the WaveformWidget loop tests —
+// render-only, with mutual-exclusion across all three artifact kinds.
+// Click-to-select-loop and double-click-to-arm aren't part of this
+// commit, so they aren't tested.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<LoopModel>
+installLoops(StaffWidget& w,
+             std::span<const std::pair<std::int64_t, std::int64_t>> ranges) {
+    auto model = std::make_shared<LoopModel>();
+    for (const auto& r : ranges) (void)model->add(r.first, r.second);
+    w.setLoopModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("StaffWidget: paints loop bands without crashing",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1500}, {2000, 3000}
+    };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.show();
+    QTest::qWait(20);
+    SUCCEED();
+}
+
+TEST_CASE("StaffWidget: setSelectedLoopId clears barline + marker selections",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    const std::int64_t bars[] = { 1000 };
+    setUpWidget(w, makeModel(std::span<const std::int64_t>{bars}));
+
+    const std::int64_t markers[] = { 2000 };
+    auto markerModel = installMarkers(w, std::span<const std::int64_t>{markers});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loopModel = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline().has_value());
+    w.setSelectedMarkerId(*markerModel->idAt(0));
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+
+    QSignalSpy markerSpy(&w, &StaffWidget::markerSelectionChanged);
+    QSignalSpy loopSpy  (&w, &StaffWidget::loopSelectionChanged);
+
+    w.setSelectedLoopId(*loopModel->idAt(0));
+
+    REQUIRE(w.selectedLoopId().has_value());
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(markerSpy.count() == 1);
+    REQUIRE(loopSpy.count()   == 1);
+}
+
+TEST_CASE("StaffWidget: setSelectedBarline clears an active loop selection",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    const std::int64_t bars[] = { 1000 };
+    setUpWidget(w, makeModel(std::span<const std::int64_t>{bars}));
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loopModel = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loopModel->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &StaffWidget::loopSelectionChanged);
+    w.setSelectedBarline(0);
+
+    REQUIRE(w.selectedBarline().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: setSelectedMarkerId clears an active loop selection",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+
+    const std::int64_t markers[] = { 2000 };
+    auto markerModel = installMarkers(w, std::span<const std::int64_t>{markers});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loopModel = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loopModel->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &StaffWidget::loopSelectionChanged);
+    w.setSelectedMarkerId(*markerModel->idAt(0));
+
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: loop setRange keeps selection alive across re-sort",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto firstId = *model->idAt(0);
+    w.setSelectedLoopId(firstId);
+
+    REQUIRE(model->setRange(firstId, 3000, 3500));
+    REQUIRE(w.selectedLoopId() == firstId);
+    REQUIRE(*model->indexOf(firstId) == 1);
+}
+
+TEST_CASE("StaffWidget: removing the selected loop clears the selection",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto secondId = *model->idAt(1);
+    w.setSelectedLoopId(secondId);
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy selSpy(&w, &StaffWidget::loopSelectionChanged);
+    REQUIRE(model->remove(secondId));
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(selSpy.count() >= 1);
+}
+
+TEST_CASE("StaffWidget: setLoopModel(nullptr) detaches and clears selection",
+          "[staff-widget][gui][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    w.setSelectedLoopId(*model->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    w.setLoopModel(nullptr);
+    REQUIRE(w.loopModel() == nullptr);
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
 }

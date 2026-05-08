@@ -5,6 +5,7 @@
 #include "audio/WaveformOverview.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/WaveformWidget.h"
 
@@ -22,6 +23,7 @@
 
 using fiddler::audio::WaveformOverview;
 using fiddler::score::BarlineModel;
+using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::WaveformWidget;
@@ -720,4 +722,205 @@ TEST_CASE("WaveformWidget: setMarkerModel(nullptr) detaches and clears selection
     w.setMarkerModel(nullptr);
     REQUIRE(w.markerModel() == nullptr);
     REQUIRE_FALSE(w.selectedMarkerId().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Loop overlay
+//
+// MEMO[refactor]: loops in this commit are render-only — selection
+// is dock-driven, so these tests pin two properties: (1) the widget
+// can paint loop bands without crashing, and (2) the mutual-exclusion
+// rule extends across all three artifact kinds (barline, marker,
+// loop). Click-to-select-loop, double-click-to-arm, and
+// arrow-nav-on-loops are deliberately NOT tested here because the
+// widget does not implement them yet (commits 3+ for dock-driven
+// arming, possibly later for click-on-band).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Install a fresh LoopModel on the widget with the given (start, end)
+// pairs. Returns the handle so tests can mutate it.
+std::shared_ptr<LoopModel>
+installLoops(WaveformWidget& w,
+             std::span<const std::pair<std::int64_t, std::int64_t>> ranges) {
+    auto model = std::make_shared<LoopModel>();
+    for (const auto& r : ranges) (void)model->add(r.first, r.second);
+    w.setLoopModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("WaveformWidget: paints loop bands without crashing",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1500}, {2000, 3000}
+    };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.resize(800, 120);
+    w.show();
+    // The return value is discarded on purpose — under the offscreen
+    // platform plugin the function may legitimately time out on
+    // headless CI machines, but the paint event still fires before
+    // we get here.
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: setSelectedLoopId clears barline + marker selections",
+          "[waveform-widget][gui][loops]") {
+    // MEMO: load-bearing — mutual exclusion across all three artifact
+    // kinds. The "selected artifact" is a single concept the dock
+    // surfaces; only one slot is populated at a time.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    const std::int64_t stamps[] = { 2000 };
+    auto markers = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    // Seed both barline + marker selections, then setSelectedLoopId
+    // must clear both.
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline().has_value());
+    w.setSelectedMarkerId(*markers->idAt(0));
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());   // marker cleared barline
+
+    QSignalSpy markerSpy(&w, &WaveformWidget::markerSelectionChanged);
+    QSignalSpy loopSpy  (&w, &WaveformWidget::loopSelectionChanged);
+
+    w.setSelectedLoopId(*loops->idAt(0));
+
+    REQUIRE(w.selectedLoopId().has_value());
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(markerSpy.count() == 1);    // marker cleared as side effect
+    REQUIRE(loopSpy.count()   == 1);    // loop set
+}
+
+TEST_CASE("WaveformWidget: setSelectedBarline clears an active loop selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &WaveformWidget::loopSelectionChanged);
+    w.setSelectedBarline(0);
+
+    REQUIRE(w.selectedBarline().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: setSelectedMarkerId clears an active loop selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    const std::int64_t stamps[] = { 2000 };
+    auto markers = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &WaveformWidget::loopSelectionChanged);
+    w.setSelectedMarkerId(*markers->idAt(0));
+
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: loop setRange keeps selection alive across re-sort",
+          "[waveform-widget][gui][loops]") {
+    // MEMO: this is the analog of the marker setPosition test —
+    // exactly why loops carry stable IDs. After a setRange that
+    // crosses a neighbour, an index-based selection would now point
+    // at a different loop; ID-based selection survives.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto firstId = *model->idAt(0);
+    w.setSelectedLoopId(firstId);
+
+    // Move first loop past the second.
+    REQUIRE(model->setRange(firstId, 3000, 3500));
+
+    REQUIRE(w.selectedLoopId() == firstId);
+    REQUIRE(*model->indexOf(firstId) == 1);
+}
+
+TEST_CASE("WaveformWidget: removing the selected loop clears the selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto secondId = *model->idAt(1);
+    w.setSelectedLoopId(secondId);
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy selSpy(&w, &WaveformWidget::loopSelectionChanged);
+    REQUIRE(model->remove(secondId));
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(selSpy.count() >= 1);
+}
+
+TEST_CASE("WaveformWidget: setSelectedLoopId rejects dangling IDs",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(99999);    // ID never issued
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+}
+
+TEST_CASE("WaveformWidget: setLoopModel(nullptr) detaches and clears selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    w.setSelectedLoopId(*model->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    w.setLoopModel(nullptr);
+    REQUIRE(w.loopModel() == nullptr);
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
 }

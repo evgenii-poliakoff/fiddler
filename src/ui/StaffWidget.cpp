@@ -1,6 +1,7 @@
 #include "ui/StaffWidget.h"
 
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
 #include <QFont>
@@ -39,6 +40,16 @@ constexpr int kMarkerFlagHeightPx     = 12;
 constexpr int kMarkerFlagPaddingPx    = 4;
 constexpr int kMarkerFlagFontPointSz  = 8;
 constexpr int kMarkerFlagMaxWidthPx   = 120;
+
+// Loop band visuals — same palette and rules as WaveformWidget.
+// Comment intentionally short here; canonical rationale lives in
+// WaveformWidget.cpp's matching block.
+constexpr int kLoopBandAlphaUnselected = 35;
+constexpr int kLoopBandAlphaSelected   = 90;
+constexpr int kLoopLabelHeightPx       = 12;
+constexpr int kLoopLabelPaddingPx      = 4;
+constexpr int kLoopLabelFontPointSz    = 8;
+constexpr int kLoopLabelMaxWidthPx     = 120;
 
 } // namespace
 
@@ -110,6 +121,24 @@ void StaffWidget::setMarkerModel(
     update();
 }
 
+void StaffWidget::setLoopModel(
+    std::shared_ptr<const score::LoopModel> model)
+{
+    if (loopModel_) {
+        disconnect(loopModel_.get(), nullptr, this, nullptr);
+    }
+    loopModel_ = std::move(model);
+    if (loopModel_) {
+        connect(loopModel_.get(), &score::LoopModel::changed,
+                this, &StaffWidget::onLoopModelChanged);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    update();
+}
+
 void StaffWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
@@ -124,11 +153,15 @@ void StaffWidget::setSelectedBarline(std::optional<std::size_t> index) {
         && *index >= barlineModel_->size()) {
         index = std::nullopt;
     }
-    // MEMO: mutual exclusion — see WaveformWidget's setSelectedBarline
-    // for the rationale; both widgets enforce the same rule.
+    // MEMO: mutual exclusion across all three artifact kinds — see
+    // WaveformWidget's setSelectedBarline for the canonical rationale.
     if (index.has_value() && selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (index.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     if (selectedBarline_ == index) {
         update();
@@ -148,6 +181,10 @@ void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
         selectedBarline_.reset();
         emit barlineSelectionChanged(selectedBarline_);
     }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
     if (selectedMarkerId_ == id) {
         update();
         return;
@@ -155,6 +192,28 @@ void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     selectedMarkerId_ = id;
     update();
     emit markerSelectionChanged(selectedMarkerId_);
+}
+
+void StaffWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_ == id) {
+        update();
+        return;
+    }
+    selectedLoopId_ = id;
+    update();
+    emit loopSelectionChanged(selectedLoopId_);
 }
 
 void StaffWidget::onBarlineModelChanged() {
@@ -176,6 +235,15 @@ void StaffWidget::onMarkerModelChanged() {
         && !markerModel_->indexOf(*selectedMarkerId_).has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    update();
+}
+
+void StaffWidget::onLoopModelChanged() {
+    if (selectedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*selectedLoopId_).has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     update();
 }
@@ -213,7 +281,9 @@ void StaffWidget::paintEvent(QPaintEvent*) {
 
     // One paint helper per visual concern keeps each method short
     // and easy to follow. Order matters: things drawn later sit on
-    // top, so the cursor is last.
+    // top, so the cursor is last. Loops paint first so the
+    // translucent bands sit at the lowest z-order.
+    paintLoops(painter);
     paintStaffLines(painter);
     paintTimeSignature(painter);
     paintBarlines(painter);
@@ -266,6 +336,59 @@ void StaffWidget::paintTimeSignature(QPainter& painter) const {
         labelFont.setBold(false);
         painter.setFont(labelFont);
         painter.drawText(leftX, top - 4, ts.tuneType);
+    }
+}
+
+void StaffWidget::paintLoops(QPainter& painter) const {
+    if (!loopModel_) return;
+    const auto loops = loopModel_->loops();
+
+    QFont labelFont = painter.font();
+    labelFont.setPointSize(kLoopLabelFontPointSz);
+    labelFont.setBold(true);
+    const QFontMetrics fm(labelFont);
+
+    for (const auto& l : loops) {
+        const int xStart = msToX(l.startMs);
+        const int xEnd   = msToX(l.endMs);
+        if (xEnd <= 0 || xStart >= width()) continue;
+
+        const int xLeft  = std::max(0, xStart);
+        const int xRight = std::min(width(), xEnd);
+        const int bandW  = std::max(1, xRight - xLeft);
+
+        const bool selected = (selectedLoopId_ == l.id);
+        const int  alpha    = selected
+            ? kLoopBandAlphaSelected
+            : kLoopBandAlphaUnselected;
+
+        const QColor bandCol(120, 200, 140, alpha);
+        painter.fillRect(QRect(xLeft, 0, bandW, height()), bandCol);
+
+        const QColor edgeCol(140, 220, 160,
+                             std::min(255, alpha + 60));
+        painter.setPen(QPen(edgeCol, selected ? 2.0 : 1.0));
+        painter.drawLine(xLeft,      0, xLeft,      height());
+        painter.drawLine(xRight - 1, 0, xRight - 1, height());
+
+        // Label sits in the bottom strip — the staff's top margin is
+        // taken by the marker flag row, so the bottom is the only
+        // sensible home for the loop name. Mirrors WaveformWidget.
+        painter.setFont(labelFont);
+        const int rawTextWidth = fm.horizontalAdvance(l.name);
+        const int textWidth =
+            std::min(rawTextWidth, kLoopLabelMaxWidthPx
+                     - 2 * kLoopLabelPaddingPx);
+        const int labelW = std::min(bandW,
+                                    textWidth + 2 * kLoopLabelPaddingPx);
+        const QRect labelRect(xLeft, height() - kLoopLabelHeightPx,
+                              labelW, kLoopLabelHeightPx);
+        painter.fillRect(labelRect, bandCol.darker(180));
+        painter.setPen(QColor(220, 240, 220));
+        painter.drawText(labelRect.adjusted(kLoopLabelPaddingPx, 0,
+                                            -kLoopLabelPaddingPx, 0),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         fm.elidedText(l.name, Qt::ElideRight, textWidth));
     }
 }
 
