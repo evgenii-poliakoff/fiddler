@@ -310,8 +310,15 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     paintTimeSignature(painter);
     paintBarlines(painter);
     paintMarkers(painter);
-    paintSecondaryAnchor(painter);
+    // Cursor must paint BEFORE the secondary anchor's dashed
+    // indicator so that, when both are at the same x (e.g. right
+    // after a tap-place when the cursor seeks to the new artifact),
+    // the dashing pierces through the cursor. Otherwise the cursor
+    // would cover the artifact-as-dashed paint and the user would
+    // only see the red cursor at that x. See WaveformWidget for the
+    // canonical comment.
     paintCursor(painter);
+    paintSecondaryAnchor(painter);
 }
 
 void StaffWidget::paintStaffLines(QPainter& painter) const {
@@ -497,26 +504,41 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
 
 void StaffWidget::paintSecondaryAnchor(QPainter& painter) const {
     if (!secondaryAnchorMs_.has_value()) return;
-    // Skip the standalone tick when an artifact already sits at the
-    // secondary's ms — paintBarlines / paintMarkers paint that
-    // artifact in dashed style, so a second tick would just stack
-    // and hide the dashes again.
+    const int sx = msToX(*secondaryAnchorMs_);
+    if (sx < 0 || sx >= width()) return;
+
+    // Detect whether an artifact already sits at the secondary's ms
+    // (in which case paintBarlines / paintMarkers already painted
+    // the artifact's tick in dashed style — a second tick would
+    // overdraw with the same pattern, harmless but wasteful) and
+    // whether the cursor is at the same x (in which case we MUST
+    // paint here so the dashes pierce through the cursor's red).
+    const bool cursorOverlap = (msToX(positionMs_) == sx);
+    bool secondaryOnArtifact = false;
+    QColor col(255, 200, 90);
     if (barlineModel_) {
         for (auto barMs : barlineModel_->barlines()) {
-            if (barMs == *secondaryAnchorMs_) return;
+            if (barMs == *secondaryAnchorMs_) {
+                secondaryOnArtifact = true;
+                break;
+            }
         }
     }
     if (markerModel_) {
         for (const auto& m : markerModel_->markers()) {
-            if (m.sourceMs == *secondaryAnchorMs_) return;
+            if (m.sourceMs == *secondaryAnchorMs_) {
+                secondaryOnArtifact = true;
+                col = QColor(160, 240, 255);   // marker hue
+                break;
+            }
         }
     }
-    const int x = msToX(*secondaryAnchorMs_);
-    if (x < 0 || x >= width()) return;
-    QPen pen(QColor(255, 200, 90), 2);
+    if (secondaryOnArtifact && !cursorOverlap) return;
+
+    QPen pen(col, 2.0);
     pen.setStyle(Qt::DashLine);
     painter.setPen(pen);
-    painter.drawLine(x, 0, x, height());
+    painter.drawLine(sx, 0, sx, height());
 }
 
 void StaffWidget::paintCursor(QPainter& painter) const {

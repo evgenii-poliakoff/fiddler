@@ -1153,6 +1153,56 @@ TEST_CASE("WaveformWidget: dashed barline at secondary anchor renders distinctly
     REQUIRE(otherRows  > 20);
 }
 
+TEST_CASE("WaveformWidget: dashed indicator pierces through cursor at same x",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: regression for the user-reported bug — when the cursor
+    // and the secondary anchor share an x (the common case right
+    // after tap-place because the cursor sits at the new artifact),
+    // the cursor was painting on top of the artifact-as-dashed
+    // tick, hiding the dashing entirely. The fix moves the
+    // secondary indicator to AFTER the cursor so the dashes
+    // pierce through the cursor's red.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 200);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    // Cursor and secondary at the SAME ms — repro condition.
+    w.setPositionMs(1000);
+    w.setSecondaryAnchorMs(1000);
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // At x=200 (1000ms in 800/4000 mapping), we should see BOTH
+    // yellow rows (dashed bar pierces through) AND red rows
+    // (cursor in dash gaps). Without the fix, the column would be
+    // pure red — cursor covers the whole height with no yellow
+    // showing through.
+    const int x = 200;
+    int yellowRows = 0;
+    int redRows    = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        const QColor c = image.pixelColor(x, y);
+        const bool isYellow = c.red() > 200 && c.green() > 180
+                           && c.blue() < 180;
+        const bool isRed    = c.red() > 200 && c.green() < 150
+                           && c.blue() < 150;
+        if (isYellow) ++yellowRows;
+        if (isRed)    ++redRows;
+    }
+
+    // Both must appear. Without the fix yellowRows would be 0 and
+    // redRows would be ~120.
+    REQUIRE(yellowRows > 20);
+    REQUIRE(redRows    > 20);
+}
+
 TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
           "[waveform-widget][gui][secondary-anchor]") {
     qtApp();

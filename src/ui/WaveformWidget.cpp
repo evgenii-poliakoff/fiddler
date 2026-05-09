@@ -516,27 +516,50 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
-    // Standalone secondary anchor tick — only drawn when the
-    // secondary doesn't sit on top of an existing artifact. The
-    // overlap case is handled above by replacing the artifact's
-    // solid tick with a dashed one. MEMO: dashed style is the
-    // "armed for combination, not yet committed" convention from
-    // DAW ghost cursors.
-    if (secondaryAnchorMs_.has_value() && !secondaryOnArtifact) {
-        const int x = msToX(*secondaryAnchorMs_);
-        if (x >= 0 && x < width()) {
-            QPen pen(QColor(255, 200, 90), 2);
-            pen.setStyle(Qt::DashLine);
-            painter.setPen(pen);
-            painter.drawLine(x, 0, x, height());
-        }
-    }
-
-    // Playhead cursor.
+    // Playhead cursor — drawn before the secondary anchor tick so
+    // the dashed indicator can pierce through it when both are at
+    // the same x (which happens immediately after a tap-place
+    // because the cursor seeks to the new artifact).
     const int cursorX = msToX(positionMs_);
     if (cursorX >= 0 && cursorX < width()) {
         painter.setPen(QPen(QColor(255, 80, 80), 2));
         painter.drawLine(cursorX, 0, cursorX, height());
+    }
+
+    // Secondary anchor indicator — painted LAST so it's always
+    // visible regardless of what's underneath (the cursor especially).
+    // Skip in the case where the artifact-itself-dashed paint above
+    // already shows the dashing AND the cursor isn't on top
+    // (otherwise we'd just overdraw an identical line — harmless,
+    // but wasteful). When cursor and secondary share an x, we MUST
+    // paint here so the dash gaps reveal cursor red instead of
+    // covering the artifact's solid line. MEMO: dashed style is the
+    // "armed for combination, not yet committed" convention from
+    // DAW ghost cursors.
+    if (secondaryAnchorMs_.has_value()) {
+        const int sx = msToX(*secondaryAnchorMs_);
+        if (sx >= 0 && sx < width()) {
+            const bool cursorOverlap = (sx == cursorX) && cursorX >= 0
+                                    && cursorX < width();
+            if (!secondaryOnArtifact || cursorOverlap) {
+                // Pick a color that matches the artifact at secondary
+                // ms (yellow for a bar, cyan for a marker), defaulting
+                // to yellow for the standalone case.
+                QColor col(255, 200, 90);
+                if (markerModel_) {
+                    for (const auto& m : markerModel_->markers()) {
+                        if (m.sourceMs == *secondaryAnchorMs_) {
+                            col = QColor(160, 240, 255);
+                            break;
+                        }
+                    }
+                }
+                QPen pen(col, 2.0);
+                pen.setStyle(Qt::DashLine);
+                painter.setPen(pen);
+                painter.drawLine(sx, 0, sx, height());
+            }
+        }
     }
 }
 
