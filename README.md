@@ -12,10 +12,13 @@ preserving tempo control 25–100 %, see and seek through a
 synchronised waveform, place barlines and named markers on a staff
 by tapping along to the recording, navigate / rename / re-position
 markers from a right-side project viewer dock, and create practice
-loops from any pair of anchors. Toggle the **Pre-roll** checkbox
-in the transport row to switch between passive listening (no
-silence) and practice mode, where every Play press inserts a
-ready-set-go countdown of the chosen ms before audio starts.
+loops from any pair of anchors. **Drag** markers and loop
+boundaries to fine-tune positions on either the waveform or the
+staff (loop edges snap to nearby barlines / markers as you drag).
+Toggle the **Pre-roll** checkbox in the transport row to switch
+between passive listening (no silence) and practice mode, where
+every Play press inserts a ready-set-go countdown of the chosen
+ms before audio starts.
 
 ## Roadmap
 

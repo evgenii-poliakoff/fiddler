@@ -108,6 +108,11 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     paintTimeSignature(painter);
     paintBarlines(painter);
     paintMarkers(painter);
+    // Selected loop's edges re-drawn ON TOP so the user can see
+    // (and drag) the edge even when a marker tick or barline sits
+    // at exactly the same x. Mirrors the hit-test rule in
+    // ScoreOverlayBase::mousePressEvent. Issue #11.
+    paintSelectedLoopEdges(painter);
     // Cursor must paint BEFORE the secondary anchor's dashed
     // indicator so that, when both are at the same x (e.g. right
     // after a tap-place when the cursor seeks to the new artifact),
@@ -350,6 +355,27 @@ void StaffWidget::paintCursor(QPainter& painter) const {
     if (cursorX < 0 || cursorX >= width()) return;
     painter.setPen(QPen(QColor(255, 80, 80), 2.0));
     painter.drawLine(cursorX, 0, cursorX, height());
+}
+
+void StaffWidget::paintSelectedLoopEdges(QPainter& painter) const {
+    const auto lpModel = loopModel();
+    const auto selLoop = selectedLoopId();
+    if (!lpModel || !selLoop.has_value()) return;
+    const auto idx = lpModel->indexOf(*selLoop);
+    if (!idx) return;
+    const auto& sel = lpModel->loops()[*idx];
+    const int xStart = msToX(sel.startMs);
+    const int xEnd   = msToX(sel.endMs);
+    const int xLeft  = std::max(0, xStart);
+    const int xRight = std::min(width(), xEnd);
+    const QColor edgeCol(180, 240, 200, 255);
+    painter.setPen(QPen(edgeCol, 2.0));
+    if (xStart == xLeft) {
+        painter.drawLine(xLeft, 0, xLeft, height());
+    }
+    if (xEnd == xRight) {
+        painter.drawLine(xRight - 1, 0, xRight - 1, height());
+    }
 }
 
 } // namespace fiddler::ui

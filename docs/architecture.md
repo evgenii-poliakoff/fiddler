@@ -476,11 +476,11 @@ currently-selected marker.
 `[startMs, endMs)` across the full vertical extent of the
 widget, with the loop name in a label strip at the bottom of
 the band (so it doesn't clash with the marker flag row at the
-top). Selected loops render at higher alpha; loops are
-render-only on the score widgets — selection is dock-driven, so
-clicking inside a band on the waveform doesn't change selection
-(this would conflict with the seek-anywhere affordance, and the
-explicit dock surface is the canonical way to inspect a loop).
+top). Selected loops render at higher alpha. Clicking the
+**band interior** still seeks (per the seek-anywhere
+affordance); clicking near a **band edge** (within ~6 px of
+xLeft / xRight) selects the loop and arms a drag — see
+"Drag-to-nudge" below.
 
 **Secondary-anchor visual** is a dashed indicator at the captured
 ms — yellow if the anchor lands on a barline (or stands alone),
@@ -488,13 +488,90 @@ cyan if it lands on a marker. See "Loop creation gesture" above
 for the painted-as-dashed-on-overlap rules and the cursor-pierce
 behaviour.
 
+### Drag-to-nudge (#11)
+
+Both score widgets support drag-to-fine-tune for **markers** and
+**loop boundaries**. All the logic lives in `ScoreOverlayBase` so
+both subclasses inherit it; the subclasses provide only their
+existing coord transforms (`xToMs` / `msToX`).
+
+**Hit-test priority on press** extends the existing chain:
+marker → barline → **loop edge** (~6 px of `xLeft` or `xRight`) →
+empty space (seek). A marker sitting exactly on a loop edge wins
+the press by default — drag moves the marker, the edge stays put.
+
+**Selection-driven exception.** When a loop is currently selected,
+*that* loop's edges take priority over markers / barlines that sit
+at the same x. Without this, a loop created from markers would
+have its edges permanently unreachable by drag — every press at
+the edge x would land on the anchor marker. The selection
+effectively means "edit mode" for the loop. To drag a coincident
+marker, the user clicks the marker in the dock first; the
+cross-kind mutex switches selection back to the marker. The paint
+order mirrors the rule: the selected loop's edges are re-drawn
+ON TOP of barlines and markers so the user can see the edge they
+intend to grab.
+
+**Empty-space clicks preserve the loop selection.** Clicking on
+the waveform / staff in a region with no artifact still seeks
+(navigation gesture) but does NOT clear `selectedLoopId_`.
+Rationale: the user often scrubs through audio while keeping
+the loop in "edit mode" so they can return and nudge an edge.
+Selection is cleared only by clicking a different artifact (the
+cross-kind mutex switches it) or by the dock.
+
+**Click-vs-drag disambiguation** uses Qt's `startDragDistance()`
+(default 10 px). Press + release without crossing the threshold
+keeps the existing click semantics (select + seek for marker /
+barline; select-only for loop edge — no seek there because the
+user is editing region geometry, not navigating). Once the
+threshold is crossed, the gesture commits to drag mode for the
+rest of that mouse-down.
+
+**Live mutation during drag.** The widget holds models as
+`shared_ptr<const>` so writes have to round-trip through the
+parent: each mouse-move past the threshold emits
+`markerDragRequested(id, newMs)` or
+`loopDragRequested(id, newStart, newEnd)`. MainWindow's slot
+calls `MarkerModel::setPosition` / `LoopModel::setRange` and the
+`changed()` signal repaints both score widgets and the dock's
+property page in real time. For markers, the widget also emits
+`seekRequested(newMs)` per move so the cursor visually tracks
+the marker (DAW-typical "live follow"). Loop edges don't
+seek — region geometry is independent from playback.
+
+**Snap-to-anchor** for loop edges: as the cursor passes within
+~6 px of any barline or marker, the edge locks to that anchor's
+exact ms. Moving away unlocks. Snap is live (not release-only)
+to give the user the magnet feel.
+
+**Invariant guards.** Loop drag refuses to commit a range that
+violates `start < end` — the dragged edge stops one ms shy of
+the partner rather than crashing through. Defensive: if the
+dragged artifact is removed mid-drag (Ctrl+Z, Del on a sibling
+widget), the drag is dropped silently.
+
+**Release** emits `markerDragCommitted` / `loopDragCommitted`
+once with `(id, fromMs, toMs)` — MainWindow logs that line for
+the bug-report channel. The intermediate per-move signals stay
+quiet to avoid log flooding; the commit line carries everything
+a replay test would need.
+
+**Out of scope (deferred):** barline drag (step 6 — see "Things
+deliberately not built" below). Undo for drag (issue #20 —
+extending Ctrl+Z to cover all artifact edits, not just
+placements).
+
 Things deliberately not built in this PR (deferred to follow-on
 work):
 
 - Tap-latency compensation (subtracting ~150 ms from
   `player.position()` at tap time to account for human reaction
   lag).
-- Drag-to-nudge a placed barline / marker / loop endpoint.
+- Drag-to-nudge for **barlines** — deferred to step 6 when the
+  staff widget grows note content and barline interaction
+  patterns are reconsidered. Marker drag and loop-boundary drag
+  shipped in #11; see "Drag-to-nudge" below.
 - Auto-suggestion of bar positions.
 - Free-meter / Air / "Other..." entries in the time-sig picker.
 - A generic overlay-layer registration API. We have three

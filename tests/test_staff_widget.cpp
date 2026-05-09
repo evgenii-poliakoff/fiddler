@@ -10,14 +10,18 @@
 #include "score/MarkerModel.h"
 #include "ui/StaffWidget.h"
 
+#include <QApplication>
+#include <QMouseEvent>
 #include <QSignalSpy>
 #include <QTest>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <span>
+#include <utility>
 
 using fiddler::score::BarlineModel;
 using fiddler::score::LoopModel;
@@ -716,4 +720,86 @@ TEST_CASE("StaffWidget: Esc clears the secondary anchor",
     QTest::keyClick(&w, Qt::Key_Escape);
     REQUIRE_FALSE(w.selectedMarkerId().has_value());
     REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Drag-to-nudge (issue #11) — confirm the base-class plumbing reaches
+// the staff subclass too. The detailed gesture matrix (snap, marker-
+// over-edge priority, invariant rejection) is pinned in
+// test_waveform_widget.cpp; here we only sanity-check that the
+// signals fire on the staff so the base/subclass split holds.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void dragSequence(StaffWidget& w, int xPress, int xRelease) {
+    const QPoint pressPt {xPress,   50};
+    const QPoint endPt   {xRelease, 50};
+    QTest::mousePress(&w, Qt::LeftButton, Qt::NoModifier, pressPt);
+    QMouseEvent mvNear(QEvent::MouseMove,
+                       QPointF{pressPt + QPoint{2, 0}},
+                       Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &mvNear);
+    QMouseEvent mvFinal(QEvent::MouseMove,
+                        QPointF{endPt},
+                        Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &mvFinal);
+    QTest::mouseRelease(&w, Qt::LeftButton, Qt::NoModifier, endPt);
+}
+
+} // namespace
+
+TEST_CASE("StaffWidget: dragging a marker emits live + commit signals",
+          "[staff-widget][gui][drag]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+
+    const std::int64_t stamps[] = { 1000 };
+    auto markers = installMarkers(
+        w, std::span<const std::int64_t>{stamps});
+    QObject::connect(&w, &StaffWidget::markerDragRequested,
+                     &w, [&markers](std::int64_t id,
+                                    std::int64_t newMs) {
+                         markers->setPosition(id, newMs);
+                     });
+
+    QSignalSpy commitSpy(&w, &StaffWidget::markerDragCommitted);
+
+    const int xStart = w.msToX(1000);
+    const int xEnd   = w.msToX(2000);
+    dragSequence(w, xStart, xEnd);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args[1].toLongLong() == 1000);
+    REQUIRE(std::abs(args[2].toLongLong() - 2000) < 5);
+}
+
+TEST_CASE("StaffWidget: dragging a loop's left edge updates startMs",
+          "[staff-widget][gui][drag][loops]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel());
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    QObject::connect(&w, &StaffWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+    QSignalSpy commitSpy(&w, &StaffWidget::loopDragCommitted);
+
+    const int xLeftEdge  = w.msToX(1000);
+    const int xLeftFinal = w.msToX(1300);
+    dragSequence(w, xLeftEdge, xLeftFinal);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args[1].toBool() == true);          // isStartEdge
+    REQUIRE(loops->loops()[0].endMs == 2000);   // partner intact
+    REQUIRE(std::abs(loops->loops()[0].startMs - 1300) < 5);
 }

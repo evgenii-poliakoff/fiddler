@@ -1218,3 +1218,399 @@ TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
     w.setSecondaryAnchorMs(std::nullopt);
     REQUIRE(spy.count() == 2);
 }
+
+// ---------------------------------------------------------------------------
+// Drag-to-nudge — markers and loop boundaries (issue #11)
+//
+// MEMO: drag uses real Qt mouse events (press → moves → release)
+// rather than the simpler QTest::mouseClick helper. mouseClick
+// emits press + release at the same point; we need intermediate
+// moves to cross startDragDistance() and trigger drag mode.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Helper: drive a press → series of moves → release sequence on the
+// widget. Each move sits at (x, 50) so the drag is purely
+// horizontal — vertical position is irrelevant for the source-time
+// translation.
+void dragSequence(WaveformWidget& w, int xPress, int xRelease) {
+    const QPoint pressPt {xPress,   50};
+    const QPoint endPt   {xRelease, 50};
+    QTest::mousePress(&w, Qt::LeftButton, Qt::NoModifier, pressPt);
+    // Two intermediate moves: one inside the threshold (no-op), one
+    // past it (commits to drag mode and starts emitting).
+    QMouseEvent mvNear(QEvent::MouseMove,
+                       QPointF{pressPt + QPoint{2, 0}},
+                       Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &mvNear);
+    QMouseEvent mvFinal(QEvent::MouseMove,
+                        QPointF{endPt},
+                        Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &mvFinal);
+    QTest::mouseRelease(&w, Qt::LeftButton, Qt::NoModifier, endPt);
+}
+
+} // namespace
+
+TEST_CASE("WaveformWidget: press marker without moving stays a click (no drag)",
+          "[waveform-widget][gui][drag]") {
+    // MEMO: regression — the click-vs-drag threshold means a
+    // press + release at the same point must still behave like a
+    // click (select + seek). No drag-commit signal fires.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::int64_t stamps[] = { 1000 };
+    auto markers = installMarkers(
+        w, std::span<const std::int64_t>{stamps});
+    QSignalSpy commitSpy(&w, &WaveformWidget::markerDragCommitted);
+
+    const int x = w.msToX(1000);
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(x, 50));
+
+    REQUIRE(w.selectedMarkerId().has_value());     // click still selects
+    REQUIRE(commitSpy.count() == 0);               // but no drag fired
+    REQUIRE(markers->markers()[0].sourceMs == 1000); // model unchanged
+}
+
+TEST_CASE("WaveformWidget: dragging a marker emits live + commit signals",
+          "[waveform-widget][gui][drag]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::int64_t stamps[] = { 1000 };
+    auto markers = installMarkers(
+        w, std::span<const std::int64_t>{stamps});
+
+    QSignalSpy liveSpy  (&w, &WaveformWidget::markerDragRequested);
+    QSignalSpy commitSpy(&w, &WaveformWidget::markerDragCommitted);
+
+    // Wire the live signal to actually mutate the model — that's
+    // the contract MainWindow fulfils in production. Without it,
+    // the release-time commit reads the model's stale pre-drag
+    // position because nothing wrote to it.
+    QObject::connect(&w, &WaveformWidget::markerDragRequested,
+                     &w, [&markers](std::int64_t id,
+                                    std::int64_t newMs) {
+                         markers->setPosition(id, newMs);
+                     });
+
+    const int xStart = w.msToX(1000);
+    const int xEnd   = w.msToX(2000);
+    dragSequence(w, xStart, xEnd);
+
+    REQUIRE(liveSpy.count()   >= 1);   // at least one live update
+    REQUIRE(commitSpy.count() == 1);   // one commit on release
+
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args[0].toLongLong() == *markers->idAt(0));
+    REQUIRE(args[1].toLongLong() == 1000);   // fromMs
+    // toMs is whatever the final cursor x maps to. Allow 5 ms slop
+    // for the integer rounding in xToMs.
+    REQUIRE(std::abs(args[2].toLongLong() - 2000) < 5);
+}
+
+TEST_CASE("WaveformWidget: marker drag emits seekRequested per move (cursor follow)",
+          "[waveform-widget][gui][drag]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::int64_t stamps[] = { 1000 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+
+    const int xStart = w.msToX(1000);
+    const int xEnd   = w.msToX(2500);
+    dragSequence(w, xStart, xEnd);
+
+    // press fires one seek (existing click behavior) + at least one
+    // more on a drag move.
+    REQUIRE(seekSpy.count() >= 2);
+}
+
+TEST_CASE("WaveformWidget: pressing on a loop edge arms a drag without seeking",
+          "[waveform-widget][gui][drag][loops]") {
+    // MEMO: loop edges are a NEW hit-test target (#11). Selecting a
+    // loop via its edge must not seek — the user is editing region
+    // geometry, not navigating playback.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+
+    const int xLeftEdge = w.msToX(1000);
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xLeftEdge, 50));
+
+    REQUIRE(w.selectedLoopId().has_value());
+    REQUIRE(*w.selectedLoopId() == *loops->idAt(0));
+    REQUIRE(seekSpy.count() == 0);   // no seek on edge click
+}
+
+TEST_CASE("WaveformWidget: dragging a loop's left edge updates startMs",
+          "[waveform-widget][gui][drag][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QSignalSpy liveSpy  (&w, &WaveformWidget::loopDragRequested);
+    QSignalSpy commitSpy(&w, &WaveformWidget::loopDragCommitted);
+
+    // Wire the live signal to actually mutate the model — that's
+    // what MainWindow does in production. Without this the
+    // mouseRelease commit reads stale model state.
+    QObject::connect(&w, &WaveformWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+
+    const int xLeftEdge  = w.msToX(1000);
+    const int xLeftFinal = w.msToX(1300);
+    dragSequence(w, xLeftEdge, xLeftFinal);
+
+    REQUIRE(liveSpy.count() >= 1);
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args[1].toBool() == true);          // isStartEdge
+    REQUIRE(args[2].toLongLong() == 1000);      // fromMs
+    REQUIRE(std::abs(args[3].toLongLong() - 1300) < 5);
+    // Partner edge stayed put.
+    REQUIRE(loops->loops()[0].endMs == 2000);
+}
+
+TEST_CASE("WaveformWidget: dragging a loop's right edge updates endMs only",
+          "[waveform-widget][gui][drag][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QObject::connect(&w, &WaveformWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+    QSignalSpy commitSpy(&w, &WaveformWidget::loopDragCommitted);
+
+    const int xRightEdge  = w.msToX(2000);
+    const int xRightFinal = w.msToX(2700);
+    dragSequence(w, xRightEdge, xRightFinal);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args[1].toBool() == false);         // isStartEdge=false → end
+    REQUIRE(loops->loops()[0].startMs == 1000); // partner unchanged
+    REQUIRE(std::abs(loops->loops()[0].endMs - 2700) < 5);
+}
+
+TEST_CASE("WaveformWidget: dragging loop edge near a barline snaps to it",
+          "[waveform-widget][gui][drag][loops][snap]") {
+    // MEMO: the magnet feel — drag the edge to within ~6 px of a
+    // barline, on release the edge ms exactly equals the barline ms.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1500);   // snap target
+    w.setBarlineModel(barlines);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QObject::connect(&w, &WaveformWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+
+    // Drag the right edge from xMsToX(2000) toward the barline.
+    // Land 2 px away from the barline so we're inside the snap
+    // tolerance (6 px) — the final ms should equal 1500 exactly.
+    const int xRightEdge   = w.msToX(2000);
+    const int xBarline     = w.msToX(1500);
+    const int xLandNearbar = xBarline + 2;
+    dragSequence(w, xRightEdge, xLandNearbar);
+
+    REQUIRE(loops->loops()[0].endMs == 1500);   // snapped
+}
+
+TEST_CASE("WaveformWidget: marker takes priority over loop edge when no loop selected",
+          "[waveform-widget][gui][drag][loops]") {
+    // MEMO: per #11 — "Drag a marker NEAR a loop boundary — they
+    // move independently". The marker wins the default hit-test so
+    // dragging moves the marker, not the edge. Exception when a
+    // loop is selected — see the next test.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::int64_t stamps[] = { 1000 };
+    auto markers = installMarkers(
+        w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    // No loop selected — default priority applies.
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+
+    QSignalSpy markerSpy(&w, &WaveformWidget::markerDragRequested);
+    QSignalSpy loopSpy  (&w, &WaveformWidget::loopDragRequested);
+
+    const int xCoincident = w.msToX(1000);
+    const int xEnd        = w.msToX(1200);
+    dragSequence(w, xCoincident, xEnd);
+
+    REQUIRE(markerSpy.count() >= 1);
+    REQUIRE(loopSpy.count()   == 0);
+    (void)markers; (void)loops;
+}
+
+TEST_CASE("WaveformWidget: empty-space click preserves loop selection",
+          "[waveform-widget][gui][drag][loops][selected-z-order]") {
+    // MEMO[smoke #11]: confirmed during smoke testing — clicking
+    // empty space on the waveform must NOT clear the loop
+    // selection. The user might want to scrub-seek while keeping
+    // the loop in "edit mode" so they can come back and nudge an
+    // edge afterwards. Loop selection is cleared only by clicking
+    // a different artifact (cross-kind mutex) or by the dock.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy seekSpy(&w, &WaveformWidget::seekRequested);
+
+    // Click far from any artifact (and far from the loop edges).
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(w.msToX(3500), 50));
+
+    REQUIRE(seekSpy.count() == 1);                    // empty click → seek
+    REQUIRE(w.selectedLoopId().has_value());          // loop still selected
+}
+
+TEST_CASE("WaveformWidget: selected loop's edges win over coincident markers",
+          "[waveform-widget][gui][drag][loops][selected-z-order]") {
+    // MEMO[smoke #11]: a loop created from markers had its edges
+    // permanently unreachable by drag — the marker at the edge's
+    // x always won. After this fix, when the loop is the selected
+    // artifact (e.g. immediately after creation), its edges take
+    // hit-test priority over coincident markers. The marker is
+    // still draggable: click it (cross-kind mutex switches
+    // selection), then drag.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::int64_t stamps[] = { 1000, 2000 };
+    auto markers = installMarkers(
+        w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    // Auto-select the loop (mirrors what onCreateLoop does in
+    // MainWindow after the user presses L).
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    // Wire live-mutate so the drag actually moves the model.
+    QObject::connect(&w, &WaveformWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+
+    QSignalSpy markerSpy(&w, &WaveformWidget::markerDragRequested);
+    QSignalSpy loopSpy  (&w, &WaveformWidget::loopDragRequested);
+
+    // Press at the loop's right edge — which coincides with the
+    // marker at 2000 — and drag. With the new rule the loop edge
+    // wins despite the marker being there.
+    const int xRightEdge = w.msToX(2000);
+    const int xEndDrag   = w.msToX(2400);
+    dragSequence(w, xRightEdge, xEndDrag);
+
+    REQUIRE(loopSpy.count()   >= 1);
+    REQUIRE(markerSpy.count() == 0);
+    // Marker stayed put.
+    REQUIRE(markers->markers()[1].sourceMs == 2000);
+}
+
+TEST_CASE("WaveformWidget: loop edge drag past partner edge is rejected",
+          "[waveform-widget][gui][drag][loops]") {
+    // MEMO: the start < end invariant — the widget refuses to emit
+    // a drag request that would invert the loop. No live updates
+    // for the offending move, no commit signal at release (because
+    // dragActive_ stayed unset — we never crossed threshold while
+    // pointing somewhere valid... actually we do cross threshold,
+    // we just don't emit live updates for invalid positions).
+    //
+    // The artifact's range stays at its original value, and the
+    // commit signal still fires (dragActive_ flips on the first
+    // threshold-crossing move regardless of whether it produced an
+    // emission). The toMs in the commit reflects the original
+    // value because nothing moved.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    QObject::connect(&w, &WaveformWidget::loopDragRequested,
+                     &w, [&loops](std::int64_t id,
+                                  std::int64_t newStart,
+                                  std::int64_t newEnd) {
+                         loops->setRange(id, newStart, newEnd);
+                     });
+
+    // Press on the left edge, drag PAST the right edge.
+    const int xLeftEdge = w.msToX(1000);
+    const int xPastEnd  = w.msToX(2500);
+    dragSequence(w, xLeftEdge, xPastEnd);
+
+    // Range is unchanged — invariant held.
+    REQUIRE(loops->loops()[0].startMs == 1000);
+    REQUIRE(loops->loops()[0].endMs   == 2000);
+}
