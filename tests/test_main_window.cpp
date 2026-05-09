@@ -814,7 +814,15 @@ TEST_CASE("MainWindow: opening a new file clears the marker model",
     auto* stopButton = window->findChild<QPushButton*>("stopButton");
     QTest::mouseClick(playButton, Qt::LeftButton);
     QTest::mouseClick(stopButton, Qt::LeftButton);
+    // Place two markers at distinct positions. The near-duplicate
+    // guard (#17) rejects same-position retaps, so we seek between
+    // taps to keep both placements valid.
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(0);
+    emit posSlider->sliderMoved(0);
     QTest::keyClick(window.get(), Qt::Key_M);
+    posSlider->setValue(500);
+    emit posSlider->sliderMoved(500);
     QTest::keyClick(window.get(), Qt::Key_M);
     REQUIRE(window->markerModel().size() == 2);
 
@@ -857,6 +865,100 @@ void seekAndTapMarker(MainWindow& window, std::int64_t ms) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Tap-to-place near-duplicate guard (#17)
+//
+// MEMO: a rapid double-tap of M / B places two artifacts within a
+// few ms of each other — almost always an accident the user has to
+// undo. The tap handler rejects the second tap when an existing
+// same-kind artifact sits within `kMinTapSeparationMs` (50 ms).
+// The check lives at the gesture layer; the models stay permissive
+// (you can still place close artifacts via the dock spinbox).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: rapid M tap near an existing marker is rejected",
+          "[main-window][gui][integration][markers][near-duplicate]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1000);
+    REQUIRE(window->markerModel().size() == 1);
+
+    // Second tap 20 ms later — within the 50 ms window. Rejected.
+    seekAndTapMarker(*window, 1020);
+    REQUIRE(window->markerModel().size() == 1);
+
+    // Third tap well outside the window. Accepted.
+    seekAndTapMarker(*window, 1100);
+    REQUIRE(window->markerModel().size() == 2);
+}
+
+TEST_CASE("MainWindow: rapid B tap near an existing barline is rejected",
+          "[main-window][gui][integration][barlines][near-duplicate]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto seekAndTapBarline = [&](std::int64_t ms) {
+        posSlider->setValue(static_cast<int>(ms));
+        emit posSlider->sliderMoved(static_cast<int>(ms));
+        QTest::keyClick(window.get(), Qt::Key_B);
+    };
+
+    seekAndTapBarline(1000);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    // Within the 50 ms window — rejected.
+    seekAndTapBarline(1030);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    // Outside the window — accepted.
+    seekAndTapBarline(1200);
+    REQUIRE(window->barlineModel().size() == 2);
+}
+
+TEST_CASE("MainWindow: near-duplicate guard is per-kind — M near B is allowed",
+          "[main-window][gui][integration][near-duplicate]") {
+    // Different-kind co-location is fine: a barline and a marker
+    // can share an ms (they mean different things).
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    // Same source-time, different kind → accepted.
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->markerModel().size() == 1);
+}
 
 TEST_CASE("MainWindow: L creates a loop spanning the two anchored markers",
           "[main-window][gui][integration][loops]") {

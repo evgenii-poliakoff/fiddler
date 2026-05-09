@@ -54,6 +54,29 @@ namespace {
 // 64 KB — trivial.
 constexpr std::size_t kOverviewBuckets = 4096;
 
+// Minimum source-time gap between same-kind tap-placements (#17).
+// A rapid double-tap of B / M produces two artifacts at nearly the
+// same ms — almost always an accident the user will then have to
+// undo. We reject the second tap if any existing same-kind artifact
+// sits within this window. 50 ms is below typical accidental retap
+// rates (~100 ms) and above the fastest intentional placement
+// (e.g. a triplet at 240 bpm = ~83 ms per note), so the rule
+// catches accidents without limiting genuine fast tapping.
+//
+// MEMO: this lives at the gesture layer, not in the models. The
+// models stay permissive — placing close artifacts via the dock's
+// spinbox or programmatically is still allowed.
+//
+// MEMO[zoom]: a fixed source-time threshold won't be the right
+// shape once zoom lands. At deep zoom-in 50 ms might be many
+// hundreds of pixels apart and the user genuinely wants to place
+// distinct artifacts that close; at zoom-out 50 ms is sub-pixel
+// and the user can't visually distinguish them anyway. The
+// future criterion is likely a *pixel* proximity threshold (e.g.
+// reject within ~5 px), computed via xToMs/msToX at the current
+// zoom. Re-evaluate this constant when adding zoom (issue TBD).
+constexpr std::int64_t kMinTapSeparationMs = 50;
+
 // Tradition-named time-signature presets, surfaced as the primary
 // picker for the user. The order is roughly "most common in Irish
 // trad first". When the user picks one, the entire TimeSignature
@@ -762,10 +785,23 @@ void MainWindow::onTempoChanged(int percent) {
 void MainWindow::onTapBarline() {
     // The 'B' key — primary barline-placement gesture. We capture
     // the player's current source-time position and ask the model to
-    // record it. The model handles sorted insertion + duplicate
+    // record it. The model handles sorted insertion + exact-duplicate
     // rejection; both widgets receive `changed()` and repaint.
     if (!player_ || !player_->duration().count()) return;
     const auto pos        = player_->position().count();
+
+    // Near-duplicate guard (#17). Reject if any existing barline is
+    // within kMinTapSeparationMs of pos — almost always an accidental
+    // double-tap. The model itself only rejects EXACT duplicates;
+    // this widening lives at the gesture layer.
+    if (const auto near =
+            barlineModel_->nearest(pos, kMinTapSeparationMs)) {
+        FLOG_DEBUG("ui.score",
+                   "tap-place ms={} ignored (within {} ms of index={}) size={}",
+                   pos, kMinTapSeparationMs, *near, barlineModel_->size());
+        return;
+    }
+
     const auto sizeBefore = barlineModel_->size();
     const auto inserted   = barlineModel_->add(pos);
 
@@ -809,11 +845,27 @@ void MainWindow::onTapBarline() {
 
 void MainWindow::onTapMarker() {
     // The 'M' key — primary marker-placement gesture. Like 'B'
-    // for barlines, but markers are auto-named and never reject
-    // duplicates (two markers can sit at the same ms with
-    // different names — see MarkerModel::add).
+    // for barlines, but markers are auto-named, and the model
+    // permits multiple markers at the same ms with different
+    // names (see MarkerModel::add).
     if (!player_ || !player_->duration().count()) return;
     const auto pos = player_->position().count();
+
+    // Near-duplicate guard (#17). Reject the tap if any existing
+    // marker is within kMinTapSeparationMs of pos. Without this,
+    // a rapid double-tap leaves an extra "Mark N+1" sitting on top
+    // of "Mark N" in the dock — clutter the user has to undo.
+    // The model stays permissive: placing two markers at the same
+    // ms is still possible via the dock spinbox or programmatically,
+    // just not via the rapid-fire tap gesture.
+    if (const auto nearId =
+            markerModel_->nearest(pos, kMinTapSeparationMs)) {
+        FLOG_DEBUG("ui.score",
+                   "tap-marker ms={} ignored (within {} ms of id={}) size={}",
+                   pos, kMinTapSeparationMs, *nearId, markerModel_->size());
+        return;
+    }
+
     const auto id  = markerModel_->add(pos);
 
     // Auto-select the newly-placed marker. Same pattern as

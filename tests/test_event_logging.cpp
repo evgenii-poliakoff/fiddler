@@ -381,7 +381,7 @@ TEST_CASE("ui.score: tap-place logs ms + index + size",
     REQUIRE(containsLog(entries, "ui.score", "size=1"));
 }
 
-TEST_CASE("ui.score: tap-place at duplicate ms is logged as 'ignored'",
+TEST_CASE("ui.score: tap-place at near-duplicate ms is logged as 'ignored'",
           "[event-logging][gui][ui.score]") {
     qtApp();
     auto lw = makeLoadedWindow();
@@ -390,16 +390,17 @@ TEST_CASE("ui.score: tap-place at duplicate ms is logged as 'ignored'",
     QTest::mouseClick(lw.stopButton, Qt::LeftButton);
 
     // First tap places at 0; second tap at the same position should
-    // be rejected by the model and logged as ignored. The model's
-    // duplicate-rejection contract (BarlineModel::add returns the
-    // existing index) is what makes this case observable in the log.
+    // be rejected by the gesture-layer near-duplicate guard (#17)
+    // and logged as ignored. The model's exact-duplicate contract
+    // (BarlineModel::add returns the existing index) still backs
+    // this up, but the widget filter catches it first.
     QTest::keyClick(lw.window.get(), Qt::Key_B);
 
     CapturedLogs logs;
     QTest::keyClick(lw.window.get(), Qt::Key_B);
 
     const auto entries = logs.snapshot();
-    REQUIRE(containsLog(entries, "ui.score", "ignored (duplicate)"));
+    REQUIRE(containsLog(entries, "ui.score", "ignored (within"));
 }
 
 TEST_CASE("ui.score: undo-last logs success and empty no-op cases",
