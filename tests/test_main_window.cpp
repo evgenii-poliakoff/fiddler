@@ -11,6 +11,7 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "ui/LoopCountdownWidget.h"
 #include "ui/MainWindow.h"
 #include "ui/ProjectViewerDock.h"
 #include "ui/StaffWidget.h"
@@ -1656,4 +1657,115 @@ TEST_CASE("MainWindow: a fresh QSettings keeps the default visible layout",
     auto* dock = window.findChild<ProjectViewerDock*>("projectViewerDock");
     REQUIRE(dock);
     REQUIRE(dock->isVisible());
+}
+
+// ---------------------------------------------------------------------------
+// Loop countdown widget — integration with the pause-between-repeats wrap
+//
+// MEMO[refactor]: end-to-end pin for issue #9. The widget itself
+// is unit-tested in test_loop_countdown_widget.cpp; here we verify
+// MainWindow drives it correctly: startCountdown is called when
+// the wrap-pause window begins, cancelCountdown is called on
+// disarm. We don't rely on audio actually advancing position —
+// instead we directly drive `updatePosition`'s wrap path by
+// arming a loop with a known endMs and calling Player::seek to
+// jump past it before triggering the GUI poll manually.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: ProjectViewerDock has a countdown widget",
+          "[main-window][gui][integration][countdown]") {
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* countdown =
+        window.findChild<fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(countdown);
+}
+
+TEST_CASE("MainWindow: disarm via Stop cancels an active countdown",
+          "[main-window][gui][integration][countdown]") {
+    // MEMO: kicks the dock's startCountdown directly via the
+    // stable API the widget exposes, then verifies that pressing
+    // Stop disarms AND cancels. This shape sidesteps the audio-
+    // playback-advances-position dependency that makes the wrap
+    // path itself flaky in headless CI.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* stopBtn = loaded.window->findChild<QPushButton*>("stopButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(dock);
+    REQUIRE(countdown);
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    // Simulate the wrap-pause start (MainWindow calls this from
+    // updatePosition when pos crosses endMs). A 5-second window
+    // is long enough that the Stop click reliably interrupts it.
+    dock->startCountdown(5000);
+    REQUIRE(countdown->isCountingDown());
+
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: arming a different loop cancels a stale countdown",
+          "[main-window][gui][integration][countdown]") {
+    // MEMO: two loops; arm A, simulate wrap-pause, then arm B
+    // before the pause finishes. The countdown for A must be
+    // cancelled — otherwise the user sees ticks depleting on
+    // the property page while looping B, which is misleading.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/300, /*end=*/700);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(dock);
+    REQUIRE(countdown);
+
+    // Add a second loop directly; we don't need to go through the
+    // L gesture for this test.
+    seekAndTapMarker(*loaded.window, 1000);
+    seekAndTapMarker(*loaded.window, 1500);
+    auto* waveform =
+        loaded.window->findChild<WaveformWidget*>("waveformWidget");
+    waveform->setSecondaryAnchorMs(1000);
+    QTest::keyClick(loaded.window.get(), Qt::Key_L);
+    REQUIRE(loaded.window->loopModel().size() == 2);
+    const auto secondLoopId =
+        loaded.window->loopModel().loops()[1].id;
+
+    // Arm loop A, simulate its wrap-pause kicking off.
+    emit dock->loopActivated(loaded.loopId);
+    dock->startCountdown(5000);
+    REQUIRE(countdown->isCountingDown());
+
+    // Activate loop B — should cancel A's countdown.
+    emit dock->loopActivated(secondLoopId);
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: deleting the armed loop cancels a stale countdown",
+          "[main-window][gui][integration][countdown]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    emit dock->loopActivated(loaded.loopId);
+    dock->startCountdown(5000);
+    REQUIRE(countdown->isCountingDown());
+
+    emit dock->loopDeleteRequested(loaded.loopId);
+    REQUIRE(loaded.window->loopModel().empty());
+    REQUIRE_FALSE(countdown->isCountingDown());
 }

@@ -57,6 +57,9 @@ class MarkerModel;
 
 namespace fiddler::ui {
 
+class LoopCountdownWidget;
+
+
 class ProjectViewerDock : public QDockWidget {
     Q_OBJECT
 public:
@@ -98,6 +101,14 @@ public slots:
     // The dock updates the tree row glyph and the Arm checkbox so
     // the UI matches transport state. nullopt = nothing armed.
     void setArmedLoopId(std::optional<std::int64_t> id);
+
+    // Pushed by MainWindow when transport enters / exits the
+    // pause-between-repeats window. `totalMs > 0` starts the
+    // countdown widget on the loop property page; cancel() halts
+    // it. The dock just forwards to the widget — countdown
+    // animation lives entirely in ui::LoopCountdownWidget.
+    void startCountdown(int totalMs);
+    void cancelCountdown();
 
 signals:
     // Selection changed in the dock — by tree click, by programmatic
@@ -226,11 +237,12 @@ private:
     QSpinBox*        markerPositionBox_ = nullptr;
 
     // Loop page widgets.
-    QLineEdit*       loopNameEdit_      = nullptr;
-    QSpinBox*        loopStartBox_      = nullptr;
-    QSpinBox*        loopEndBox_        = nullptr;
-    QSpinBox*        loopPauseBox_      = nullptr;
-    QCheckBox*       loopArmedCheck_    = nullptr;
+    QLineEdit*           loopNameEdit_      = nullptr;
+    QSpinBox*            loopStartBox_      = nullptr;
+    QSpinBox*            loopEndBox_        = nullptr;
+    QSpinBox*            loopPauseBox_      = nullptr;
+    QCheckBox*           loopArmedCheck_    = nullptr;
+    LoopCountdownWidget* loopCountdown_     = nullptr;
 
     // MEMO: invariant — set true while we're populating the
     // property-page widgets from the model, so their valueChanged

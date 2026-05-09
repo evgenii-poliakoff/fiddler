@@ -1,5 +1,7 @@
 add_executable(fiddler
     main.cpp
+    ui/LoopCountdownWidget.cpp
+    ui/LoopCountdownWidget.h
     ui/MainWindow.cpp
     ui/MainWindow.h
     ui/ProjectViewerDock.cpp

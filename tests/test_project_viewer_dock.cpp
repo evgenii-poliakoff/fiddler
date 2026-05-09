@@ -9,6 +9,7 @@
 #include "qt_test_app.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "ui/LoopCountdownWidget.h"
 #include "ui/ProjectViewerDock.h"
 
 #include <QCheckBox>
@@ -884,4 +885,52 @@ TEST_CASE("ProjectViewerDock: removing the selected loop clears selection",
     REQUIRE(model->remove(loopId));
     REQUIRE_FALSE(dock.selectedLoopId().has_value());
     REQUIRE(spy.count() >= 1);
+}
+
+TEST_CASE("ProjectViewerDock: countdown widget reflects armed state of selected loop",
+          "[project-viewer-dock][gui][loops][countdown][progressive-weight]") {
+    // MEMO: pin the three-tier visual weight wiring. The countdown
+    // widget's armed flag drives the disabled / ready / active
+    // colour tier. The dock forwards this whenever the property
+    // page refreshes — selection change AND armed-state change
+    // both go through refreshPropertyPage.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1500}, {2000, 3000}
+    };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+
+    auto* countdown =
+        dock.findChild<fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(countdown);
+
+    const auto firstId  = *model->idAt(0);
+    const auto secondId = *model->idAt(1);
+
+    // Select first loop, no arm — countdown should be in the
+    // disabled tier.
+    dock.setSelectedLoopId(firstId);
+    REQUIRE_FALSE(countdown->isArmed());
+
+    // Arm the first loop — the dock pushes that to the widget.
+    dock.setArmedLoopId(firstId);
+    REQUIRE(countdown->isArmed());
+
+    // Switch selection to the second (un-armed) loop — the
+    // countdown must drop back to the disabled tier even though
+    // the FIRST loop is still armed somewhere in transport.
+    dock.setSelectedLoopId(secondId);
+    REQUIRE_FALSE(countdown->isArmed());
+
+    // And back — selecting the armed loop again restores the
+    // ready tier.
+    dock.setSelectedLoopId(firstId);
+    REQUIRE(countdown->isArmed());
+
+    // Disarm — falls back to disabled.
+    dock.setArmedLoopId(std::nullopt);
+    REQUIRE_FALSE(countdown->isArmed());
 }
