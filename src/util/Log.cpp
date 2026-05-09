@@ -113,6 +113,55 @@ std::vector<std::string> parseFilter(std::string_view filter) {
 
 } // namespace
 
+ResolveResult resolveLogConfig(const CliInputs& in) {
+    ResolveResult out;
+    Config& cfg = out.config;
+
+    // Step 1: env (lower precedence than the CLI flag).
+    bool levelFromEnvOrCli = false;
+    if (!in.envLevel.empty()) {
+        if (auto lvl = parseLevel(in.envLevel)) {
+            cfg.level = *lvl;
+            levelFromEnvOrCli = true;
+        } else {
+            out.error = "Unknown FIDDLER_LOG_LEVEL: " + in.envLevel;
+            return out;
+        }
+    }
+
+    // Step 2: --log-level (overrides env if set).
+    if (in.levelExplicit) {
+        if (auto lvl = parseLevel(in.levelStr)) {
+            cfg.level = *lvl;
+            levelFromEnvOrCli = true;
+        } else {
+            out.error = "Unknown log level: " + in.levelStr;
+            return out;
+        }
+    }
+
+    // Step 3: filter — explicit value wins; unset falls back to "*".
+    if (in.filterExplicit) {
+        cfg.filter = in.filterStr.empty() ? std::string{"*"}
+                                          : in.filterStr;
+    }
+    // else cfg.filter keeps its default ("*")
+
+    // Step 4: load-bearing UX rule (see Log.h). Filter without level
+    // promotes verbosity. Without this, every gestural FLOG_DEBUG
+    // call is silently filtered out and the user sees nothing.
+    if (in.filterExplicit && !levelFromEnvOrCli) {
+        cfg.level = Level::Debug;
+    }
+
+    // Step 5: log file passthrough.
+    if (!in.logFile.empty()) {
+        cfg.logFile = std::filesystem::path(in.logFile);
+    }
+
+    return out;
+}
+
 std::optional<Level> parseLevel(std::string_view s) {
     const auto lo = toLower(s);
     if (lo == "trace") return Level::Trace;
@@ -140,7 +189,14 @@ void init(const Config& cfg) {
                                                     sinks.begin(), sinks.end());
     logger->set_level(toSpdlog(cfg.level));
     logger->set_pattern("%H:%M:%S.%e %^%-5l%$ [%t] %v");
-    logger->flush_on(spdlog::level::warn);
+    // MEMO: flush_on(debug) is deliberately aggressive — Fiddler is a
+    // debugging tool, used interactively at human time scales. Per-
+    // line flushing means the log file is always up to date when the
+    // user reproduces a bug, even if the app is force-killed (SIGTERM
+    // or crash). The throughput cost (one fsync-equivalent per line)
+    // is irrelevant at gestural rates. See tests/test_app_subprocess.cpp:
+    // the --log-file functional test depends on this flush policy.
+    logger->flush_on(spdlog::level::debug);
 
     spdlog::set_default_logger(logger);
     g_logger = std::move(logger);

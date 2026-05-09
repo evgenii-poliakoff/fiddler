@@ -23,6 +23,7 @@ class QTimer;
 namespace fiddler::audio { class Player; }
 namespace fiddler::score {
 class BarlineModel;
+class LoopModel;
 class MarkerModel;
 }
 
@@ -53,6 +54,7 @@ public:
     // marker-related mutations actually reach the models.
     [[nodiscard]] const score::BarlineModel& barlineModel() const noexcept;
     [[nodiscard]] const score::MarkerModel&  markerModel()  const noexcept;
+    [[nodiscard]] const score::LoopModel&    loopModel()    const noexcept;
 
 protected:
     // MEMO: closeEvent is overridden purely to emit a `[ui.file] close`
@@ -80,11 +82,18 @@ private slots:
     void onTapMarker();
 
     // The 'Ctrl+Z' shortcut: peel the most-recently-added artifact
-    // (barline or marker, whichever was most recent) from its
-    // model. MEMO: see placementHistory_ — this is the combined
+    // (barline, marker, or loop — whichever was most recent) from
+    // its model. MEMO: see placementHistory_ — this is the combined
     // LIFO that makes "Z = undo last placement" feel right
     // regardless of kind.
     void onUndoLastPlacement();
+
+    // The 'L' shortcut: turn a primary + secondary anchor pair into
+    // a new loop. Reads both anchors off the waveform widget; the
+    // staff and dock keep them in sync via the same mirror plumbing
+    // that already covers single selections. Lower of the two ms
+    // values becomes startMs, higher becomes endMs.
+    void onCreateLoop();
 
     // The tune-type picker: looks up the chosen preset and pushes
     // its TimeSignature into the model.
@@ -100,16 +109,51 @@ private slots:
     void onStaffMarkerSelectionChanged   (std::optional<std::int64_t> id);
     void onDockMarkerSelectionChanged    (std::optional<std::int64_t> id);
 
+    // Loop selection mirroring — same three-way shape as markers.
+    void onWaveformLoopSelectionChanged(std::optional<std::int64_t> id);
+    void onStaffLoopSelectionChanged   (std::optional<std::int64_t> id);
+    void onDockLoopSelectionChanged    (std::optional<std::int64_t> id);
+
+    // Secondary-anchor mirroring (waveform <-> staff). The dock
+    // doesn't track its own secondary anchor — it just emits gesture
+    // signals that we translate into setSecondaryAnchorMs calls on
+    // the score widgets here.
+    void onWaveformSecondaryAnchorChanged(std::optional<std::int64_t> ms);
+    void onStaffSecondaryAnchorChanged   (std::optional<std::int64_t> ms);
+    // Ctrl+left-click on a marker row in the dock — capture the
+    // current primary anchor's ms (read from the waveform widget,
+    // which is the canonical primary holder) as the secondary.
+    void onDockLoopAnchorAddRequested();
+    // Plain left-click elsewhere in the dock tree — clear secondary.
+    void onDockLoopAnchorClearRequested();
+
     // The user double-clicked a marker in the dock — seek the
     // player to the marker's position and start playback.
     // "Jump-and-play" is the standard DAW idiom for an
     // activate-on-double-click marker list.
     void onMarkerActivated(std::int64_t id);
 
+    // The user double-clicked a loop in the dock — arm it,
+    // seek to its startMs, and start playback. Same jump-and-play
+    // idiom as markers; the difference is that arming switches the
+    // transport into wrap-around mode (see updatePosition).
+    void onLoopActivated(std::int64_t id);
+
+    // The Arm checkbox on the loop property page was toggled.
+    // `armed=true` arms the loop *without* seeking or auto-playing
+    // (the user might be mid-listen and just want wrap-around to
+    // start happening at endMs); `armed=false` disarms.
+    void onLoopArmToggleRequested(std::int64_t id, bool armed);
+
+    // Connected to LoopModel::changed — drops the armed state if
+    // the armed loop has been removed from the model.
+    void onLoopModelChanged();
+
     // 'Del' on a widget: turn the requested-by-key signal into an
     // actual model mutation.
     void onBarlineDeleteRequested(std::size_t index);
     void onMarkerDeleteRequested (std::int64_t id);
+    void onLoopDeleteRequested   (std::int64_t id);
 
     // The window-level 'Del' shortcut: removes the currently-selected
     // artifact (barline OR marker) regardless of which child widget
@@ -139,6 +183,7 @@ private:
     ProjectViewerDock* projectViewerDock_ = nullptr;
     QShortcut*      tapBarShortcut_    = nullptr;   // 'B'
     QShortcut*      tapMarkerShortcut_ = nullptr;   // 'M'
+    QShortcut*      createLoopShortcut_ = nullptr;  // 'L'
     QShortcut*      undoShortcut_      = nullptr;   // Ctrl+Z
     QShortcut*      deleteBarShortcut_ = nullptr;   // 'Del' (artifact-agnostic)
 
@@ -149,6 +194,7 @@ private:
     // with member destruction here).
     std::shared_ptr<score::BarlineModel> barlineModel_;
     std::shared_ptr<score::MarkerModel>  markerModel_;
+    std::shared_ptr<score::LoopModel>    loopModel_;
 
     // MEMO: invariant — selection mirrors are one-shot, not loops.
     // Each widget (and now the dock) emits *SelectionChanged when
@@ -174,8 +220,22 @@ private:
     // succeeds or the history drains. See feedback_simple_first.md
     // — this is the simple route; a full QUndoStack would be richer
     // but we don't need redo or cross-action undo yet.
-    enum class PlacementKind { Barline, Marker };
+    enum class PlacementKind { Barline, Marker, Loop };
     std::vector<PlacementKind> placementHistory_;
+
+    // MEMO: armedLoopId_ is the canonical "transport is wrapping
+    // around this loop" state. The dock mirrors it via setArmedLoopId
+    // so the Armed checkbox + tree glyph match. Stop disarms; file
+    // load disarms; removing the armed loop from the model disarms.
+    std::optional<std::int64_t> armedLoopId_;
+
+    // Suppress re-entering the wrap path while a pause-between-
+    // repeats timer is in flight. Without this, the GUI poll could
+    // see pos > endMs on subsequent ticks (the player paused but
+    // the position didn't fully reset until the seek lands) and
+    // schedule duplicate wraps. Reset by the timer's lambda when
+    // the loop is rearmed at startMs.
+    bool wrapPending_ = false;
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't

@@ -1,6 +1,7 @@
 #include "ui/WaveformWidget.h"
 
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
 #include <QColor>
@@ -34,6 +35,24 @@ constexpr int kMarkerFlagHeightPx     = 14;
 constexpr int kMarkerFlagPaddingPx    = 4;
 constexpr int kMarkerFlagFontPointSz  = 8;
 constexpr int kMarkerFlagMaxWidthPx   = 120;
+
+// Loop bands — translucent, full-height. Selected loop renders with
+// higher alpha than unselected so a glance at the waveform tells you
+// which loop the dock's property page is editing. Colors chosen to
+// be visibly distinct from the cyan markers and yellow barlines: a
+// soft sage green that doesn't fight peaks-blue.
+//
+// MEMO: the loop label sits in the BOTTOM of the band (the bottom
+// kLoopLabelHeightPx pixels) on purpose — putting it at the top
+// would clash with the marker flag row, since loops and markers
+// commonly share start positions when the user converts a loop's
+// "starts here" into a marker for orientation.
+constexpr int kLoopBandAlphaUnselected = 35;
+constexpr int kLoopBandAlphaSelected   = 90;
+constexpr int kLoopLabelHeightPx       = 14;
+constexpr int kLoopLabelPaddingPx      = 4;
+constexpr int kLoopLabelFontPointSz    = 8;
+constexpr int kLoopLabelMaxWidthPx     = 120;
 } // namespace
 
 WaveformWidget::WaveformWidget(QWidget* parent) : QWidget(parent) {
@@ -88,6 +107,24 @@ void WaveformWidget::setMarkerModel(
     update();
 }
 
+void WaveformWidget::setLoopModel(
+    std::shared_ptr<const score::LoopModel> model)
+{
+    if (loopModel_) {
+        disconnect(loopModel_.get(), nullptr, this, nullptr);
+    }
+    loopModel_ = std::move(model);
+    if (loopModel_) {
+        connect(loopModel_.get(), &score::LoopModel::changed,
+                this, &WaveformWidget::onLoopModelChanged);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    update();
+}
+
 void WaveformWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
@@ -99,19 +136,23 @@ void WaveformWidget::setSelectedBarline(std::optional<std::size_t> index) {
         && *index >= barlineModel_->size()) {
         index = std::nullopt;
     }
-    // MEMO: mutual exclusion — setting a barline selection clears
-    // any active marker selection. The user wanted "the selected
-    // artifact" to be a single concept (the project viewer shows
-    // its properties), so even though both selection slots exist
+    // MEMO: mutual exclusion — setting a barline selection clears any
+    // active marker AND loop selection. The user wanted "the selected
+    // artifact" to be a single concept (the project viewer shows its
+    // properties), so even though all three selection slots exist
     // they're never simultaneously populated.
     if (index.has_value() && selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
+    if (index.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
     if (selectedBarline_ == index) {
-        // The marker-clear above may still have caused a repaint
-        // need (the marker was highlighted). Repaint just in case;
-        // update() is a cheap no-op when nothing actually moved.
+        // The marker/loop-clear above may still have caused a repaint
+        // need (the cleared selection was highlighted). Repaint just
+        // in case; update() is a cheap no-op when nothing moved.
         update();
         return;
     }
@@ -128,10 +169,14 @@ void WaveformWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
         id = std::nullopt;
     }
     // Mirror of setSelectedBarline: setting a marker selection clears
-    // any active barline selection.
+    // barline AND loop selections.
     if (id.has_value() && selectedBarline_.has_value()) {
         selectedBarline_.reset();
         emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     if (selectedMarkerId_ == id) {
         update();
@@ -140,6 +185,55 @@ void WaveformWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     selectedMarkerId_ = id;
     update();
     emit markerSelectionChanged(selectedMarkerId_);
+}
+
+std::optional<std::int64_t>
+WaveformWidget::primaryAnchorMs() const noexcept {
+    if (selectedBarline_.has_value() && barlineModel_
+        && *selectedBarline_ < barlineModel_->size())
+    {
+        return barlineModel_->barlines()[*selectedBarline_];
+    }
+    if (selectedMarkerId_.has_value() && markerModel_) {
+        if (const auto idx = markerModel_->indexOf(*selectedMarkerId_)) {
+            return markerModel_->markers()[*idx].sourceMs;
+        }
+    }
+    return std::nullopt;
+}
+
+void WaveformWidget::setSecondaryAnchorMs(
+    std::optional<std::int64_t> ms)
+{
+    if (secondaryAnchorMs_ == ms) return;
+    secondaryAnchorMs_ = ms;
+    update();
+    emit secondaryAnchorChanged(secondaryAnchorMs_);
+}
+
+void WaveformWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
+    // Validate against current model — drop dangling IDs.
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    // Mirror of the others: setting a loop selection clears
+    // barline AND marker selections.
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_ == id) {
+        update();
+        return;
+    }
+    selectedLoopId_ = id;
+    update();
+    emit loopSelectionChanged(selectedLoopId_);
 }
 
 void WaveformWidget::onBarlineModelChanged() {
@@ -162,6 +256,18 @@ void WaveformWidget::onMarkerModelChanged() {
         && !markerModel_->indexOf(*selectedMarkerId_).has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    update();
+}
+
+void WaveformWidget::onLoopModelChanged() {
+    // Mirror of onMarkerModelChanged: range edits keep the same ID
+    // (so selection survives), but a remove genuinely drops the ID
+    // and we have to clear the selection slot to match.
+    if (selectedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*selectedLoopId_).has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     update();
 }
@@ -243,6 +349,96 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
+    // Loop bands — drawn first so barlines, markers, and the cursor
+    // all paint on top (otherwise the band's translucent fill would
+    // smudge over a tick that the user wants to read clearly).
+    if (loopModel_) {
+        const auto loops = loopModel_->loops();
+        QFont labelFont = painter.font();
+        labelFont.setPointSize(kLoopLabelFontPointSz);
+        labelFont.setBold(true);
+        const QFontMetrics fm(labelFont);
+
+        for (const auto& l : loops) {
+            const int xStart = msToX(l.startMs);
+            const int xEnd   = msToX(l.endMs);
+            // Skip degenerate or off-screen bands. msToX() clamps to
+            // [0, w-1] so we still get a one-pixel-wide rect at the
+            // edge for loops that start before x=0; that's fine.
+            if (xEnd <= 0 || xStart >= width()) continue;
+
+            const int xLeft  = std::max(0, xStart);
+            const int xRight = std::min(width(), xEnd);
+            const int bandW  = std::max(1, xRight - xLeft);
+
+            const bool selected = (selectedLoopId_ == l.id);
+            const int  alpha    = selected
+                ? kLoopBandAlphaSelected
+                : kLoopBandAlphaUnselected;
+
+            // Soft sage green — chosen to be visibly distinct from
+            // the cyan markers and yellow barlines, and not to fight
+            // the peaks-blue waveform.
+            const QColor bandCol(120, 200, 140, alpha);
+            painter.fillRect(QRect(xLeft, 0, bandW, height()), bandCol);
+
+            // Vertical edges of the band, drawn slightly more opaque
+            // so the boundary is legible even when alpha is low.
+            const QColor edgeCol(140, 220, 160,
+                                 std::min(255, alpha + 60));
+            painter.setPen(QPen(edgeCol, selected ? 2.0 : 1.0));
+            painter.drawLine(xLeft,      0, xLeft,      height());
+            painter.drawLine(xRight - 1, 0, xRight - 1, height());
+
+            // Loop name label in the BOTTOM strip of the band
+            // (avoids overlapping the marker flag row at the top
+            // when a loop and a marker share a start position).
+            painter.setFont(labelFont);
+            const int rawTextWidth = fm.horizontalAdvance(l.name);
+            const int textWidth =
+                std::min(rawTextWidth, kLoopLabelMaxWidthPx
+                         - 2 * kLoopLabelPaddingPx);
+            const int labelW = std::min(bandW,
+                                        textWidth + 2 * kLoopLabelPaddingPx);
+            const QRect labelRect(xLeft, height() - kLoopLabelHeightPx,
+                                  labelW, kLoopLabelHeightPx);
+            painter.fillRect(labelRect, bandCol.darker(180));
+            painter.setPen(QColor(220, 240, 220));
+            painter.drawText(labelRect.adjusted(kLoopLabelPaddingPx, 0,
+                                                -kLoopLabelPaddingPx, 0),
+                             Qt::AlignVCenter | Qt::AlignLeft,
+                             fm.elidedText(l.name, Qt::ElideRight,
+                                           textWidth));
+        }
+    }
+
+    // MEMO: when the secondary anchor lands on top of an existing
+    // artifact (the common case — the user Ctrl+clicked an existing
+    // tick), DON'T draw a separate dashed tick over the artifact's
+    // solid tick. The underlying solid line would fill the gaps in
+    // the dash pattern and the dashing wouldn't be visible. Instead,
+    // detect the overlap here, paint the artifact ITSELF with a
+    // dashed pen below, and skip the standalone tick later.
+    bool secondaryOnArtifact = false;
+    if (secondaryAnchorMs_.has_value()) {
+        if (barlineModel_) {
+            for (auto barMs : barlineModel_->barlines()) {
+                if (barMs == *secondaryAnchorMs_) {
+                    secondaryOnArtifact = true;
+                    break;
+                }
+            }
+        }
+        if (!secondaryOnArtifact && markerModel_) {
+            for (const auto& m : markerModel_->markers()) {
+                if (m.sourceMs == *secondaryAnchorMs_) {
+                    secondaryOnArtifact = true;
+                    break;
+                }
+            }
+        }
+    }
+
     // Barline ticks — drawn between peaks and the cursor so the
     // playhead always wins z-order.
     if (barlineModel_) {
@@ -251,9 +447,20 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             const int x = msToX(bars[i]);
             if (x < 0 || x >= width()) continue;
             const bool selected = (selectedBarline_ == i);
-            painter.setPen(QPen(
-                selected ? QColor(255, 200, 90) : QColor(210, 170, 60),
-                selected ? 2.0 : 1.0));
+            const bool isAnchor = secondaryAnchorMs_.has_value()
+                              && bars[i] == *secondaryAnchorMs_;
+            QPen pen;
+            if (isAnchor) {
+                // Bright yellow + dashed + thick: visibly distinct
+                // from both the regular and selected barlines.
+                pen = QPen(QColor(255, 220, 130), 2.0);
+                pen.setStyle(Qt::DashLine);
+            } else {
+                pen = QPen(
+                    selected ? QColor(255, 200, 90) : QColor(210, 170, 60),
+                    selected ? 2.0 : 1.0);
+            }
+            painter.setPen(pen);
             painter.drawLine(x, 0, x, height());
         }
     }
@@ -273,12 +480,23 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             const int x = msToX(m.sourceMs);
             if (x < 0 || x >= width()) continue;
             const bool selected = (selectedMarkerId_ == m.id);
+            const bool isAnchor = secondaryAnchorMs_.has_value()
+                              && m.sourceMs == *secondaryAnchorMs_;
             const QColor lineCol = selected
                 ? QColor(140, 230, 250)
                 : QColor(100, 200, 220);
 
-            // Vertical tick line — full height.
-            painter.setPen(QPen(lineCol, selected ? 2.0 : 1.0));
+            // Vertical tick line — full height. Marker-as-secondary
+            // gets a brighter, dashed, thicker line; the label flag
+            // stays solid so the marker's name remains legible.
+            QPen tickPen;
+            if (isAnchor) {
+                tickPen = QPen(QColor(160, 240, 255), 2.0);
+                tickPen.setStyle(Qt::DashLine);
+            } else {
+                tickPen = QPen(lineCol, selected ? 2.0 : 1.0);
+            }
+            painter.setPen(tickPen);
             painter.drawLine(x, 0, x, height());
 
             // Label flag at the top: filled rectangle with the name.
@@ -298,11 +516,50 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
-    // Playhead cursor.
+    // Playhead cursor — drawn before the secondary anchor tick so
+    // the dashed indicator can pierce through it when both are at
+    // the same x (which happens immediately after a tap-place
+    // because the cursor seeks to the new artifact).
     const int cursorX = msToX(positionMs_);
     if (cursorX >= 0 && cursorX < width()) {
         painter.setPen(QPen(QColor(255, 80, 80), 2));
         painter.drawLine(cursorX, 0, cursorX, height());
+    }
+
+    // Secondary anchor indicator — painted LAST so it's always
+    // visible regardless of what's underneath (the cursor especially).
+    // Skip in the case where the artifact-itself-dashed paint above
+    // already shows the dashing AND the cursor isn't on top
+    // (otherwise we'd just overdraw an identical line — harmless,
+    // but wasteful). When cursor and secondary share an x, we MUST
+    // paint here so the dash gaps reveal cursor red instead of
+    // covering the artifact's solid line. MEMO: dashed style is the
+    // "armed for combination, not yet committed" convention from
+    // DAW ghost cursors.
+    if (secondaryAnchorMs_.has_value()) {
+        const int sx = msToX(*secondaryAnchorMs_);
+        if (sx >= 0 && sx < width()) {
+            const bool cursorOverlap = (sx == cursorX) && cursorX >= 0
+                                    && cursorX < width();
+            if (!secondaryOnArtifact || cursorOverlap) {
+                // Pick a color that matches the artifact at secondary
+                // ms (yellow for a bar, cyan for a marker), defaulting
+                // to yellow for the standalone case.
+                QColor col(255, 200, 90);
+                if (markerModel_) {
+                    for (const auto& m : markerModel_->markers()) {
+                        if (m.sourceMs == *secondaryAnchorMs_) {
+                            col = QColor(160, 240, 255);
+                            break;
+                        }
+                    }
+                }
+                QPen pen(col, 2.0);
+                pen.setStyle(Qt::DashLine);
+                painter.setPen(pen);
+                painter.drawLine(sx, 0, sx, height());
+            }
+        }
     }
 }
 
@@ -314,11 +571,12 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     const int x  = event->pos().x();
     const auto ms = xToMs(x);
+    const bool ctrlHeld =
+        (event->modifiers() & Qt::ControlModifier) != 0;
 
-    // MEMO: hit-test priority — markers FIRST (they're labelled and
-    // visually atop barlines, so a click on a flag should select
-    // the marker), then barlines, then plain seek. This matches
-    // the user's "annotation > structural meta" mental model.
+    // MEMO: hit-test priority — markers FIRST (labelled and visually
+    // atop barlines, so a click on a flag should select the marker),
+    // then barlines, then plain seek.
 
     std::int64_t tolMs = 0;
     if (overview_ && width() > 0) {
@@ -329,12 +587,30 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
         }
     }
 
+    // MEMO: Ctrl+click semantics — "add as second anchor for loop
+    // creation". The current primary's ms is captured into the
+    // secondary slot before the new selection is installed; the
+    // dashed tick at that ms persists until cleared. Plain click
+    // clears the secondary slot as a side effect (the user is
+    // starting a fresh selection). See commit 4 for the reason this
+    // is widget-level (rather than MainWindow-level) state.
+    auto prepareClickStateChange = [&]() {
+        if (ctrlHeld) {
+            if (const auto primMs = primaryAnchorMs()) {
+                setSecondaryAnchorMs(*primMs);
+            }
+        } else {
+            setSecondaryAnchorMs(std::nullopt);
+        }
+    };
+
     // 1. Marker hit?
     if (markerModel_ && markerModel_->size() > 0 && tolMs >= 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
             const auto idx = markerModel_->indexOf(*markerHit);
             if (idx) {
-                setSelectedMarkerId(*markerHit);   // also clears barline sel
+                prepareClickStateChange();
+                setSelectedMarkerId(*markerHit);
                 emit seekRequested(
                     markerModel_->markers()[*idx].sourceMs);
                 event->accept();
@@ -346,14 +622,21 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
     // 2. Barline hit?
     if (barlineModel_ && barlineModel_->size() > 0 && tolMs >= 0) {
         if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
-            setSelectedBarline(*barHit);           // also clears marker sel
+            prepareClickStateChange();
+            setSelectedBarline(*barHit);
             emit seekRequested(barlineModel_->barlines()[*barHit]);
             event->accept();
             return;
         }
     }
 
-    // 3. Plain seek — clear both selections.
+    // 3. No artifact hit. Ctrl+click on empty space is a no-op so
+    // the user can't accidentally lose their second anchor by
+    // missing a tick. Plain click clears everything and seeks.
+    if (ctrlHeld) {
+        event->accept();
+        return;
+    }
     if (selectedBarline_.has_value()) {
         selectedBarline_.reset();
         update();
@@ -363,6 +646,9 @@ void WaveformWidget::mousePressEvent(QMouseEvent* event) {
         selectedMarkerId_.reset();
         update();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (secondaryAnchorMs_.has_value()) {
+        setSecondaryAnchorMs(std::nullopt);
     }
     emit seekRequested(ms);
     event->accept();
@@ -432,6 +718,11 @@ void WaveformWidget::keyPressEvent(QKeyEvent* event) {
             setSelectedBarline(std::nullopt);
         } else if (selectedMarkerId_.has_value()) {
             setSelectedMarkerId(std::nullopt);
+        }
+        // Also drop any secondary anchor — Esc means "I'm done with
+        // the in-flight selection state, including loop anchors".
+        if (secondaryAnchorMs_.has_value()) {
+            setSecondaryAnchorMs(std::nullopt);
         }
         event->accept();
         return;

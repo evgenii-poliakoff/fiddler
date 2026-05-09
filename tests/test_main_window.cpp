@@ -9,6 +9,7 @@
 #include "audio/Player.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/MainWindow.h"
 #include "ui/ProjectViewerDock.h"
@@ -22,6 +23,8 @@
 #include <QSlider>
 #include <QString>
 #include <QTest>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -822,4 +825,720 @@ TEST_CASE("MainWindow: opening a new file clears the marker model",
     QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
     REQUIRE(window->markerModel().empty());
     REQUIRE(window->barlineModel().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Loop creation (L gesture) + Ctrl+Z + Del integration
+//
+// MEMO[refactor]: these are end-to-end tests against MainWindow —
+// they exercise the L shortcut, the secondary anchor mirror, the
+// combined-Ctrl+Z LIFO with the new Loop kind, and the
+// onDeleteSelectedArtifact dispatch on the Loop branch. Per
+// feedback_logs_drive_tests.md, each test pins a user gesture
+// reproducible from the logs alone.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Convenience: tap a marker at the player's current position via M.
+// The widgets pick it up and auto-select on the waveform; tests
+// chain a seek + tap to drop a marker at a known ms.
+void seekAndTapMarker(MainWindow& window, std::int64_t ms) {
+    auto* slider = window.findChild<QSlider*>("positionSlider");
+    REQUIRE(slider);
+    slider->setValue(static_cast<int>(ms));
+    // sliderMoved is what the widget connects to onSeek; setValue
+    // alone wouldn't trigger the player. Emit it directly.
+    emit slider->sliderMoved(static_cast<int>(ms));
+    QTest::keyClick(&window, Qt::Key_M);
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: L creates a loop spanning the two anchored markers",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->markerModel().size() == 2);
+
+    // After tapping the second marker, it's the auto-selected
+    // primary. We need to also have a secondary anchor — set it
+    // directly via the widget API (the user gesture would be
+    // Ctrl+click on the first marker, but driving that via QTest is
+    // covered in the widget-level tests; here we focus on what
+    // MainWindow does once both anchors are present).
+    waveform->setSecondaryAnchorMs(500);
+    REQUIRE(waveform->primaryAnchorMs()   == 1500);
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    const auto& loop = window->loopModel().loops()[0];
+    REQUIRE(loop.startMs == 500);
+    REQUIRE(loop.endMs   == 1500);
+    REQUIRE(loop.pauseMs == 500);   // model default
+    // Loop is auto-selected on creation so the dock's property
+    // page jumps straight to it.
+    REQUIRE(waveform->selectedLoopId().has_value());
+    // Secondary anchor was consumed.
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("MainWindow: L without two anchors is a no-op",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Just one marker; no secondary anchor.
+    seekAndTapMarker(*window, 1000);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: L on identical primary + secondary refuses degenerate range",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1000);
+    waveform->setSecondaryAnchorMs(1000);   // same as primary
+
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: Ctrl+Z peels the most-recently-created loop",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: load-bearing — the combined LIFO must include Loop and
+    // dispatch to LoopModel::undoLastAdd on Ctrl+Z. Without the new
+    // PlacementKind::Loop branch this would fall through to one of
+    // the marker / barline models and leave the loop in place.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->loopModel().empty());
+    // Markers are untouched — Ctrl+Z peeled the loop only.
+    REQUIRE(window->markerModel().size() == 2);
+}
+
+TEST_CASE("MainWindow: Del with a selected loop removes it",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(waveform->selectedLoopId().has_value());
+
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->loopModel().empty());
+}
+
+TEST_CASE("MainWindow: secondary anchor mirrors waveform → staff",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    waveform->setSecondaryAnchorMs(1234);
+    REQUIRE(staff->secondaryAnchorMs() == 1234);
+
+    waveform->setSecondaryAnchorMs(std::nullopt);
+    REQUIRE_FALSE(staff->secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("MainWindow: loop selection mirrors across waveform / staff / dock",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    const auto loopId = *waveform->selectedLoopId();
+    REQUIRE(staff->selectedLoopId()  == loopId);
+    REQUIRE(*dock->selectedLoopId()  == loopId);
+
+    // Clear via the dock — the score widgets should follow.
+    dock->setSelectedLoopId(std::nullopt);
+    REQUIRE_FALSE(waveform->selectedLoopId().has_value());
+    REQUIRE_FALSE(staff->selectedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: opening a new file clears the loop model",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->loadFile(fixturePath));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+
+    REQUIRE(window->loadFile(fixturePath));
+    REQUIRE(window->loopModel().empty());
+    REQUIRE(window->markerModel().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Loop activation (commit 5)
+//
+// MEMO[refactor]: these tests pin the arming state machine and the
+// dock<->MainWindow handshake. The wrap-around itself depends on
+// audio playback advancing the position, which isn't reliable in
+// headless CI — those paths are exercised end-to-end in manual
+// smoke tests, while the unit tests here verify the deterministic
+// arm / disarm transitions.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a fresh window with one loop spanning [start, end] ms.
+// Returns the (window, loopId) pair so the test can drive arming.
+struct LoadedWithLoop {
+    std::unique_ptr<MainWindow> window;
+    std::int64_t                loopId = 0;
+};
+
+LoadedWithLoop makeWindowWithLoop(std::int64_t start = 500,
+                                  std::int64_t end   = 1500) {
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, start);
+    seekAndTapMarker(*window, end);
+    waveform->setSecondaryAnchorMs(start);
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    LoadedWithLoop out;
+    out.loopId = window->loopModel().loops()[0].id;
+    out.window = std::move(window);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: loopActivated arms the loop, seeks to start, flips Play→Pause",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: load-bearing — double-click in the dock should be a
+    // single user gesture that lands the user at the loop's
+    // starting bar with playback running. Mirrors the marker-
+    // activated jump-and-play idiom.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+
+    // Move the player away from the loop's startMs so we can verify
+    // the seek lands.
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(0);
+    emit posSlider->sliderMoved(0);
+
+    emit dock->loopActivated(loaded.loopId);
+
+    REQUIRE(*dock->armedLoopId() == loaded.loopId);
+    REQUIRE(playBtn->text() == "Pause");
+    // Player::seek is synchronous; on no-audio hosts position is
+    // exactly the seek target. On an audio host a few ms can have
+    // elapsed by the time we read it.
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 500);
+    REQUIRE(pos <= 550);
+}
+
+TEST_CASE("MainWindow: Arm checkbox arms without seeking or auto-playing",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: the checkbox path is intentionally less aggressive than
+    // double-click — the user might be mid-listen and just want
+    // wrap-around enabled at endMs. A seek would be jarring, and
+    // auto-play would change transport state without an explicit
+    // intent.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(2000);
+    emit posSlider->sliderMoved(2000);
+    const auto posBefore = loaded.window->player().position().count();
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+
+    REQUIRE(*dock->armedLoopId() == loaded.loopId);
+    // Player did NOT move.
+    REQUIRE(loaded.window->player().position().count() == posBefore);
+}
+
+TEST_CASE("MainWindow: unchecking the Arm checkbox disarms",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    emit dock->loopArmToggleRequested(loaded.loopId, false);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: Stop disarms the armed loop",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: per design — Stop is the user's "exit loop mode"
+    // gesture. The next Play press resumes normal (non-wrapping)
+    // playback.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* stopBtn = loaded.window->findChild<QPushButton*>("stopButton");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: deleting the armed loop disarms transport",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    emit dock->loopDeleteRequested(loaded.loopId);
+    REQUIRE(loaded.window->loopModel().empty());
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: loadFile clears any armed-loop state",
+          "[main-window][gui][integration][loops]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopActivated(loaded.loopId);
+    REQUIRE(dock->armedLoopId().has_value());
+
+    REQUIRE(loaded.window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+TEST_CASE("MainWindow: arming an unknown loop ID is a quiet no-op",
+          "[main-window][gui][integration][loops]") {
+    // MEMO: defensive — the dock should never emit a stale ID, but
+    // we double-check at the MainWindow boundary so a future bug
+    // can't land us in an "armed but no loop" inconsistent state.
+    qtApp();
+    auto loaded = makeWindowWithLoop(500, 1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+
+    emit dock->loopArmToggleRequested(99999, true);
+    REQUIRE_FALSE(dock->armedLoopId().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Press-Play-with-armed-loop seek rule
+//
+// MEMO[refactor]: load-bearing UX — pressing Play with a loop armed
+// should land the user at the loop's startMs unless they're already
+// inside the loop (mid-listen continuity). Three branches:
+//   * pos < startMs   → seek
+//   * pos in loop     → no seek (continuity)
+//   * pos >= endMs    → seek
+// Without the seek branches, the user either waits 30+ seconds for
+// the tune to reach endMs before wrap engages, or sits at a stale
+// post-loop position.
+// ---------------------------------------------------------------------------
+
+// MEMO: the test fixture WAV is 2 seconds long, so all ms values
+// in this block stay strictly inside [0, 2000].
+//
+// MEMO[CI]: the Play button is gated on `hasAudioOutput()` — on CI
+// hosts without an audio device the button stays disabled, and a
+// QTest::mouseClick on a disabled button is a silent no-op, which
+// would mask the seek branch we're trying to verify. We
+// `setEnabled(true)` before clicking so the test exercises the
+// onPlayPause path regardless of audio availability. The
+// production guard is purely a UX nicety; the slot runs the same
+// logic either way.
+
+TEST_CASE("MainWindow: Play with armed loop and pos before startMs seeks to startMs",
+          "[main-window][gui][integration][loops][play-armed]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/1000, /*end=*/1800);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    // Arm via checkbox path (no auto-seek), then move position to
+    // BEFORE startMs to set up the "user wants to drill the loop"
+    // scenario.
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(300);
+    emit posSlider->sliderMoved(300);
+    REQUIRE(loaded.window->player().position().count() == 300);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    // Player now sits at startMs (or up to ~50ms past on hosts
+    // where audio is actually advancing).
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 1000);
+    REQUIRE(pos <= 1050);
+}
+
+TEST_CASE("MainWindow: Play with armed loop and pos inside the loop preserves position",
+          "[main-window][gui][integration][loops][play-armed]") {
+    // MEMO: the "armed mid-listen and resumed" case. The user was
+    // already inside the loop region; pressing Play after a pause
+    // should resume from where they paused, not jump back to start.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1800);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(1000);
+    emit posSlider->sliderMoved(1000);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 1000);
+    REQUIRE(pos <= 1050);   // no seek to startMs
+}
+
+TEST_CASE("MainWindow: Play with armed loop and pos past endMs seeks to startMs",
+          "[main-window][gui][integration][loops][play-armed]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/400, /*end=*/1000);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 400);
+    REQUIRE(pos <= 450);
+}
+
+TEST_CASE("MainWindow: dock Ctrl+click on a marker creates a loop with L",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: end-to-end — click marker A in the dock, Ctrl+click
+    // marker B in the dock, press L. The window-scoped L shortcut
+    // fires regardless of which child has focus, so the whole
+    // gesture works without ever touching the score widgets. This
+    // pins the user's request: "same selection mechanics in the
+    // list of markers in the property editor".
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Two markers at known positions.
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->markerModel().size() == 2);
+
+    auto* tree = dock->findChild<QTreeWidget*>("projectViewerTree");
+    REQUIRE(tree);
+    // After tap-place, the auto-selection put marker 2 (id from
+    // idAt(1) — sorted-order index 1) on the primary; reset to
+    // marker 1 via plain click in the dock so the test is explicit
+    // about both gestures.
+    const auto firstId  = window->markerModel().markers()[0].id;
+    const auto secondId = window->markerModel().markers()[1].id;
+
+    auto findRow = [&](std::int64_t markerId) -> QTreeWidgetItem* {
+        constexpr int kRole = Qt::UserRole + 1;   // mirrors dock impl
+        auto* category = tree->topLevelItem(0);   // Markers
+        for (int i = 0; i < category->childCount(); ++i) {
+            auto* child = category->child(i);
+            if (child->data(0, kRole).toLongLong() == markerId) {
+                return child;
+            }
+        }
+        return nullptr;
+    };
+
+    // Plain click marker 1 in the dock.
+    auto* firstRow = findRow(firstId);
+    REQUIRE(firstRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      tree->visualItemRect(firstRow).center());
+    REQUIRE(*waveform->selectedMarkerId() == firstId);
+
+    // Ctrl+click marker 2 in the dock.
+    auto* secondRow = findRow(secondId);
+    REQUIRE(secondRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier,
+                      tree->visualItemRect(secondRow).center());
+    REQUIRE(*waveform->selectedMarkerId() == secondId);
+    // The dashed tick should be sitting at marker 1's ms now.
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+
+    // Press L — window-scoped shortcut, fires regardless of focus.
+    QTest::keyClick(window.get(), Qt::Key_L);
+
+    REQUIRE(window->loopModel().size() == 1);
+    const auto& loop = window->loopModel().loops()[0];
+    REQUIRE(loop.startMs == 500);
+    REQUIRE(loop.endMs   == 1500);
+}
+
+TEST_CASE("MainWindow: bar selected on waveform + Ctrl+click marker in dock keeps secondary alive",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: regression repro for the user's bug report — primary
+    // selection is a barline placed via the waveform; secondary
+    // gesture comes from Ctrl+click on a marker row in the dock.
+    // The sequence triggers two state-changing paths in close
+    // succession (loopAnchorAddRequested THEN markerSelectionChanged
+    // from the tree's selection change). We need to verify the
+    // secondary survives the second path's mutual-exclusion clearing
+    // so the paint code's isAnchor check still fires.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Setup: 1 barline at 500 ms, 1 marker at 1500 ms.
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(500);
+    emit posSlider->sliderMoved(500);
+    QTest::keyClick(window.get(), Qt::Key_B);
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->markerModel().size()  == 1);
+
+    // Clear any stale state from the auto-select-on-place path.
+    waveform->setSelectedMarkerId(std::nullopt);
+    waveform->setSecondaryAnchorMs(std::nullopt);
+
+    // Step 1: select the bar via waveform — sets selectedBarline_=0.
+    waveform->setSelectedBarline(0);
+    REQUIRE(waveform->selectedBarline() == 0);
+    REQUIRE_FALSE(waveform->selectedMarkerId().has_value());
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+
+    // Step 2: Ctrl+click the marker row in the dock. This fires
+    // loopAnchorAddRequested first (capturing the bar's ms as
+    // secondary), then Qt processes the click and selection moves
+    // to the marker, triggering mutual exclusion that clears
+    // selectedBarline_.
+    auto* tree = dock->findChild<QTreeWidget*>("projectViewerTree");
+    REQUIRE(tree);
+    constexpr int kRole = Qt::UserRole + 1;
+    auto* category = tree->topLevelItem(0);
+    QTreeWidgetItem* markerRow = nullptr;
+    for (int i = 0; i < category->childCount(); ++i) {
+        if (category->child(i)->data(0, kRole).toLongLong()
+            == window->markerModel().markers()[0].id) {
+            markerRow = category->child(i);
+            break;
+        }
+    }
+    REQUIRE(markerRow);
+
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier,
+                      tree->visualItemRect(markerRow).center());
+
+    // The painted-as-dashed contract: secondaryAnchorMs_ holds the
+    // barline's ms, selectedBarline_ is cleared (mutual exclusion),
+    // selectedMarkerId_ points at the new marker. The bar's isAnchor
+    // check in paintEvent then fires.
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+    REQUIRE(*waveform->selectedMarkerId()
+            == window->markerModel().markers()[0].id);
+    // Same on staff (mirror).
+    REQUIRE(staff->secondaryAnchorMs() == 500);
+}
+
+TEST_CASE("MainWindow: dock secondary-anchor mirrors to staff",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: when the dock fires loopAnchorAddRequested, MainWindow
+    // pushes the captured ms to BOTH score widgets directly so the
+    // dashed tick is visible in both views.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 700);
+
+    // Simulate the dock's gesture signal directly — the unit tests
+    // already cover that the click path emits it.
+    emit dock->loopAnchorAddRequested();
+    REQUIRE(waveform->secondaryAnchorMs() == 700);
+    REQUIRE(staff->secondaryAnchorMs()    == 700);
+
+    emit dock->loopAnchorClearRequested();
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+    REQUIRE_FALSE(staff->secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("MainWindow: Play with no armed loop does not jump",
+          "[main-window][gui][integration][loops][play-armed]") {
+    // MEMO: regression — the seek branch is gated on armedLoopId_.
+    // Disarmed playback should always resume from the current
+    // position, never silently jump.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* playBtn   = window->findChild<QPushButton*>("playButton");
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    const auto pos = window->player().position().count();
+    REQUIRE(pos >= 1500);
+    REQUIRE(pos <= 1550);
 }

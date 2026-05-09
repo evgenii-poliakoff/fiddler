@@ -174,24 +174,150 @@ authoritative undo across both models lives at MainWindow level
 incidental in MainWindow context — kept around because the model
 is unit-tested standalone.
 
+### Score model: practice loops
+
+`score::LoopModel` is the third project-artifact model. Distinct
+from both barlines and markers because a loop is *paired* — a
+named region rather than a single anchor.
+
+- **Stable IDs.** Same rationale as `MarkerModel`: `setRange()`
+  re-sorts on startMs change, so widgets and the dock track the
+  selected / armed loop by stable `int64_t` ID, not by index.
+- **Strict invariant `endMs > startMs`.** `add()` returns 0 and
+  `setRange()` returns `false` on degenerate or inverted ranges.
+  The model never silently fixes user input; the UI is responsible
+  for keeping the property-page spinboxes valid (the End spinbox's
+  lower bound is dynamically clamped to Start + 1 and vice versa).
+- **Per-loop pause-between-repeats.** Each loop carries its own
+  `pauseMs`, defaulting to **500 ms** — a short breath the user
+  asked for so the ear can reset before the next pass without
+  dragging the practice tempo. Negative values clamp to 0.
+- **No `nearest()` helper.** Loops are selected from the dock or
+  from the band overlay — never by tick hit-test — so the lookup
+  pattern that `BarlineModel` and `MarkerModel` need doesn't apply.
+
+The model owns the same kind of `undoLastAdd` LIFO as the others;
+combined `Ctrl+Z` at MainWindow level dispatches across all three
+kinds (see below).
+
+### Loop creation gesture: two anchors + `L`
+
+A loop is created from any two anchors, of any kind. The
+gesture has three parts:
+
+1. **Primary anchor.** Single-click any barline or marker on the
+   waveform, the staff, or the dock's marker list. Standard
+   selection — solid yellow tick (or cyan, for markers).
+2. **Secondary anchor.** Ctrl+click any second artifact, again on
+   any of the three surfaces (waveform / staff / dock). The prior
+   primary's ms is captured into a `secondaryAnchorMs_` slot on
+   the score widgets; visual feedback is a dashed yellow / cyan
+   tick at that ms, mirrored to whichever view the user isn't
+   currently looking at.
+3. **`L`.** Window-scope shortcut. MainWindow reads
+   `WaveformWidget::primaryAnchorMs()` and `secondaryAnchorMs()`,
+   takes `min`/`max` to derive `startMs`/`endMs`, and passes the
+   pair to `LoopModel::add`. The secondary slot is consumed
+   (cleared) on success — a fresh `L` press needs a fresh
+   Ctrl+click. Refuses degenerate ranges (`primary == secondary`)
+   and missing-anchor cases (silent no-op + log line).
+
+Two design commitments worth recording:
+
+- **Secondary stores a raw ms, not an artifact ID.** The only
+  consumer is the L shortcut, which only needs two ms values to
+  hand to `LoopModel::add`. Storing an ID would create a
+  lifetime headache (the originating artifact may be deleted
+  between the Ctrl+click and the L press); a raw ms doesn't care.
+- **Secondary mirrors waveform ↔ staff but is not in the dock.**
+  The dock is a gesture detector for the dock-Ctrl+click path — it
+  emits `loopAnchorAddRequested` / `loopAnchorClearRequested` and
+  MainWindow translates those into setSecondaryAnchorMs calls on
+  the score widgets. The dock itself never holds secondary state.
+
+**Painted-as-dashed-on-overlap.** A naive secondary indicator
+(separate dashed tick painted over the artifact's solid tick)
+loses its dashing — the underlying solid line fills the dash
+gaps. Two cooperating fixes ensure the secondary is always
+visibly distinct:
+1. When an artifact's ms equals the secondary anchor's ms, the
+   artifact itself is painted dashed (replacing its normal solid
+   rendering).
+2. The dashed indicator paints **after the playhead cursor** so
+   that, when the cursor and the secondary share an x (the common
+   case right after tap-place because tap-place seeks the cursor
+   to the new artifact), the dashes pierce through the cursor's
+   red. Gap pixels reveal the cursor; dash pixels show yellow /
+   cyan. The user sees both clearly.
+
+### Loop activation: arm + wrap-around
+
+A loop can be **armed** — selected for transport. Two arming
+gestures, with deliberately different intents:
+
+- **Double-click on the loop's row in the dock** — "jump and
+  play". Arms the loop, seeks to `startMs`, starts playback.
+  Mirrors `markerActivated`'s aggressive idiom; this is what the
+  user reaches for when they explicitly want to drill the loop
+  *now*.
+- **Arm checkbox on the loop property page** — "armed in place".
+  Arms without seeking and without auto-playing. The user might
+  be mid-listen and just want wrap-around to engage at `endMs`;
+  a seek would be jarring.
+
+Pressing the **Play button while a loop is armed** seeks to
+`startMs` first if the cursor is outside `[startMs, endMs)` —
+otherwise plays from current (mid-listen continuity). Three
+branches:
+- pos < startMs → seek (the "I armed and pressed Play to drill
+  the loop" scenario; without the seek the user hears the whole
+  tune up to endMs once before wrap engages).
+- pos in loop → no seek (mid-listen continuity).
+- pos >= endMs → seek (without it the user is stuck past endMs;
+  the GUI wrap path would only fire once and from a stale frame).
+
+**Wrap-around** lives in `MainWindow::updatePosition` — the
+existing 50 ms GUI-poll timer. When `pos >= loop.endMs`:
+- `pauseMs == 0` → tight wrap with `seek(startMs)` while playing.
+- `pauseMs > 0` → pause, seek to `startMs` immediately (so the
+  visible position slides back right away — silence reads as
+  "loop break", not "dead air at the end of the tune"), then
+  `QTimer::singleShot(pauseMs, ...)` to resume play.
+
+GUI-driven (rather than audio-callback-driven) is the deliberate
+Rule-8 choice: ~50 ms wrap jitter is inaudible during practice,
+and it keeps the loop region out of the Player + Rubber Band
+internals. A `wrapPending_` flag blocks re-entry while the pause
+timer is in flight; the timer's lambda re-checks `armedLoopId_`
+so disarm-during-pause is a quiet no-op.
+
+**Stop disarms.** Per the design discussion, Stop is the user's
+"exit loop mode" gesture. The next Play press resumes normal
+(non-wrapping) playback. Removing the armed loop (Del or
+Ctrl+Z) also disarms via a `LoopModel::changed` listener.
+Loading a new file disarms.
+
 ### Project viewer dock
 
 `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts
-the project's "artifacts" — markers today, loops in the next PR,
-notes / sections later. Layout is two-pane vertical:
+the project's "artifacts" — markers and loops today, notes /
+sections later. Layout is two-pane vertical:
 
 ```
-┌───────────────────────────┐
-│ Project                   │ ← QDockWidget title
-├───────────────────────────┤
-│ ▾ Markers                 │
-│   Mark 1   (1000 ms)      │ ← QTreeWidget; one row per artifact
-│   Mark 2   (1500 ms)      │
-├───────────────────────────┤
-│ Properties                │
-│   Name:     [Mark 1____]  │ ← QStackedWidget; per-type page
-│   Position: [1000   ↕]    │   (here, the Marker page)
-└───────────────────────────┘
+┌─────────────────────────────────┐
+│ Project                         │ ← QDockWidget title
+├─────────────────────────────────┤
+│ ▾ Markers                       │
+│   Mark 1     (1000 ms)          │ ← QTreeWidget; one row per artifact
+│   Mark 2     (1500 ms)          │
+│ ▾ Loops                         │
+│   ▶ Loop 1   (1000–3000 ms)     │ ← ▶ glyph marks the armed loop
+│   Loop 2     (5000–7000 ms)     │
+├─────────────────────────────────┤
+│ Properties                      │
+│   Name:     [Mark 1____]        │ ← QStackedWidget; per-type page
+│   Position: [1000   ↕]          │   (here, the Marker page)
+└─────────────────────────────────┘
 ```
 
 **`Qt::RightDockWidgetArea`** by convention — DaVinci Resolve,
@@ -223,30 +349,42 @@ seeks the player to the marker's source-time and starts playback.
 "Jump and play" is the standard DAW idiom for activate-on-
 double-click in a marker / clip / region list.
 
-**Adding a new artifact category** (loops in the next PR) is one
-new top-level item under the tree's invisible root, plus one new
-page in the property `QStackedWidget`. No restructuring required.
+**Loop property page** has Name + Start + End + Pause +
+Armed-checkbox fields. The range spinboxes maintain the
+`endMs > startMs` invariant by dynamically clamping each box's
+opposite bound: editing Start moves End's lower bound to
+`Start+1`, and vice versa. The Arm checkbox emits
+`loopArmToggleRequested(id, armed)`; MainWindow holds the
+canonical armed state and pushes it back via `setArmedLoopId(id)`,
+which the dock uses to keep the checkbox + tree-row glyph in sync
+without re-emitting (suppressed by the `updatingPropertyPage_`
+guard).
 
-### Combined `Ctrl+Z` across barlines + markers
+**Adding a new artifact category** is one new top-level item
+under the tree's invisible root, plus one new page in the
+property `QStackedWidget`. No restructuring required.
+
+### Combined `Ctrl+Z` across barlines + markers + loops
 
 The user's mental model is "Z = undo last placement", regardless
-of whether the last thing placed was a barline or a marker. Each
-model has its own placement-history LIFO, but neither alone knows
-the global order across kinds. MainWindow keeps a small additional
-LIFO of `PlacementKind` enums:
+of whether the last thing placed was a barline, a marker, or a
+loop. Each model has its own placement-history LIFO, but no model
+alone knows the global order across kinds. MainWindow keeps a
+small additional LIFO of `PlacementKind` enums:
 
 ```cpp
-std::vector<PlacementKind> placementHistory_;   // Barline | Marker
+enum class PlacementKind { Barline, Marker, Loop };
+std::vector<PlacementKind> placementHistory_;
 ```
 
-`onTapBarline` / `onTapMarker` push the kind on a successful add;
-`onUndoLastPlacement` pops the back and dispatches to the matching
-model's `undoLastAdd`, walking past stale entries (a manual Del
-between placements leaves the history slightly out of sync, but
-the loop tolerates that). This is a degenerate undo — placements
-only, no redo, no edit history — which is sufficient for the tap-
-along workflow. A full `QUndoStack` is deferred until something
-demands it (Rule 8).
+`onTapBarline` / `onTapMarker` / `onCreateLoop` push the kind on
+a successful add; `onUndoLastPlacement` pops the back and
+dispatches to the matching model's `undoLastAdd`, walking past
+stale entries (a manual Del between placements leaves the history
+slightly out of sync, but the loop tolerates that). This is a
+degenerate undo — placements only, no redo, no edit history —
+which is sufficient for the tap-along workflow. A full
+`QUndoStack` is deferred until something demands it (Rule 8).
 
 ### Time-signature picker: tradition-named, technical-form deferred
 
@@ -265,23 +403,23 @@ why traditional names lead the picker rather than bare technical form.
 
 ### Score widgets: WaveformWidget overlay + StaffWidget
 
-Both widgets observe the same `BarlineModel` *and* `MarkerModel`
-(each held as `shared_ptr<const ...>`) and the same source-time
-axis, so their barline ticks and marker labels line up 1:1
-horizontally. Each widget is small, self-contained, and emits a
-narrow set of signals (`seekRequested`, `barlineSelectionChanged`,
-`markerSelectionChanged`, `barlineDeleteRequested`,
-`markerDeleteRequested`) that MainWindow turns into model
-mutations and seek calls.
+Both widgets observe the same `BarlineModel`, `MarkerModel`, and
+`LoopModel` (each held as `shared_ptr<const ...>`) and the same
+source-time axis, so barline ticks, marker flags, and loop bands
+line up 1:1 horizontally. Each widget is small, self-contained,
+and emits a narrow set of signals (`seekRequested`,
+`barlineSelectionChanged`, `markerSelectionChanged`,
+`loopSelectionChanged`, `secondaryAnchorChanged`,
+`barlineDeleteRequested`, `markerDeleteRequested`) that MainWindow
+turns into model mutations and seek calls.
 
-**Selection is mutually exclusive** between barlines and markers.
-A widget can have at most one of `selectedBarline_` /
-`selectedMarkerId_` populated; the click handler enforces this
-("hit a marker → select marker, clear barline; hit a barline →
-select barline, clear marker; hit empty → clear both"). The user
-wanted "the selected artifact" to be a single concept (the
-property viewer in the dock shows its properties), and this is
-the simplest way to deliver that.
+**Selection is mutually exclusive across all three artifact
+kinds.** A widget can have at most one of `selectedBarline_` /
+`selectedMarkerId_` / `selectedLoopId_` populated; the click
+handler and the dock both enforce this. The user wanted "the
+selected artifact" to be a single concept (the property viewer
+shows its properties), and this is the simplest way to deliver
+that.
 
 **Marker visual** is a vertical tick (cyan to distinguish from
 the amber barline ticks) plus a small label flag at the top of
@@ -289,22 +427,40 @@ the widget bearing the marker's name. The flag is elided if the
 name is too long; the rendering colour brightens for the
 currently-selected marker.
 
+**Loop visual** is a translucent sage-green band spanning
+`[startMs, endMs)` across the full vertical extent of the
+widget, with the loop name in a label strip at the bottom of
+the band (so it doesn't clash with the marker flag row at the
+top). Selected loops render at higher alpha; loops are
+render-only on the score widgets — selection is dock-driven, so
+clicking inside a band on the waveform doesn't change selection
+(this would conflict with the seek-anywhere affordance, and the
+explicit dock surface is the canonical way to inspect a loop).
+
+**Secondary-anchor visual** is a dashed indicator at the captured
+ms — yellow if the anchor lands on a barline (or stands alone),
+cyan if it lands on a marker. See "Loop creation gesture" above
+for the painted-as-dashed-on-overlap rules and the cursor-pierce
+behaviour.
+
 Things deliberately not built in this PR (deferred to follow-on
 work):
 
-- Practice loops — model + UI for `start_ms` / `end_ms` /
-  pause-between-repeats, plus `Player`-side wrap-around. The
-  next PR after this one.
 - Tap-latency compensation (subtracting ~150 ms from
   `player.position()` at tap time to account for human reaction
   lag).
-- Drag-to-nudge a placed barline or marker.
+- Drag-to-nudge a placed barline / marker / loop endpoint.
 - Auto-suggestion of bar positions.
 - Free-meter / Air / "Other..." entries in the time-sig picker.
-- A generic overlay-layer registration API. We have two concrete
-  overlays now (barlines + markers); the abstraction can wait
-  until note ranges arrive in step 6+ and we have a third
-  example to design from.
+- A generic overlay-layer registration API. We have three
+  concrete overlays now (barlines + markers + loops); the
+  abstraction can wait until note ranges arrive in step 6+ and
+  we have a fourth example to design from.
+- Sample-accurate loop wrap. The current GUI-poll-driven wrap
+  has up to ~50 ms jitter, which is inaudible during practice;
+  if a future use case (looped playback into a tracking studio?)
+  needs tighter wrap, the hook would move into the audio-callback
+  path.
 
 ### Logging: spdlog (behind a facade)
 
@@ -581,16 +737,25 @@ Synchronization primitives:
   the generation that was active when they were spawned and drop
   their result if it no longer matches when the queued post-back
   reaches the GUI thread.
-- `score::BarlineModel`, `score::MarkerModel` — both owned by
-  MainWindow, observed by the score widgets and (for markers)
-  the project viewer dock. All mutations happen on the GUI
+- `score::BarlineModel`, `score::MarkerModel`, `score::LoopModel`
+  — all three owned by MainWindow, observed by the score widgets
+  and the project viewer dock. All mutations happen on the GUI
   thread; no cross-thread access. Each model's `changed()` Qt
   signal is the one synchronisation point — observers connect
   and call `update()`, which hops naturally onto the GUI
   thread's paint queue.
 - `MainWindow::placementHistory_` — `std::vector<PlacementKind>`,
   GUI-thread-only. Combined `Ctrl+Z` LIFO across barlines +
-  markers; pop dispatches to the matching model's `undoLastAdd`.
+  markers + loops; pop dispatches to the matching model's
+  `undoLastAdd`.
+- `MainWindow::armedLoopId_` — `std::optional<int64_t>`,
+  GUI-thread-only. Canonical "this loop is wrapping the
+  transport" state; pushed to the dock via `setArmedLoopId` so
+  the ▶ glyph + Arm checkbox stay in sync. Reset on Stop, file
+  load, or the armed loop being removed from the model.
+- `MainWindow::wrapPending_` — bool, GUI-thread-only. Suppresses
+  re-entry into the wrap path while a pause-between-repeats
+  `QTimer::singleShot` is in flight.
 
 ## Logging
 
@@ -610,13 +775,33 @@ FLOG_INFO("decoder", "opened {}, {} ms, {} Hz",
 | Level | Use for |
 | --- | --- |
 | TRACE | Per-iteration firehose (decoder thread refills, ring stats). Off by default. |
-| DEBUG | Algorithmic milestones useful during development (seek targets, codec params). |
+| DEBUG | Algorithmic milestones useful during development (seek targets, codec params, every gestural UI action). |
 | INFO  | Lifecycle events (file loaded, app starting/stopping). |
 | WARN  | Recoverable problems (missing Xing header, fallback paths). |
 | ERROR | Operations that failed. |
 
-Default threshold is **WARN** — silent unless something's wrong. Override
-at runtime with `--log-level=debug` or `FIDDLER_LOG_LEVEL=trace`.
+Default threshold is **INFO** — quiet by default, but the startup
+banner and lifecycle events are visible without any flags. Override
+at runtime with `--log-level=debug` for verbose output, or set
+`FIDDLER_LOG_LEVEL=trace` in the environment.
+
+**Load-bearing UX rule:** if `--log-filter` is set explicitly and
+no level is otherwise specified, the level is auto-promoted to
+**Debug**. The user's intent in passing a filter is "I want to see
+X"; if we left the level at Info they'd get only INFO+ lines and
+miss every Debug call (which is where almost all gestural logging
+lives), then quietly conclude the filter is broken. Two debugging
+sessions burned exactly that hour before the auto-promote landed.
+
+The effective config is printed to stderr unconditionally on
+startup:
+```
+fiddler 0.1.0 | log level=debug filter='ui.*,score'
+```
+This is a plain `std::cerr` print rather than a log line, because
+a narrow filter like `ui.*,score` would silently exclude an
+"app"-tagged FLOG_INFO — and the banner would then be invisible
+exactly when it's most useful.
 
 ### Categories
 
@@ -674,6 +859,7 @@ fiddler/
 │   │   └── RingBuffer.h              # lock-free SPSC, header-only
 │   ├── score/
 │   │   ├── BarlineModel.{h,cpp}      # barlines + time signature
+│   │   ├── LoopModel.{h,cpp}         # practice loops (paired ms ranges)
 │   │   └── MarkerModel.{h,cpp}       # named cue points (stable IDs)
 │   └── util/Log.{h,cpp}              # logging facade over spdlog
 └── tests/
@@ -717,8 +903,8 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 3** — Real-time time-stretching via Rubber Band; tempo slider 25–100 % with no pitch change. `Stretcher` (R3 engine) sits between the decoder and the ring buffer on the decoder thread; `Player::setTempoRatio()` is the GUI-visible knob. Position tracking uses the simple anchor model (Rule 8).
 - ✅ **Step 4** — Waveform view synchronised with playback position. `audio::WaveformOverview` (peak buckets keyed on source-time ms) is built on a detached worker thread on file open; `ui::WaveformWidget` paints peaks plus a cursor and emits `seekRequested(ms)` on click. Decoupled from `Player`; public `xToMs`/`msToX` so step 5's overlays plug in without restructuring.
 - ✅ **Step 5** — Empty staff widget; user-placed barlines mapped to audio timestamps. `score::BarlineModel` is the shared data layer (descriptive `TimeSignature`, no uniformity enforcement — supports crooked tunes); `ui::StaffWidget` and `ui::WaveformWidget` both observe it. Tap-to-place is the primary gesture (`B`); `Ctrl+Z` undoes the last placement; `Del` removes the selected (auto-selected on tap) bar. Tradition-named time-signature picker; `QPainter` rather than `QGraphicsView` — see "Score widgets" above for the deferred features.
-- ✅ **Step 5.5 (part A)** — Markers + project viewer dock. `score::MarkerModel` is the second project-artifact model (stable IDs, auto-named, repositionable, free-text rename). `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts the marker list and a property editor; double-click on a marker row "jump and plays". Tap-to-place is `M`; `Ctrl+Z` is now combined across barlines + markers; `Del` removes whichever is selected (mutually-exclusive selection). Loops + practice-pause are part B (the next PR).
-- 🔜 **Step 5.5 (part B)** — Practice loops. Loop = `start_ms` + `end_ms` + optional name + pause-between-repeats; created from two anchors (any combination of barlines + markers) by selecting them and pressing `L`. Selecting a saved loop "arms" it — Play/Pause/Stop then operate on the loop region; Stop deselects, returning to normal mode. Player wrap-around handled by the GUI timer (~50 ms jitter — acceptable for practice; sample-accurate hook deferred until needed).
+- ✅ **Step 5.5 (part A)** — Markers + project viewer dock. `score::MarkerModel` is the second project-artifact model (stable IDs, auto-named, repositionable, free-text rename). `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts the marker list and a property editor; double-click on a marker row "jump and plays". Tap-to-place is `M`; `Ctrl+Z` is now combined across barlines + markers; `Del` removes whichever is selected (mutually-exclusive selection).
+- ✅ **Step 5.5 (part B)** — Practice loops. `score::LoopModel` is the third project-artifact model (paired `start_ms` + `end_ms`, stable IDs, per-loop pause-between-repeats default 500 ms). Two-anchor creation gesture: click first anchor, Ctrl+click second (any combination of barlines + markers, on any of the three surfaces — waveform, staff, dock), press `L` to create. Loops appear under a "Loops" category in the dock with a property page; double-click arms + jumps + plays, the Arm checkbox arms in place. Pressing Play with an armed loop seeks to startMs if the cursor is outside the loop. Wrap-around lives in the 50 ms GUI poll (jitter inaudible at practice tempos); Stop disarms.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 

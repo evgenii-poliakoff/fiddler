@@ -7,9 +7,11 @@
 // being checked rather than the literal value.
 
 #include "qt_test_app.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/ProjectViewerDock.h"
 
+#include <QCheckBox>
 #include <QLineEdit>
 #include <QSignalSpy>
 #include <QSpinBox>
@@ -25,6 +27,7 @@
 #include <span>
 #include <vector>
 
+using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::ProjectViewerDock;
@@ -32,11 +35,19 @@ using fiddler::ui::ProjectViewerDock;
 namespace {
 
 constexpr int kMarkerIdRole = Qt::UserRole + 1;   // mirrors dock impl
+constexpr int kLoopIdRole   = Qt::UserRole + 2;
 
 std::shared_ptr<MarkerModel>
 makeModelWith(std::span<const std::int64_t> stamps) {
     auto m = std::make_shared<MarkerModel>();
     for (auto ms : stamps) (void)m->add(ms);
+    return m;
+}
+
+std::shared_ptr<LoopModel>
+makeLoopModelWith(std::span<const std::pair<std::int64_t, std::int64_t>> ranges) {
+    auto m = std::make_shared<LoopModel>();
+    for (const auto& r : ranges) (void)m->add(r.first, r.second);
     return m;
 }
 
@@ -55,17 +66,29 @@ QStackedWidget* stackOf(ProjectViewerDock& dock) {
     return stack;
 }
 
-// Locate the marker entry in the tree whose UserRole+1 == id.
-// Returns nullptr if not found. Helper for tests that need to
-// click / inspect a specific entry.
+// Locate the marker entry in the tree whose kMarkerIdRole == id.
+// Returns nullptr if not found. The Markers category is at index 0.
 QTreeWidgetItem*
 findMarkerRow(QTreeWidget& tree, std::int64_t id) {
-    // The Markers category is the only top-level item for now.
     REQUIRE(tree.topLevelItemCount() >= 1);
     auto* category = tree.topLevelItem(0);
     for (int i = 0; i < category->childCount(); ++i) {
         auto* child = category->child(i);
         if (child->data(0, kMarkerIdRole).toLongLong() == id) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+// Same for loops — Loops category is at top-level index 1.
+QTreeWidgetItem*
+findLoopRow(QTreeWidget& tree, std::int64_t id) {
+    REQUIRE(tree.topLevelItemCount() >= 2);
+    auto* category = tree.topLevelItem(1);
+    for (int i = 0; i < category->childCount(); ++i) {
+        auto* child = category->child(i);
+        if (child->data(0, kLoopIdRole).toLongLong() == id) {
             return child;
         }
     }
@@ -84,8 +107,10 @@ TEST_CASE("ProjectViewerDock: with no model, tree is empty and 'no selection' sh
     ProjectViewerDock dock;
     auto* tree = treeOf(dock);
 
-    REQUIRE(tree->topLevelItemCount() == 1);          // just the Markers category
+    // Two top-level category headers: Markers + Loops. Both empty.
+    REQUIRE(tree->topLevelItemCount() == 2);
     REQUIRE(tree->topLevelItem(0)->childCount() == 0);
+    REQUIRE(tree->topLevelItem(1)->childCount() == 0);
 
     // The "no selection" page is index 0 in the property stack.
     REQUIRE(stackOf(dock)->currentIndex() == 0);
@@ -436,4 +461,427 @@ TEST_CASE("ProjectViewerDock: Del on a focused marker entry fires markerDeleteRe
 
     REQUIRE(spy.count() == 1);
     REQUIRE(spy.takeFirst().at(0).value<std::int64_t>() == markerId);
+}
+
+// ---------------------------------------------------------------------------
+// Loops category
+//
+// MEMO[refactor]: each TEST_CASE in this block names one rule the
+// loop-aware dock must satisfy. Cross-kind mutual exclusion, the
+// armed-glyph row prefix, the editingFinished discipline on the
+// range spinboxes, and the Arm-checkbox round-trip are all
+// load-bearing — break any one and you'll surface UI regressions
+// in the integration tests for commit 5.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ProjectViewerDock: setLoopModel populates the Loops category",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1500}, {2000, 3000}
+    };
+    dock.setLoopModel(makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges}));
+
+    auto* tree = treeOf(dock);
+    auto* loopsCategory = tree->topLevelItem(1);
+    REQUIRE(loopsCategory->childCount() == 2);
+    // Rows store the loop ID in kLoopIdRole; verify the data plumbing.
+    REQUIRE(loopsCategory->child(0)->data(0, kLoopIdRole).toLongLong() != 0);
+}
+
+TEST_CASE("ProjectViewerDock: clicking a loop row emits loopSelectionChanged + shows loop page",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+
+    QSignalSpy selSpy(&dock, &ProjectViewerDock::loopSelectionChanged);
+    auto* tree = treeOf(dock);
+    auto* row  = findLoopRow(*tree, loopId);
+    REQUIRE(row);
+    tree->setCurrentItem(row);
+
+    REQUIRE(selSpy.count() == 1);
+    REQUIRE(*dock.selectedLoopId() == loopId);
+    // Property stack: 0 = no-selection, 1 = marker, 2 = loop.
+    REQUIRE(stackOf(dock)->currentIndex() == 2);
+}
+
+TEST_CASE("ProjectViewerDock: clicking a loop clears any active marker selection",
+          "[project-viewer-dock][gui][loops]") {
+    // MEMO: cross-kind mutual exclusion in the dock — this is what
+    // keeps the property page focused on a single artifact at a time.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t markerStamps[] = { 500 };
+    auto markerModel = makeModelWith(std::span<const std::int64_t>{markerStamps});
+    dock.setMarkerModel(markerModel);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loopModel = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(loopModel);
+
+    // Seed marker selection.
+    dock.setSelectedMarkerId(*markerModel->idAt(0));
+    REQUIRE(dock.selectedMarkerId().has_value());
+
+    QSignalSpy markerSpy(&dock, &ProjectViewerDock::markerSelectionChanged);
+    QSignalSpy loopSpy  (&dock, &ProjectViewerDock::loopSelectionChanged);
+
+    auto* tree = treeOf(dock);
+    tree->setCurrentItem(findLoopRow(*tree, *loopModel->idAt(0)));
+
+    REQUIRE(dock.selectedLoopId().has_value());
+    REQUIRE_FALSE(dock.selectedMarkerId().has_value());
+    REQUIRE(markerSpy.count() == 1);
+    REQUIRE(loopSpy.count()   == 1);
+}
+
+TEST_CASE("ProjectViewerDock: setSelectedLoopId(nullopt) returns to 'no selection'",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    dock.setSelectedLoopId(*model->idAt(0));
+    REQUIRE(stackOf(dock)->currentIndex() == 2);
+
+    dock.setSelectedLoopId(std::nullopt);
+    REQUIRE_FALSE(dock.selectedLoopId().has_value());
+    REQUIRE(stackOf(dock)->currentIndex() == 0);
+}
+
+TEST_CASE("ProjectViewerDock: double-clicking a loop row emits loopActivated",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::loopActivated);
+    auto* tree = treeOf(dock);
+    emit tree->itemDoubleClicked(findLoopRow(*tree, loopId), 0);
+    // Note: emitting the signal directly is the dock-test idiom in
+    // this file (used elsewhere) — drives Qt's slot wiring without
+    // needing a real mouse double-click on a hidden widget.
+
+    REQUIRE(spy.count() == 1);
+    REQUIRE(spy.takeFirst().at(0).value<std::int64_t>() == loopId);
+}
+
+TEST_CASE("ProjectViewerDock: Del on a focused loop entry fires loopDeleteRequested",
+          "[project-viewer-dock][gui][loops][keys]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+
+    auto* tree = treeOf(dock);
+    auto* row  = findLoopRow(*tree, loopId);
+    tree->setCurrentItem(row);
+    dock.show();
+    tree->setFocus();
+    (void)QTest::qWaitForWindowExposed(&dock);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::loopDeleteRequested);
+    QTest::keyClick(tree, Qt::Key_Delete);
+
+    REQUIRE(spy.count() == 1);
+    REQUIRE(spy.takeFirst().at(0).value<std::int64_t>() == loopId);
+}
+
+TEST_CASE("ProjectViewerDock: editing loop Start round-trips through setRange",
+          "[project-viewer-dock][gui][loops]") {
+    // MEMO: pins the editingFinished → setRange path. Mirrors the
+    // marker Position round-trip test (same leading-zero rationale).
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+    dock.setSelectedLoopId(loopId);
+
+    auto* startBox = dock.findChild<QSpinBox*>("loopStartBox");
+    REQUIRE(startBox);
+    startBox->setValue(1500);
+    emit startBox->editingFinished();   // simulate Enter / focus-loss
+
+    REQUIRE(model->loops()[0].startMs == 1500);
+    REQUIRE(model->loops()[0].endMs   == 2000);
+}
+
+TEST_CASE("ProjectViewerDock: editing loop End round-trips through setRange",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    dock.setSelectedLoopId(*model->idAt(0));
+
+    auto* endBox = dock.findChild<QSpinBox*>("loopEndBox");
+    REQUIRE(endBox);
+    endBox->setValue(2500);
+    emit endBox->editingFinished();
+
+    REQUIRE(model->loops()[0].endMs == 2500);
+}
+
+TEST_CASE("ProjectViewerDock: editing pause-between-repeats round-trips through setPauseMs",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    dock.setSelectedLoopId(*model->idAt(0));
+
+    auto* pauseBox = dock.findChild<QSpinBox*>("loopPauseBox");
+    REQUIRE(pauseBox);
+    REQUIRE(pauseBox->value() == 500);   // default pause from the model
+
+    pauseBox->setValue(750);
+    emit pauseBox->editingFinished();
+    REQUIRE(model->loops()[0].pauseMs == 750);
+}
+
+TEST_CASE("ProjectViewerDock: editing the loop Name round-trips through rename",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    dock.setSelectedLoopId(*model->idAt(0));
+
+    auto* nameEdit = dock.findChild<QLineEdit*>("loopNameEdit");
+    REQUIRE(nameEdit);
+    nameEdit->setText("Hard turn");
+    emit nameEdit->editingFinished();
+    REQUIRE(model->loops()[0].name == "Hard turn");
+}
+
+TEST_CASE("ProjectViewerDock: Arm checkbox toggle emits loopArmToggleRequested",
+          "[project-viewer-dock][gui][loops]") {
+    // MEMO: the dock relays the toggle to MainWindow rather than
+    // flipping armedLoopId_ itself — transport state is the
+    // canonical source of truth, and MainWindow pushes it back via
+    // setArmedLoopId() once the transport has actually changed.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+    dock.setSelectedLoopId(loopId);
+
+    auto* armCheck = dock.findChild<QCheckBox*>("loopArmedCheck");
+    REQUIRE(armCheck);
+    REQUIRE_FALSE(armCheck->isChecked());
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::loopArmToggleRequested);
+    armCheck->setChecked(true);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(0).value<std::int64_t>() == loopId);
+    REQUIRE(args.at(1).toBool() == true);
+}
+
+TEST_CASE("ProjectViewerDock: setArmedLoopId updates Arm checkbox without re-emitting",
+          "[project-viewer-dock][gui][loops]") {
+    // MEMO: load-bearing — when MainWindow pushes the armed state
+    // back to the dock (after acting on a double-click or external
+    // arm), the checkbox sync must NOT re-emit
+    // loopArmToggleRequested. Otherwise we'd loop forever between
+    // dock→MainWindow→dock.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+    dock.setSelectedLoopId(loopId);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::loopArmToggleRequested);
+    dock.setArmedLoopId(loopId);
+
+    auto* armCheck = dock.findChild<QCheckBox*>("loopArmedCheck");
+    REQUIRE(armCheck->isChecked());
+    REQUIRE(spy.count() == 0);            // no re-emit during sync
+    REQUIRE(*dock.armedLoopId() == loopId);
+}
+
+TEST_CASE("ProjectViewerDock: armed loop row gets a glyph prefix",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+
+    auto* tree = treeOf(dock);
+    auto* row  = findLoopRow(*tree, loopId);
+    const QString unarmedText = row->text(0);
+
+    dock.setArmedLoopId(loopId);
+    auto* armedRow = findLoopRow(*tree, loopId);
+    const QString armedText = armedRow->text(0);
+
+    REQUIRE(armedText != unarmedText);
+    REQUIRE(armedText.startsWith(QString::fromUtf8("▶")));
+
+    dock.setArmedLoopId(std::nullopt);
+    auto* disarmedRow = findLoopRow(*tree, loopId);
+    REQUIRE(disarmedRow->text(0) == unarmedText);
+}
+
+TEST_CASE("ProjectViewerDock: loop setRange keeps selection alive across re-sort",
+          "[project-viewer-dock][gui][loops]") {
+    // MEMO: stable-ID survival, mirror of the marker setPosition test.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto firstId = *model->idAt(0);
+    dock.setSelectedLoopId(firstId);
+
+    REQUIRE(model->setRange(firstId, 3000, 3500));   // moves past second
+    REQUIRE(*dock.selectedLoopId() == firstId);
+    REQUIRE(*model->indexOf(firstId) == 1);
+}
+
+TEST_CASE("ProjectViewerDock: Ctrl+click on a marker row emits loopAnchorAddRequested",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    // MEMO: load-bearing — the dock's Ctrl+click gesture is the
+    // mirror of the score widgets' Ctrl+click. It fires a signal
+    // *before* the click changes selection, so MainWindow's handler
+    // can capture the prior primary's ms.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 500, 1500 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* secondRow = findMarkerRow(*tree, *model->idAt(1));
+    REQUIRE(secondRow);
+
+    // Select first marker so there's a "prior primary" to capture.
+    dock.setSelectedMarkerId(*model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    // Drive a Ctrl+left-click via QTest. The viewport is the
+    // QTreeWidget's actual mouse target.
+    const QRect rowRect = tree->visualItemRect(secondRow);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 1);
+    REQUIRE(clearSpy.count() == 0);
+}
+
+TEST_CASE("ProjectViewerDock: plain click on a marker emits loopAnchorClearRequested",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[] = { 1000 };
+    auto model = makeModelWith(std::span<const std::int64_t>{stamps});
+    dock.setMarkerModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* row  = findMarkerRow(*tree, *model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    const QRect rowRect = tree->visualItemRect(row);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::NoModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 0);
+    REQUIRE(clearSpy.count() >= 1);
+}
+
+TEST_CASE("ProjectViewerDock: Ctrl+click on a loop row emits clear, not add",
+          "[project-viewer-dock][gui][loops][secondary-anchor]") {
+    // MEMO: loops are regions, not anchors — Ctrl+click on a loop
+    // row is treated as "exit loop-creation mode", same as a plain
+    // click. Pinning this rule keeps a future visual-only refactor
+    // from accidentally promoting loops to anchor candidates.
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
+    auto* tree = treeOf(dock);
+    auto* row  = findLoopRow(*tree, *model->idAt(0));
+
+    QSignalSpy addSpy(&dock, &ProjectViewerDock::loopAnchorAddRequested);
+    QSignalSpy clearSpy(&dock,
+                        &ProjectViewerDock::loopAnchorClearRequested);
+
+    const QRect rowRect = tree->visualItemRect(row);
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier, rowRect.center());
+
+    REQUIRE(addSpy.count()   == 0);
+    REQUIRE(clearSpy.count() >= 1);
+}
+
+TEST_CASE("ProjectViewerDock: removing the selected loop clears selection",
+          "[project-viewer-dock][gui][loops]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto model = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    dock.setLoopModel(model);
+    const auto loopId = *model->idAt(0);
+    dock.setSelectedLoopId(loopId);
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::loopSelectionChanged);
+    REQUIRE(model->remove(loopId));
+    REQUIRE_FALSE(dock.selectedLoopId().has_value());
+    REQUIRE(spy.count() >= 1);
 }

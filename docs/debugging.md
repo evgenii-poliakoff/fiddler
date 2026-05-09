@@ -19,10 +19,23 @@ a path:
 
 ```bash
 ./build/src/fiddler \
-    --log-level=debug \
     --log-filter='ui.*,player,waveform,score' \
     --log-file=/tmp/fiddler.log
 ```
+
+Note: passing `--log-filter` without `--log-level` auto-promotes
+the level to `debug`. The user's intent in passing a filter is
+"I want to see X"; the auto-promote prevents the silent-output
+trap where the filter matches but every line is below the
+threshold. Pass an explicit `--log-level=warn` (or whatever) if
+you want a quieter view.
+
+The startup banner is printed to stderr unconditionally:
+```
+fiddler 0.1.0 | log level=debug filter='ui.*,player,waveform,score'
+```
+That's the answer to "why am I not seeing the logs I expect" —
+check the level and the filter as the runtime resolved them.
 
 Then:
 
@@ -43,9 +56,9 @@ format `<verb> <params...> <state...>`. Categories:
 | Category       | Action                                                  |
 |----------------|---------------------------------------------------------|
 | `ui.file`      | open success / failure / cancelled, close               |
-| `ui.transport` | play, pause, stop, auto-pause, seek via position-slider |
+| `ui.transport` | play, pause, stop, auto-pause, seek via position-slider, play-armed-seek, loop-wrap |
 | `ui.tempo`     | tempo change (every applied step)                       |
-| `ui.score`     | tap-place (barline), tap-marker, undo-last (kind=barline\|marker), time-sig pick, seek via waveform / staff click, select / select-marker / clear, delete (widget key vs. window shortcut), marker-activated (double-click) |
+| `ui.score`     | tap-place (barline), tap-marker, create-loop, undo-last (kind=barline\|marker\|loop), time-sig pick, seek via waveform / staff click, select / select-marker / select-loop / clear, secondary-anchor (set / cleared, via=waveform\|staff\|dock-ctrl-click\|dock-click), delete (widget key vs. window shortcut), marker-activated, loop-activated, loop-armed / loop-disarmed |
 
 The `--log-filter` flag accepts a single glob or a comma-separated
 list. Each entry is either a bare `*`, a trailing `.*` subtree
@@ -136,11 +149,31 @@ TEST_CASE("regression: <one-sentence summary of the bug>",
     //   [ui.score] marker-activated id=…     → emit dock->markerActivated(id)
     //                                          (simulates a double-click on
     //                                           the marker row)
+    //   [ui.score] secondary-anchor ms=… via=waveform
+    //                                        → mouseClick(waveform, …,
+    //                                                     ControlModifier)
+    //   [ui.score] secondary-anchor ms=… via=dock-ctrl-click
+    //                                        → emit dock->loopAnchorAddRequested()
+    //                                          (or QTest::mouseClick on the
+    //                                           tree viewport with Ctrl)
+    //   [ui.score] create-loop start=… end=… → setSecondaryAnchorMs(ms);
+    //                                          keyClick(window, Qt::Key_L)
+    //   [ui.score] loop-activated id=…       → emit dock->loopActivated(id)
+    //   [ui.score] loop-armed id=… via=checkbox
+    //                                        → emit dock->loopArmToggleRequested(id, true)
+    //   [ui.transport] loop-wrap id=… …      → cursor crossed endMs while armed;
+    //                                          drive via posSlider beyond endMs
+    //                                          and let updatePosition fire
+    //   [ui.transport] play-armed-seek id=… to=…
+    //                                        → mouseClick(playButton) with
+    //                                          armedLoopId set + cursor outside loop
     //   [ui.score] delete … via=window-shortcut
     //                                        → keyClick(window, Qt::Key_Delete)
     //   [ui.score] delete-marker … via=window-shortcut
     //                                        → keyClick(window, Qt::Key_Delete)
     //                                          (with a marker selected)
+    //   [ui.score] delete-loop … via=…       → keyClick(window, Qt::Key_Delete)
+    //                                          (with a loop selected)
     //   [ui.file] close                      → window->close()
     //
     // Then assert the bug-fix invariant.

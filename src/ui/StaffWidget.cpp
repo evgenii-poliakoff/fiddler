@@ -1,6 +1,7 @@
 #include "ui/StaffWidget.h"
 
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
 #include <QFont>
@@ -39,6 +40,16 @@ constexpr int kMarkerFlagHeightPx     = 12;
 constexpr int kMarkerFlagPaddingPx    = 4;
 constexpr int kMarkerFlagFontPointSz  = 8;
 constexpr int kMarkerFlagMaxWidthPx   = 120;
+
+// Loop band visuals — same palette and rules as WaveformWidget.
+// Comment intentionally short here; canonical rationale lives in
+// WaveformWidget.cpp's matching block.
+constexpr int kLoopBandAlphaUnselected = 35;
+constexpr int kLoopBandAlphaSelected   = 90;
+constexpr int kLoopLabelHeightPx       = 12;
+constexpr int kLoopLabelPaddingPx      = 4;
+constexpr int kLoopLabelFontPointSz    = 8;
+constexpr int kLoopLabelMaxWidthPx     = 120;
 
 } // namespace
 
@@ -110,6 +121,24 @@ void StaffWidget::setMarkerModel(
     update();
 }
 
+void StaffWidget::setLoopModel(
+    std::shared_ptr<const score::LoopModel> model)
+{
+    if (loopModel_) {
+        disconnect(loopModel_.get(), nullptr, this, nullptr);
+    }
+    loopModel_ = std::move(model);
+    if (loopModel_) {
+        connect(loopModel_.get(), &score::LoopModel::changed,
+                this, &StaffWidget::onLoopModelChanged);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    update();
+}
+
 void StaffWidget::setPositionMs(std::int64_t ms) {
     if (positionMs_ == ms) return;
     positionMs_ = ms;
@@ -124,11 +153,15 @@ void StaffWidget::setSelectedBarline(std::optional<std::size_t> index) {
         && *index >= barlineModel_->size()) {
         index = std::nullopt;
     }
-    // MEMO: mutual exclusion — see WaveformWidget's setSelectedBarline
-    // for the rationale; both widgets enforce the same rule.
+    // MEMO: mutual exclusion across all three artifact kinds — see
+    // WaveformWidget's setSelectedBarline for the canonical rationale.
     if (index.has_value() && selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (index.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     if (selectedBarline_ == index) {
         update();
@@ -148,6 +181,10 @@ void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
         selectedBarline_.reset();
         emit barlineSelectionChanged(selectedBarline_);
     }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
     if (selectedMarkerId_ == id) {
         update();
         return;
@@ -155,6 +192,50 @@ void StaffWidget::setSelectedMarkerId(std::optional<std::int64_t> id) {
     selectedMarkerId_ = id;
     update();
     emit markerSelectionChanged(selectedMarkerId_);
+}
+
+std::optional<std::int64_t>
+StaffWidget::primaryAnchorMs() const noexcept {
+    if (selectedBarline_.has_value() && barlineModel_
+        && *selectedBarline_ < barlineModel_->size())
+    {
+        return barlineModel_->barlines()[*selectedBarline_];
+    }
+    if (selectedMarkerId_.has_value() && markerModel_) {
+        if (const auto idx = markerModel_->indexOf(*selectedMarkerId_)) {
+            return markerModel_->markers()[*idx].sourceMs;
+        }
+    }
+    return std::nullopt;
+}
+
+void StaffWidget::setSecondaryAnchorMs(std::optional<std::int64_t> ms) {
+    if (secondaryAnchorMs_ == ms) return;
+    secondaryAnchorMs_ = ms;
+    update();
+    emit secondaryAnchorChanged(secondaryAnchorMs_);
+}
+
+void StaffWidget::setSelectedLoopId(std::optional<std::int64_t> id) {
+    if (id.has_value() && loopModel_
+        && !loopModel_->indexOf(*id).has_value()) {
+        id = std::nullopt;
+    }
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_ == id) {
+        update();
+        return;
+    }
+    selectedLoopId_ = id;
+    update();
+    emit loopSelectionChanged(selectedLoopId_);
 }
 
 void StaffWidget::onBarlineModelChanged() {
@@ -176,6 +257,15 @@ void StaffWidget::onMarkerModelChanged() {
         && !markerModel_->indexOf(*selectedMarkerId_).has_value()) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    update();
+}
+
+void StaffWidget::onLoopModelChanged() {
+    if (selectedLoopId_.has_value() && loopModel_
+        && !loopModel_->indexOf(*selectedLoopId_).has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
     }
     update();
 }
@@ -213,12 +303,22 @@ void StaffWidget::paintEvent(QPaintEvent*) {
 
     // One paint helper per visual concern keeps each method short
     // and easy to follow. Order matters: things drawn later sit on
-    // top, so the cursor is last.
+    // top, so the cursor is last. Loops paint first so the
+    // translucent bands sit at the lowest z-order.
+    paintLoops(painter);
     paintStaffLines(painter);
     paintTimeSignature(painter);
     paintBarlines(painter);
     paintMarkers(painter);
+    // Cursor must paint BEFORE the secondary anchor's dashed
+    // indicator so that, when both are at the same x (e.g. right
+    // after a tap-place when the cursor seeks to the new artifact),
+    // the dashing pierces through the cursor. Otherwise the cursor
+    // would cover the artifact-as-dashed paint and the user would
+    // only see the red cursor at that x. See WaveformWidget for the
+    // canonical comment.
     paintCursor(painter);
+    paintSecondaryAnchor(painter);
 }
 
 void StaffWidget::paintStaffLines(QPainter& painter) const {
@@ -269,6 +369,59 @@ void StaffWidget::paintTimeSignature(QPainter& painter) const {
     }
 }
 
+void StaffWidget::paintLoops(QPainter& painter) const {
+    if (!loopModel_) return;
+    const auto loops = loopModel_->loops();
+
+    QFont labelFont = painter.font();
+    labelFont.setPointSize(kLoopLabelFontPointSz);
+    labelFont.setBold(true);
+    const QFontMetrics fm(labelFont);
+
+    for (const auto& l : loops) {
+        const int xStart = msToX(l.startMs);
+        const int xEnd   = msToX(l.endMs);
+        if (xEnd <= 0 || xStart >= width()) continue;
+
+        const int xLeft  = std::max(0, xStart);
+        const int xRight = std::min(width(), xEnd);
+        const int bandW  = std::max(1, xRight - xLeft);
+
+        const bool selected = (selectedLoopId_ == l.id);
+        const int  alpha    = selected
+            ? kLoopBandAlphaSelected
+            : kLoopBandAlphaUnselected;
+
+        const QColor bandCol(120, 200, 140, alpha);
+        painter.fillRect(QRect(xLeft, 0, bandW, height()), bandCol);
+
+        const QColor edgeCol(140, 220, 160,
+                             std::min(255, alpha + 60));
+        painter.setPen(QPen(edgeCol, selected ? 2.0 : 1.0));
+        painter.drawLine(xLeft,      0, xLeft,      height());
+        painter.drawLine(xRight - 1, 0, xRight - 1, height());
+
+        // Label sits in the bottom strip — the staff's top margin is
+        // taken by the marker flag row, so the bottom is the only
+        // sensible home for the loop name. Mirrors WaveformWidget.
+        painter.setFont(labelFont);
+        const int rawTextWidth = fm.horizontalAdvance(l.name);
+        const int textWidth =
+            std::min(rawTextWidth, kLoopLabelMaxWidthPx
+                     - 2 * kLoopLabelPaddingPx);
+        const int labelW = std::min(bandW,
+                                    textWidth + 2 * kLoopLabelPaddingPx);
+        const QRect labelRect(xLeft, height() - kLoopLabelHeightPx,
+                              labelW, kLoopLabelHeightPx);
+        painter.fillRect(labelRect, bandCol.darker(180));
+        painter.setPen(QColor(220, 240, 220));
+        painter.drawText(labelRect.adjusted(kLoopLabelPaddingPx, 0,
+                                            -kLoopLabelPaddingPx, 0),
+                         Qt::AlignVCenter | Qt::AlignLeft,
+                         fm.elidedText(l.name, Qt::ElideRight, textWidth));
+    }
+}
+
 void StaffWidget::paintBarlines(QPainter& painter) const {
     if (!barlineModel_) return;
 
@@ -283,7 +436,19 @@ void StaffWidget::paintBarlines(QPainter& painter) const {
         if (x < 0 || x >= width()) continue;   // off-screen, skip
 
         const bool selected = (selectedBarline_ == i);
-        painter.setPen(selected ? selectedPen : normalPen);
+        const bool isAnchor = secondaryAnchorMs_.has_value()
+                          && bars[i] == *secondaryAnchorMs_;
+        // MEMO: when this barline IS the secondary anchor, render
+        // it dashed instead of drawing a separate dashed tick on
+        // top — overlapping a solid line would mask the dash gaps.
+        // See WaveformWidget paintEvent for the canonical comment.
+        if (isAnchor) {
+            QPen pen(QColor(255, 220, 130), 2.0);
+            pen.setStyle(Qt::DashLine);
+            painter.setPen(pen);
+        } else {
+            painter.setPen(selected ? selectedPen : normalPen);
+        }
         painter.drawLine(x, topY, x, bottomY);
     }
 }
@@ -302,12 +467,23 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
         const int x = msToX(m.sourceMs);
         if (x < 0 || x >= width()) continue;
         const bool selected = (selectedMarkerId_ == m.id);
+        const bool isAnchor = secondaryAnchorMs_.has_value()
+                          && m.sourceMs == *secondaryAnchorMs_;
         const QColor lineCol = selected
             ? QColor(140, 230, 250)
             : QColor(100, 200, 220);
 
-        // Marker tick: full height, like the staff barline.
-        painter.setPen(QPen(lineCol, selected ? 2.0 : 1.0));
+        // Marker tick: full height. Marker-as-secondary gets a
+        // dashed, brighter line; the label flag stays solid so the
+        // marker's name remains legible.
+        QPen tickPen;
+        if (isAnchor) {
+            tickPen = QPen(QColor(160, 240, 255), 2.0);
+            tickPen.setStyle(Qt::DashLine);
+        } else {
+            tickPen = QPen(lineCol, selected ? 2.0 : 1.0);
+        }
+        painter.setPen(tickPen);
         painter.drawLine(x, 0, x, height());
 
         // Label flag in the top margin (sits above the staff lines).
@@ -324,6 +500,45 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
                          Qt::AlignVCenter | Qt::AlignLeft,
                          fm.elidedText(m.name, Qt::ElideRight, textWidth));
     }
+}
+
+void StaffWidget::paintSecondaryAnchor(QPainter& painter) const {
+    if (!secondaryAnchorMs_.has_value()) return;
+    const int sx = msToX(*secondaryAnchorMs_);
+    if (sx < 0 || sx >= width()) return;
+
+    // Detect whether an artifact already sits at the secondary's ms
+    // (in which case paintBarlines / paintMarkers already painted
+    // the artifact's tick in dashed style — a second tick would
+    // overdraw with the same pattern, harmless but wasteful) and
+    // whether the cursor is at the same x (in which case we MUST
+    // paint here so the dashes pierce through the cursor's red).
+    const bool cursorOverlap = (msToX(positionMs_) == sx);
+    bool secondaryOnArtifact = false;
+    QColor col(255, 200, 90);
+    if (barlineModel_) {
+        for (auto barMs : barlineModel_->barlines()) {
+            if (barMs == *secondaryAnchorMs_) {
+                secondaryOnArtifact = true;
+                break;
+            }
+        }
+    }
+    if (markerModel_) {
+        for (const auto& m : markerModel_->markers()) {
+            if (m.sourceMs == *secondaryAnchorMs_) {
+                secondaryOnArtifact = true;
+                col = QColor(160, 240, 255);   // marker hue
+                break;
+            }
+        }
+    }
+    if (secondaryOnArtifact && !cursorOverlap) return;
+
+    QPen pen(col, 2.0);
+    pen.setStyle(Qt::DashLine);
+    painter.setPen(pen);
+    painter.drawLine(sx, 0, sx, height());
 }
 
 void StaffWidget::paintCursor(QPainter& painter) const {
@@ -346,21 +561,33 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
 
     const int          clickX = event->pos().x();
     const std::int64_t ms     = xToMs(clickX);
+    const bool ctrlHeld =
+        (event->modifiers() & Qt::ControlModifier) != 0;
 
-    // MEMO: same hit-test priority as WaveformWidget — markers
-    // first (labelled, visually above), then barlines, then plain
-    // seek with both selections cleared.
     std::int64_t tolMs = 0;
     if (width() > 0) {
         tolMs = static_cast<std::int64_t>(kHitTolerancePx)
                 * durationMs_ / width();
     }
 
+    // MEMO: same Ctrl+click semantics as WaveformWidget — see the
+    // canonical comment there.
+    auto prepareClickStateChange = [&]() {
+        if (ctrlHeld) {
+            if (const auto primMs = primaryAnchorMs()) {
+                setSecondaryAnchorMs(*primMs);
+            }
+        } else {
+            setSecondaryAnchorMs(std::nullopt);
+        }
+    };
+
     // 1. Marker hit?
     if (markerModel_ && markerModel_->size() > 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
             const auto idx = markerModel_->indexOf(*markerHit);
             if (idx) {
+                prepareClickStateChange();
                 setSelectedMarkerId(*markerHit);
                 emit seekRequested(
                     markerModel_->markers()[*idx].sourceMs);
@@ -373,6 +600,7 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
     // 2. Barline hit?
     if (barlineModel_ && barlineModel_->size() > 0) {
         if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
+            prepareClickStateChange();
             setSelectedBarline(*barHit);
             emit seekRequested(barlineModel_->barlines()[*barHit]);
             event->accept();
@@ -380,7 +608,11 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
         }
     }
 
-    // 3. Plain seek — clear both selections.
+    // 3. No artifact hit. Ctrl+click on empty space is a no-op.
+    if (ctrlHeld) {
+        event->accept();
+        return;
+    }
     if (selectedBarline_.has_value()) {
         selectedBarline_.reset();
         update();
@@ -390,6 +622,9 @@ void StaffWidget::mousePressEvent(QMouseEvent* event) {
         selectedMarkerId_.reset();
         update();
         emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (secondaryAnchorMs_.has_value()) {
+        setSecondaryAnchorMs(std::nullopt);
     }
     emit seekRequested(ms);
     event->accept();
@@ -453,6 +688,9 @@ void StaffWidget::keyPressEvent(QKeyEvent* event) {
             setSelectedBarline(std::nullopt);
         } else if (selectedMarkerId_.has_value()) {
             setSelectedMarkerId(std::nullopt);
+        }
+        if (secondaryAnchorMs_.has_value()) {
+            setSecondaryAnchorMs(std::nullopt);
         }
         event->accept();
         return;

@@ -1,12 +1,14 @@
 find_package(Catch2 3 REQUIRED)
 
 add_executable(fiddler_tests
+    test_app_subprocess.cpp
     test_barline_model.cpp
     test_decoder.cpp
     test_decoder_synthetic.cpp
     test_decoder_corpus.cpp
     test_event_logging.cpp
     test_log.cpp
+    test_loop_model.cpp
     test_main_window.cpp
     test_marker_model.cpp
     test_project_viewer_dock.cpp
@@ -30,6 +32,15 @@ target_compile_definitions(fiddler_tests PRIVATE
     FIDDLER_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data/audio"
 )
 
+# Bake the path to the built fiddler binary so the subprocess
+# functional test can launch the actual app. $<TARGET_FILE:fiddler>
+# is a generator expression that resolves to the binary's absolute
+# path at build time (same value the IDE / CMake uses internally).
+target_compile_definitions(fiddler_tests PRIVATE
+    FIDDLER_BINARY_PATH="$<TARGET_FILE:fiddler>"
+)
+add_dependencies(fiddler_tests fiddler)
+
 target_link_libraries(fiddler_tests PRIVATE
     # Catch2 (not Catch2WithMain) — qt_test_app.cpp owns main() so the
     # QApplication lives on the stack for the test session, avoiding
@@ -52,6 +63,7 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/MarkerModel.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/ProjectViewerDock.cpp

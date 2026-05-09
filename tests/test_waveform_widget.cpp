@@ -5,6 +5,7 @@
 #include "audio/WaveformOverview.h"
 #include "qt_test_app.h"
 #include "score/BarlineModel.h"
+#include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "ui/WaveformWidget.h"
 
@@ -22,6 +23,7 @@
 
 using fiddler::audio::WaveformOverview;
 using fiddler::score::BarlineModel;
+using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
 using fiddler::test::qtApp;
 using fiddler::ui::WaveformWidget;
@@ -720,4 +722,499 @@ TEST_CASE("WaveformWidget: setMarkerModel(nullptr) detaches and clears selection
     w.setMarkerModel(nullptr);
     REQUIRE(w.markerModel() == nullptr);
     REQUIRE_FALSE(w.selectedMarkerId().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Loop overlay
+//
+// MEMO[refactor]: loops in this commit are render-only — selection
+// is dock-driven, so these tests pin two properties: (1) the widget
+// can paint loop bands without crashing, and (2) the mutual-exclusion
+// rule extends across all three artifact kinds (barline, marker,
+// loop). Click-to-select-loop, double-click-to-arm, and
+// arrow-nav-on-loops are deliberately NOT tested here because the
+// widget does not implement them yet (commits 3+ for dock-driven
+// arming, possibly later for click-on-band).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Install a fresh LoopModel on the widget with the given (start, end)
+// pairs. Returns the handle so tests can mutate it.
+std::shared_ptr<LoopModel>
+installLoops(WaveformWidget& w,
+             std::span<const std::pair<std::int64_t, std::int64_t>> ranges) {
+    auto model = std::make_shared<LoopModel>();
+    for (const auto& r : ranges) (void)model->add(r.first, r.second);
+    w.setLoopModel(model);
+    return model;
+}
+
+} // namespace
+
+TEST_CASE("WaveformWidget: paints loop bands without crashing",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1500}, {2000, 3000}
+    };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.resize(800, 120);
+    w.show();
+    // The return value is discarded on purpose — under the offscreen
+    // platform plugin the function may legitimately time out on
+    // headless CI machines, but the paint event still fires before
+    // we get here.
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: setSelectedLoopId clears barline + marker selections",
+          "[waveform-widget][gui][loops]") {
+    // MEMO: load-bearing — mutual exclusion across all three artifact
+    // kinds. The "selected artifact" is a single concept the dock
+    // surfaces; only one slot is populated at a time.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    const std::int64_t stamps[] = { 2000 };
+    auto markers = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    // Seed both barline + marker selections, then setSelectedLoopId
+    // must clear both.
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline().has_value());
+    w.setSelectedMarkerId(*markers->idAt(0));
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());   // marker cleared barline
+
+    QSignalSpy markerSpy(&w, &WaveformWidget::markerSelectionChanged);
+    QSignalSpy loopSpy  (&w, &WaveformWidget::loopSelectionChanged);
+
+    w.setSelectedLoopId(*loops->idAt(0));
+
+    REQUIRE(w.selectedLoopId().has_value());
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(markerSpy.count() == 1);    // marker cleared as side effect
+    REQUIRE(loopSpy.count()   == 1);    // loop set
+}
+
+TEST_CASE("WaveformWidget: setSelectedBarline clears an active loop selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &WaveformWidget::loopSelectionChanged);
+    w.setSelectedBarline(0);
+
+    REQUIRE(w.selectedBarline().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: setSelectedMarkerId clears an active loop selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    const std::int64_t stamps[] = { 2000 };
+    auto markers = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto loops = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(*loops->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy loopSpy(&w, &WaveformWidget::loopSelectionChanged);
+    w.setSelectedMarkerId(*markers->idAt(0));
+
+    REQUIRE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(loopSpy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: loop setRange keeps selection alive across re-sort",
+          "[waveform-widget][gui][loops]") {
+    // MEMO: this is the analog of the marker setPosition test —
+    // exactly why loops carry stable IDs. After a setRange that
+    // crosses a neighbour, an index-based selection would now point
+    // at a different loop; ID-based selection survives.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto firstId = *model->idAt(0);
+    w.setSelectedLoopId(firstId);
+
+    // Move first loop past the second.
+    REQUIRE(model->setRange(firstId, 3000, 3500));
+
+    REQUIRE(w.selectedLoopId() == firstId);
+    REQUIRE(*model->indexOf(firstId) == 1);
+}
+
+TEST_CASE("WaveformWidget: removing the selected loop clears the selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::pair<std::int64_t, std::int64_t> ranges[] = {
+        {500, 1000}, {2000, 2500}
+    };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    const auto secondId = *model->idAt(1);
+    w.setSelectedLoopId(secondId);
+    REQUIRE(w.selectedLoopId().has_value());
+
+    QSignalSpy selSpy(&w, &WaveformWidget::loopSelectionChanged);
+    REQUIRE(model->remove(secondId));
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+    REQUIRE(selSpy.count() >= 1);
+}
+
+TEST_CASE("WaveformWidget: setSelectedLoopId rejects dangling IDs",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    w.setSelectedLoopId(99999);    // ID never issued
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+}
+
+TEST_CASE("WaveformWidget: setLoopModel(nullptr) detaches and clears selection",
+          "[waveform-widget][gui][loops]") {
+    qtApp();
+    WaveformWidget w;
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 1500} };
+    auto model = installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+    w.setSelectedLoopId(*model->idAt(0));
+    REQUIRE(w.selectedLoopId().has_value());
+
+    w.setLoopModel(nullptr);
+    REQUIRE(w.loopModel() == nullptr);
+    REQUIRE_FALSE(w.selectedLoopId().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Secondary anchor (Ctrl+click multi-select for loop creation)
+//
+// MEMO[refactor]: each TEST_CASE pins one rule of the Ctrl+click
+// gesture. The widget's job is narrow: capture the previous primary
+// selection's ms when Ctrl+click hits a new artifact, and clear it
+// on a plain click or Esc. MainWindow consumes this in the L
+// shortcut (covered by integration tests against MainWindow).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("WaveformWidget: primaryAnchorMs returns nullopt with no selection",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    REQUIRE_FALSE(w.primaryAnchorMs().has_value());
+}
+
+TEST_CASE("WaveformWidget: primaryAnchorMs resolves selectedBarline to its ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    barlines->add(2500);
+    w.setBarlineModel(barlines);
+
+    w.setSelectedBarline(1);
+    REQUIRE(w.primaryAnchorMs() == 2500);
+}
+
+TEST_CASE("WaveformWidget: primaryAnchorMs resolves selectedMarkerId to its ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    w.setSelectedMarkerId(*model->idAt(0));
+    REQUIRE(w.primaryAnchorMs() == 1500);
+}
+
+TEST_CASE("WaveformWidget: Ctrl+click on a marker promotes prior primary to secondary",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: this is the load-bearing rule of the Ctrl+click gesture.
+    // The widget captures the *previous* primary's ms into the
+    // secondary slot, then installs the clicked marker as the new
+    // primary. Without this, MainWindow's L shortcut couldn't see
+    // two anchors at once.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    // Two markers at 1000 ms and 3000 ms — given a 4-second file
+    // and an 800-pixel widget, those land at x=200 and x=600.
+    const std::int64_t stamps[] = { 1000, 3000 };
+    installMarkers(w, std::span<const std::int64_t>{stamps});
+
+    QSignalSpy secondarySpy(&w, &WaveformWidget::secondaryAnchorChanged);
+
+    // Click marker 1 (no Ctrl) → primary at 1000 ms, no secondary.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 60));
+    REQUIRE(w.primaryAnchorMs() == 1000);
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+
+    // Ctrl+click marker 2 → primary at 3000, secondary at 1000.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
+                      QPoint(600, 60));
+    REQUIRE(w.primaryAnchorMs() == 3000);
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+    REQUIRE(secondarySpy.count() >= 1);   // at least one signal emitted
+}
+
+TEST_CASE("WaveformWidget: plain click clears any active secondary anchor",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    // Pre-seed a secondary anchor; then click an empty patch.
+    w.setSecondaryAnchorMs(1500);
+    REQUIRE(w.secondaryAnchorMs().has_value());
+
+    QSignalSpy spy(&w, &WaveformWidget::secondaryAnchorChanged);
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(700, 60));
+
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+    REQUIRE(spy.count() == 1);
+}
+
+TEST_CASE("WaveformWidget: Ctrl+click on empty space leaves secondary intact",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: a Ctrl+click that doesn't land on an artifact should not
+    // disturb the user's already-captured anchors. Otherwise a
+    // missed click would silently abort the loop-creation gesture.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    w.setSecondaryAnchorMs(1500);
+    REQUIRE(w.secondaryAnchorMs() == 1500);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
+                      QPoint(700, 60));   // nothing here
+    REQUIRE(w.secondaryAnchorMs() == 1500);
+}
+
+TEST_CASE("WaveformWidget: Esc clears secondary anchor along with primary",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+    w.setSecondaryAnchorMs(2500);
+    REQUIRE(w.secondaryAnchorMs().has_value());
+
+    QTest::keyClick(&w, Qt::Key_Escape);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
+}
+
+TEST_CASE("WaveformWidget: paint survives secondary anchor on a barline ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: regression test — when the secondary anchor's ms equals
+    // an existing barline's ms (the common Ctrl+click case), the
+    // widget must paint the barline in dashed style instead of
+    // drawing a separate dashed tick over the solid one. The bug
+    // before the fix: the standalone tick drew over the solid
+    // barline, the gaps were filled by the underlying line, and
+    // the dashing was invisible to the user.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+    w.setSelectedBarline(0);
+
+    // Set the secondary anchor at the same ms as the barline.
+    // After the fix, the barline itself renders dashed; before the
+    // fix, a separate dashed tick was drawn (which the user
+    // couldn't see).
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: paint survives secondary anchor on a marker ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+    w.setSecondaryAnchorMs(1500);   // same ms as the marker
+
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: dashed barline at secondary anchor renders distinctly",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: pixel-level regression — render the widget to a QImage
+    // and inspect the column at the barline's x. The fix replaced
+    // the standalone tick with an artifact-painted-dashed rendering;
+    // verify the column is dashed (mix of yellow + non-yellow rows)
+    // rather than solid yellow.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 200);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);   // x=200 in an 800-px / 4-second view
+    w.setBarlineModel(barlines);
+
+    // No primary selection on the bar (mirrors the user's bug
+    // scenario: after Ctrl+click in dock, mutual exclusion clears
+    // selectedBarline_ on the waveform).
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+
+    // Render to image without showing the widget.
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Walk down the column at x=200 and bin pixels into "bright
+    // yellow" (dashed pen color 255,220,130 ± slack) vs "dark/other"
+    // (gap or no line). A dashed line should produce both kinds in
+    // roughly equal measure; a solid line produces only bright
+    // yellow rows.
+    const int x = 200;
+    int yellowRows = 0;
+    int otherRows  = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        const QColor c = image.pixelColor(x, y);
+        const bool isYellow = c.red() > 200 && c.green() > 180
+                           && c.blue() < 180;
+        if (isYellow) ++yellowRows;
+        else          ++otherRows;
+    }
+
+    // Both kinds must appear — that's what makes the line "dashed".
+    // The exact ratio depends on Qt's dash pattern at width 2, but
+    // we should see plenty of both. Pick a generous threshold so
+    // tiny rendering changes don't flap the test.
+    REQUIRE(yellowRows > 20);
+    REQUIRE(otherRows  > 20);
+}
+
+TEST_CASE("WaveformWidget: dashed indicator pierces through cursor at same x",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: regression for the user-reported bug — when the cursor
+    // and the secondary anchor share an x (the common case right
+    // after tap-place because the cursor sits at the new artifact),
+    // the cursor was painting on top of the artifact-as-dashed
+    // tick, hiding the dashing entirely. The fix moves the
+    // secondary indicator to AFTER the cursor so the dashes
+    // pierce through the cursor's red.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 200);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+
+    // Cursor and secondary at the SAME ms — repro condition.
+    w.setPositionMs(1000);
+    w.setSecondaryAnchorMs(1000);
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // At x=200 (1000ms in 800/4000 mapping), we should see BOTH
+    // yellow rows (dashed bar pierces through) AND red rows
+    // (cursor in dash gaps). Without the fix, the column would be
+    // pure red — cursor covers the whole height with no yellow
+    // showing through.
+    const int x = 200;
+    int yellowRows = 0;
+    int redRows    = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        const QColor c = image.pixelColor(x, y);
+        const bool isYellow = c.red() > 200 && c.green() > 180
+                           && c.blue() < 180;
+        const bool isRed    = c.red() > 200 && c.green() < 150
+                           && c.blue() < 150;
+        if (isYellow) ++yellowRows;
+        if (isRed)    ++redRows;
+    }
+
+    // Both must appear. Without the fix yellowRows would be 0 and
+    // redRows would be ~120.
+    REQUIRE(yellowRows > 20);
+    REQUIRE(redRows    > 20);
+}
+
+TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    QSignalSpy spy(&w, &WaveformWidget::secondaryAnchorChanged);
+
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE(spy.count() == 1);
+    w.setSecondaryAnchorMs(1000);    // same value
+    REQUIRE(spy.count() == 1);        // no re-emit
+    w.setSecondaryAnchorMs(std::nullopt);
+    REQUIRE(spy.count() == 2);
+    w.setSecondaryAnchorMs(std::nullopt);
+    REQUIRE(spy.count() == 2);
 }
