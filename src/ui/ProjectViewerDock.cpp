@@ -148,8 +148,8 @@ void ProjectViewerDock::buildUi() {
         propertyStack_->insertWidget(kPageMarker, page);
     }
 
-    // Page 2: loop properties — name, start, end, pause-between-repeats,
-    // and an Arm checkbox that mirrors transport state.
+    // Page 2: loop properties — name, start, end, and an Arm
+    // checkbox that mirrors transport state.
     {
         auto* page = new QWidget(propertyStack_);
         auto* form = new QFormLayout(page);
@@ -177,13 +177,10 @@ void ProjectViewerDock::buildUi() {
                 this, &ProjectViewerDock::onLoopEndEdited);
         form->addRow(tr("End:"), loopEndBox_);
 
-        loopPauseBox_ = new QSpinBox(page);
-        loopPauseBox_->setObjectName("loopPauseBox");
-        loopPauseBox_->setRange(0, 60'000);   // up to 60s pause is plenty
-        loopPauseBox_->setSuffix(tr(" ms"));
-        connect(loopPauseBox_, &QSpinBox::editingFinished,
-                this, &ProjectViewerDock::onLoopPauseEdited);
-        form->addRow(tr("Pause:"), loopPauseBox_);
+        // MEMO: per-loop "Pause" spinbox was removed in issue #16.
+        // Pause-between-repeats is now a global setting in the
+        // transport row, applied uniformly to every loop. The
+        // per-loop value used to live here.
 
         loopArmedCheck_ = new QCheckBox(tr("Armed"), page);
         loopArmedCheck_->setObjectName("loopArmedCheck");
@@ -196,22 +193,31 @@ void ProjectViewerDock::buildUi() {
                 this, &ProjectViewerDock::onLoopArmedToggled);
         form->addRow(QString(), loopArmedCheck_);
 
-        // MEMO: countdown sits at the bottom of the loop property
-        // page so it's always associated with the loop being
-        // edited. setIdleVisible(true) means the ring shows full
-        // when no countdown is running — the user sees what the
-        // affordance is even before they hit Play. MainWindow
-        // calls startCountdown / cancelCountdown around the
-        // transport's pause-between-repeats window.
-        loopCountdown_ = new LoopCountdownWidget(page);
-        loopCountdown_->setObjectName("loopCountdown");
-        form->addRow(QString(), loopCountdown_);
-
         propertyStack_->insertWidget(kPageLoop, page);
     }
 
     propertyStack_->setCurrentIndex(kPageNoSelection);
     layout->addWidget(propertyStack_);
+
+    // ---- Global pre-roll countdown -------------------------------------
+    // MEMO: the countdown widget used to live inside the loop
+    // property page when pre-roll was a per-loop setting. After
+    // issue #16 promoted it to a global setting, the widget belongs
+    // to the dock as a whole — it's visible whenever the user has
+    // pre-roll enabled, regardless of which (if any) artifact is
+    // selected. Sits at the bottom so the property page above keeps
+    // its natural sizing and the user always knows where to look
+    // for the "ready, set, go" cue.
+    //
+    // setArmed(true) once at construction: with global pre-roll the
+    // widget is only ever shown in the "ready / counting" tiers —
+    // the "not armed" dim tier is unreachable now. See
+    // memory/feedback_progressive_visual_weight.md.
+    loopCountdown_ = new LoopCountdownWidget(root);
+    loopCountdown_->setObjectName("loopCountdown");
+    loopCountdown_->setArmed(true);
+    loopCountdown_->setVisible(prerollEnabled_);
+    layout->addWidget(loopCountdown_);
 
     setWidget(root);
 }
@@ -348,6 +354,18 @@ void ProjectViewerDock::startCountdown(int totalMs) {
 
 void ProjectViewerDock::cancelCountdown() {
     if (loopCountdown_) loopCountdown_->cancel();
+}
+
+void ProjectViewerDock::setPrerollEnabled(bool enabled) {
+    if (prerollEnabled_ == enabled) return;
+    prerollEnabled_ = enabled;
+    if (loopCountdown_) {
+        // When pre-roll is turned off mid-countdown, also stop the
+        // animation — leaving a frozen ring visible would be
+        // confusing.
+        if (!enabled) loopCountdown_->cancel();
+        loopCountdown_->setVisible(enabled);
+    }
 }
 
 void ProjectViewerDock::setArmedLoopId(
@@ -516,14 +534,8 @@ void ProjectViewerDock::refreshPropertyPage() {
             loopEndBox_->setMinimum(static_cast<int>(l.startMs) + 1);
             loopEndBox_->setValue(static_cast<int>(l.endMs));
             loopStartBox_->setMaximum(static_cast<int>(l.endMs) - 1);
-            loopPauseBox_->setValue(l.pauseMs);
             const bool isLoopArmed = (armedLoopId_ == l.id);
             loopArmedCheck_->setChecked(isLoopArmed);
-            // Forward armed state to the countdown widget — drives
-            // the three-tier visual weight (disabled / ready /
-            // active) on the ring. See
-            // memory/feedback_progressive_visual_weight.md.
-            if (loopCountdown_) loopCountdown_->setArmed(isLoopArmed);
             updatingPropertyPage_ = false;
             propertyStack_->setCurrentIndex(kPageLoop);
             return;
@@ -679,12 +691,6 @@ void ProjectViewerDock::onLoopEndEdited() {
     const std::int64_t newEnd = loopEndBox_->value();
     if (newEnd <= l.startMs) return;
     loopModel_->setRange(*selectedLoopId_, l.startMs, newEnd);
-}
-
-void ProjectViewerDock::onLoopPauseEdited() {
-    if (updatingPropertyPage_) return;
-    if (!selectedLoopId_ || !loopModel_) return;
-    loopModel_->setPauseMs(*selectedLoopId_, loopPauseBox_->value());
 }
 
 void ProjectViewerDock::onLoopArmedToggled(bool checked) {

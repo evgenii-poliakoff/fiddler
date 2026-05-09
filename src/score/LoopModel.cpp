@@ -22,15 +22,13 @@ LoopModel::LoopModel(QObject* parent) : QObject(parent) {}
 
 std::int64_t LoopModel::add(std::int64_t startMs,
                             std::int64_t endMs,
-                            QString      name,
-                            int          pauseMs) {
+                            QString      name) {
     if (endMs <= startMs) return 0;   // reject degenerate range
 
     Loop loop;
     loop.id      = nextId_++;
     loop.startMs = startMs;
     loop.endMs   = endMs;
-    loop.pauseMs = (pauseMs < 0) ? 0 : pauseMs;
     if (name.isEmpty()) {
         loop.name = QString("Loop %1").arg(nextNameNumber_++);
     } else {
@@ -67,16 +65,6 @@ bool LoopModel::setRange(std::int64_t id,
     // Re-sort. Same reasoning as MarkerModel::setPosition: N is small,
     // so a fresh sort beats a careful in-place shuffle.
     std::sort(loops_.begin(), loops_.end(), loopLess);
-    emit changed();
-    return true;
-}
-
-bool LoopModel::setPauseMs(std::int64_t id, int newPauseMs) {
-    const auto idx = indexOf(id);
-    if (!idx) return false;
-    const int clamped = (newPauseMs < 0) ? 0 : newPauseMs;
-    if (loops_[*idx].pauseMs == clamped) return true;
-    loops_[*idx].pauseMs = clamped;
     emit changed();
     return true;
 }

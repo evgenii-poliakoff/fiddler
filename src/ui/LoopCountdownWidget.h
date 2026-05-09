@@ -1,9 +1,16 @@
 // LoopCountdownWidget — circular tick-ring countdown, drawn at the
-// bottom of the loop property page. While a loop is armed and the
-// transport is paused between repeats, the 16 radial ticks deplete
-// one by one over the pauseMs window. When idle (loop selected but
-// not counting down), the ring is shown full so the widget is
-// self-explanatory before the user has experienced a wrap.
+// bottom of the project viewer dock. While transport is in a pre-
+// roll wrap-pause (the practice-mode silence before each Play /
+// before each loop repeat), the 16 radial ticks deplete one by
+// one over the pre-roll window. When idle (visible but not
+// counting down), the ring is shown full so the widget is
+// self-explanatory before the user has experienced a countdown.
+//
+// MEMO[issue #16]: this widget used to live inside the loop
+// property page and reflect that loop's armed state. It moved
+// out when pre-roll became a global setting — it's now visible
+// whenever the user has practice mode on, regardless of which
+// (if any) artifact is selected.
 //
 // MEMO: 16 ticks chosen as a balance — denser than a clock face
 // (so it reads as "digital" rather than analog), but not so dense

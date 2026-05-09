@@ -122,35 +122,10 @@ TEST_CASE("LoopModel: auto-name counter doesn't reuse numbers after remove",
     (void)id3;
 }
 
-TEST_CASE("LoopModel: default pause-between-repeats is 500ms",
-          "[loop-model]") {
-    // MEMO: load-bearing — 500ms is the user-confirmed default.
-    // Changing this value should be a deliberate, documented choice;
-    // the test guards against an accidental change to 0.
-    qtApp();
-    LoopModel m;
-    m.add(1000, 2000);
-    REQUIRE(m.loops()[0].pauseMs == 500);
-    REQUIRE(LoopModel::kDefaultPauseMs == 500);
-}
-
-TEST_CASE("LoopModel: explicit pauseMs override on add",
-          "[loop-model]") {
-    qtApp();
-    LoopModel m;
-    m.add(1000, 2000, {}, 0);
-    m.add(3000, 4000, {}, 1500);
-    REQUIRE(m.loops()[0].pauseMs == 0);
-    REQUIRE(m.loops()[1].pauseMs == 1500);
-}
-
-TEST_CASE("LoopModel: negative pauseMs on add clamps to 0",
-          "[loop-model]") {
-    qtApp();
-    LoopModel m;
-    m.add(1000, 2000, {}, -10);
-    REQUIRE(m.loops()[0].pauseMs == 0);
-}
+// MEMO: pause-between-repeats moved out of the per-loop model in
+// issue #16. The per-loop pauseMs / setPauseMs / kDefaultPauseMs
+// API surface is gone; pause is now a global MainWindow setting
+// covered by the integration tests in test_main_window.cpp.
 
 // ---------------------------------------------------------------------------
 // Sort invariant
@@ -289,43 +264,6 @@ TEST_CASE("LoopModel: setRange of unknown ID returns false, no emit",
     LoopModel m;
     QSignalSpy spy(&m, &LoopModel::changed);
     REQUIRE_FALSE(m.setRange(999, 1000, 2000));
-    REQUIRE(spy.count() == 0);
-}
-
-// ---------------------------------------------------------------------------
-// setPauseMs
-// ---------------------------------------------------------------------------
-
-TEST_CASE("LoopModel: setPauseMs updates and emits",
-          "[loop-model]") {
-    qtApp();
-    LoopModel m;
-    const auto id = m.add(1000, 2000);
-    QSignalSpy spy(&m, &LoopModel::changed);
-
-    REQUIRE(m.setPauseMs(id, 750));
-    REQUIRE(m.loops()[0].pauseMs == 750);
-    REQUIRE(spy.count() == 1);
-}
-
-TEST_CASE("LoopModel: setPauseMs clamps negative to 0",
-          "[loop-model]") {
-    qtApp();
-    LoopModel m;
-    const auto id = m.add(1000, 2000);
-
-    REQUIRE(m.setPauseMs(id, -100));
-    REQUIRE(m.loops()[0].pauseMs == 0);
-}
-
-TEST_CASE("LoopModel: setPauseMs to the same value is a quiet no-op",
-          "[loop-model]") {
-    qtApp();
-    LoopModel m;
-    const auto id = m.add(1000, 2000);   // pause defaults to 500
-    QSignalSpy spy(&m, &LoopModel::changed);
-
-    REQUIRE(m.setPauseMs(id, 500));
     REQUIRE(spy.count() == 0);
 }
 
