@@ -412,6 +412,33 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
+    // MEMO: when the secondary anchor lands on top of an existing
+    // artifact (the common case — the user Ctrl+clicked an existing
+    // tick), DON'T draw a separate dashed tick over the artifact's
+    // solid tick. The underlying solid line would fill the gaps in
+    // the dash pattern and the dashing wouldn't be visible. Instead,
+    // detect the overlap here, paint the artifact ITSELF with a
+    // dashed pen below, and skip the standalone tick later.
+    bool secondaryOnArtifact = false;
+    if (secondaryAnchorMs_.has_value()) {
+        if (barlineModel_) {
+            for (auto barMs : barlineModel_->barlines()) {
+                if (barMs == *secondaryAnchorMs_) {
+                    secondaryOnArtifact = true;
+                    break;
+                }
+            }
+        }
+        if (!secondaryOnArtifact && markerModel_) {
+            for (const auto& m : markerModel_->markers()) {
+                if (m.sourceMs == *secondaryAnchorMs_) {
+                    secondaryOnArtifact = true;
+                    break;
+                }
+            }
+        }
+    }
+
     // Barline ticks — drawn between peaks and the cursor so the
     // playhead always wins z-order.
     if (barlineModel_) {
@@ -420,9 +447,20 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             const int x = msToX(bars[i]);
             if (x < 0 || x >= width()) continue;
             const bool selected = (selectedBarline_ == i);
-            painter.setPen(QPen(
-                selected ? QColor(255, 200, 90) : QColor(210, 170, 60),
-                selected ? 2.0 : 1.0));
+            const bool isAnchor = secondaryAnchorMs_.has_value()
+                              && bars[i] == *secondaryAnchorMs_;
+            QPen pen;
+            if (isAnchor) {
+                // Bright yellow + dashed + thick: visibly distinct
+                // from both the regular and selected barlines.
+                pen = QPen(QColor(255, 220, 130), 2.0);
+                pen.setStyle(Qt::DashLine);
+            } else {
+                pen = QPen(
+                    selected ? QColor(255, 200, 90) : QColor(210, 170, 60),
+                    selected ? 2.0 : 1.0);
+            }
+            painter.setPen(pen);
             painter.drawLine(x, 0, x, height());
         }
     }
@@ -442,12 +480,23 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             const int x = msToX(m.sourceMs);
             if (x < 0 || x >= width()) continue;
             const bool selected = (selectedMarkerId_ == m.id);
+            const bool isAnchor = secondaryAnchorMs_.has_value()
+                              && m.sourceMs == *secondaryAnchorMs_;
             const QColor lineCol = selected
                 ? QColor(140, 230, 250)
                 : QColor(100, 200, 220);
 
-            // Vertical tick line — full height.
-            painter.setPen(QPen(lineCol, selected ? 2.0 : 1.0));
+            // Vertical tick line — full height. Marker-as-secondary
+            // gets a brighter, dashed, thicker line; the label flag
+            // stays solid so the marker's name remains legible.
+            QPen tickPen;
+            if (isAnchor) {
+                tickPen = QPen(QColor(160, 240, 255), 2.0);
+                tickPen.setStyle(Qt::DashLine);
+            } else {
+                tickPen = QPen(lineCol, selected ? 2.0 : 1.0);
+            }
+            painter.setPen(tickPen);
             painter.drawLine(x, 0, x, height());
 
             // Label flag at the top: filled rectangle with the name.
@@ -467,17 +516,16 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
-    // Secondary anchor — a dashed tick at the captured ms. Drawn
-    // after the artifact ticks so it sits visually on top, but
-    // before the cursor so the playhead always wins z-order.
-    if (secondaryAnchorMs_.has_value()) {
+    // Standalone secondary anchor tick — only drawn when the
+    // secondary doesn't sit on top of an existing artifact. The
+    // overlap case is handled above by replacing the artifact's
+    // solid tick with a dashed one. MEMO: dashed style is the
+    // "armed for combination, not yet committed" convention from
+    // DAW ghost cursors.
+    if (secondaryAnchorMs_.has_value() && !secondaryOnArtifact) {
         const int x = msToX(*secondaryAnchorMs_);
         if (x >= 0 && x < width()) {
             QPen pen(QColor(255, 200, 90), 2);
-            // MEMO: dashed style differentiates the secondary anchor
-            // from a regular selected barline (solid yellow). The
-            // dashed line reads as "armed for combination, not yet
-            // committed" — same convention as DAW ghost cursors.
             pen.setStyle(Qt::DashLine);
             painter.setPen(pen);
             painter.drawLine(x, 0, x, height());

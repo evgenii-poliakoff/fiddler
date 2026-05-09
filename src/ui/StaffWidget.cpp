@@ -429,7 +429,19 @@ void StaffWidget::paintBarlines(QPainter& painter) const {
         if (x < 0 || x >= width()) continue;   // off-screen, skip
 
         const bool selected = (selectedBarline_ == i);
-        painter.setPen(selected ? selectedPen : normalPen);
+        const bool isAnchor = secondaryAnchorMs_.has_value()
+                          && bars[i] == *secondaryAnchorMs_;
+        // MEMO: when this barline IS the secondary anchor, render
+        // it dashed instead of drawing a separate dashed tick on
+        // top — overlapping a solid line would mask the dash gaps.
+        // See WaveformWidget paintEvent for the canonical comment.
+        if (isAnchor) {
+            QPen pen(QColor(255, 220, 130), 2.0);
+            pen.setStyle(Qt::DashLine);
+            painter.setPen(pen);
+        } else {
+            painter.setPen(selected ? selectedPen : normalPen);
+        }
         painter.drawLine(x, topY, x, bottomY);
     }
 }
@@ -448,12 +460,23 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
         const int x = msToX(m.sourceMs);
         if (x < 0 || x >= width()) continue;
         const bool selected = (selectedMarkerId_ == m.id);
+        const bool isAnchor = secondaryAnchorMs_.has_value()
+                          && m.sourceMs == *secondaryAnchorMs_;
         const QColor lineCol = selected
             ? QColor(140, 230, 250)
             : QColor(100, 200, 220);
 
-        // Marker tick: full height, like the staff barline.
-        painter.setPen(QPen(lineCol, selected ? 2.0 : 1.0));
+        // Marker tick: full height. Marker-as-secondary gets a
+        // dashed, brighter line; the label flag stays solid so the
+        // marker's name remains legible.
+        QPen tickPen;
+        if (isAnchor) {
+            tickPen = QPen(QColor(160, 240, 255), 2.0);
+            tickPen.setStyle(Qt::DashLine);
+        } else {
+            tickPen = QPen(lineCol, selected ? 2.0 : 1.0);
+        }
+        painter.setPen(tickPen);
         painter.drawLine(x, 0, x, height());
 
         // Label flag in the top margin (sits above the staff lines).
@@ -474,6 +497,20 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
 
 void StaffWidget::paintSecondaryAnchor(QPainter& painter) const {
     if (!secondaryAnchorMs_.has_value()) return;
+    // Skip the standalone tick when an artifact already sits at the
+    // secondary's ms — paintBarlines / paintMarkers paint that
+    // artifact in dashed style, so a second tick would just stack
+    // and hide the dashes again.
+    if (barlineModel_) {
+        for (auto barMs : barlineModel_->barlines()) {
+            if (barMs == *secondaryAnchorMs_) return;
+        }
+    }
+    if (markerModel_) {
+        for (const auto& m : markerModel_->markers()) {
+            if (m.sourceMs == *secondaryAnchorMs_) return;
+        }
+    }
     const int x = msToX(*secondaryAnchorMs_);
     if (x < 0 || x >= width()) return;
     QPen pen(QColor(255, 200, 90), 2);

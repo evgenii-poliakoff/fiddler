@@ -1053,6 +1053,54 @@ TEST_CASE("WaveformWidget: Esc clears secondary anchor along with primary",
     REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
 }
 
+TEST_CASE("WaveformWidget: paint survives secondary anchor on a barline ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: regression test — when the secondary anchor's ms equals
+    // an existing barline's ms (the common Ctrl+click case), the
+    // widget must paint the barline in dashed style instead of
+    // drawing a separate dashed tick over the solid one. The bug
+    // before the fix: the standalone tick drew over the solid
+    // barline, the gaps were filled by the underlying line, and
+    // the dashing was invisible to the user.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);
+    w.setBarlineModel(barlines);
+    w.setSelectedBarline(0);
+
+    // Set the secondary anchor at the same ms as the barline.
+    // After the fix, the barline itself renders dashed; before the
+    // fix, a separate dashed tick was drawn (which the user
+    // couldn't see).
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
+TEST_CASE("WaveformWidget: paint survives secondary anchor on a marker ms",
+          "[waveform-widget][gui][secondary-anchor]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 120);
+
+    const std::int64_t stamps[] = { 1500 };
+    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    w.setSelectedMarkerId(*model->idAt(0));
+    w.setSecondaryAnchorMs(1500);   // same ms as the marker
+
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+    SUCCEED();
+}
+
 TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
           "[waveform-widget][gui][secondary-anchor]") {
     qtApp();
