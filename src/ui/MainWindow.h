@@ -49,6 +49,30 @@ public:
     // through to the player.
     [[nodiscard]] const audio::Player& player() const noexcept { return *player_; }
 
+    // Test seams for the wrap-pause state machine (issue #13).
+    // Production code never calls enterWrapPauseForTest — the real
+    // entry is updatePosition's wrap branch. Exposed so integration
+    // tests can verify the cancel paths (Play press / seek during
+    // pause) without depending on audio actually advancing position
+    // past endMs, which is unreliable on headless CI.
+    void enterWrapPauseForTest(std::int64_t loopId, int pauseMs);
+    [[nodiscard]] bool wrapPending() const noexcept { return wrapPending_; }
+
+    // Pure helper for the wrap-trigger rule: wrap only when the
+    // playhead crossed `endMs` going forward during NATURAL
+    // playback, not when the user seeked past it. Detected by
+    // requiring `previousPosMs < endMs && currentPosMs >= endMs`.
+    // Without this, a click on the waveform to the right of the
+    // loop yanks the user back via wrap (UX-asymmetric to clicks
+    // on the left, which play forward freely). See issue #13.
+    //
+    // Static + public so tests can pin the truth table directly,
+    // without driving the full updatePosition path which depends
+    // on Player::state being Playing (unreliable on headless CI).
+    [[nodiscard]] static bool wrapShouldFire(std::int64_t previousPosMs,
+                                             std::int64_t currentPosMs,
+                                             std::int64_t endMs) noexcept;
+
     // Access to the shared score models. Used by integration tests
     // to verify that tap-to-place / Ctrl+Z / time-sig picker /
     // marker-related mutations actually reach the models.
@@ -242,8 +266,40 @@ private:
     // see pos > endMs on subsequent ticks (the player paused but
     // the position didn't fully reset until the seek lands) and
     // schedule duplicate wraps. Reset by the timer's lambda when
-    // the loop is rearmed at startMs.
+    // the loop is rearmed at startMs, OR by `cancelPendingWrap`
+    // when the user interrupts the pause via Play / seek.
     bool wrapPending_ = false;
+
+    // Position observed at the END of the previous updatePosition
+    // tick (or after a user seek). The wrap rule fires only on a
+    // forward crossing of endMs (`previousPosMs_ < endMs && pos >=
+    // endMs`); user-initiated seeks update this so a jump past
+    // endMs doesn't look like a fresh crossing on the next tick.
+    // See issue #13 + wrapShouldFire().
+    //
+    // Sentinel -1 means "no previous tick yet" — first tick after
+    // file load doesn't fire wrap regardless of position.
+    std::int64_t previousPosMs_ = -1;
+
+    // The pause-between-repeats QTimer. Single-shot, started when
+    // we enter the wrap-pause window, fires after `pauseMs` to
+    // resume playback. Held as a member (rather than the static
+    // QTimer::singleShot we used originally) so user actions can
+    // explicitly cancel it — pressing Play during the pause should
+    // stop the auto-resume; seeking during the pause should leave
+    // the player paused at the new position. See issue #13 for
+    // the rationale.
+    QTimer*      wrapTimer_         = nullptr;
+    // The loop id captured at wrap entry. The timer's timeout
+    // handler compares this against `armedLoopId_` — if the user
+    // armed a different loop in the meantime, the auto-resume
+    // becomes a no-op rather than playing the wrong loop.
+    std::int64_t wrapTargetLoopId_  = 0;
+
+    // Cancel any pending pause-between-repeats. Stops the timer,
+    // clears `wrapPending_`, cancels the dock's countdown widget.
+    // Idempotent — safe to call when no wrap is pending.
+    void cancelPendingWrap();
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't

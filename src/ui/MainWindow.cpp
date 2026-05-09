@@ -113,6 +113,28 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowTitle("Fiddler");
     buildMenus();
     buildCentralWidget();
+
+    // Wrap-pause QTimer — one persistent instance, started fresh
+    // each time we enter the pause-between-repeats window. Holding
+    // it as a member (not a static QTimer::singleShot) lets the user
+    // cancel it explicitly via cancelPendingWrap when they press
+    // Play or seek during the pause. See issue #13.
+    wrapTimer_ = new QTimer(this);
+    wrapTimer_->setSingleShot(true);
+    connect(wrapTimer_, &QTimer::timeout, this, [this]() {
+        wrapPending_ = false;
+        // Defensive: if the user disarmed (or armed a DIFFERENT
+        // loop) during the pause, the captured loopId no longer
+        // matches and we just bail. The countdown widget completes
+        // its own depletion in parallel; nothing to do here.
+        if (!armedLoopId_.has_value()
+            || *armedLoopId_ != wrapTargetLoopId_) {
+            return;
+        }
+        if (!player_) return;
+        player_->play();
+        playButton_->setText(tr("Pause"));
+    });
     // MEMO: restoreLayout AFTER buildCentralWidget so the dock
     // exists before we ask Qt to push its persisted state into it.
     // Qt's restoreState matches dock widgets by objectName — set
@@ -450,11 +472,13 @@ bool MainWindow::loadFile(const QString& path) {
     // anyway, but resetting wrapPending_ is the explicit reason for
     // doing it here too.
     armedLoopId_.reset();
-    wrapPending_ = false;
+    cancelPendingWrap();
     if (projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(std::nullopt);
-        projectViewerDock_->cancelCountdown();
     }
+    // Reset the wrap-detection tracker — fresh file, no prior tick
+    // observed yet.
+    previousPosMs_ = -1;
 
     // Tell the staff how long this file is (so its msToX mapping
     // works). The waveform gets its duration via the WaveformOverview
@@ -517,6 +541,29 @@ void MainWindow::onPlayPause() {
         FLOG_DEBUG("ui.transport", "pause at={} ms", pos);
         return;
     }
+
+    // MEMO: special-case for issue #13 — the user clicked the
+    // play/pause button DURING a wrap-pause. The button label still
+    // reads "Pause" at this moment (we deliberately don't flip it
+    // when entering the wrap-pause; the loop is conceptually still
+    // in playback mode, just experiencing a temporary silence). The
+    // user's gesture means "cancel the auto-resume, pause for real":
+    //   * stop the wrap timer
+    //   * leave the player paused at startMs (where it was seeked
+    //     to during wrap entry)
+    //   * cancel the depleting countdown
+    //   * keep the loop armed (a subsequent Play press will resume,
+    //     and the loop wraps as normal on the next endMs crossing)
+    // Use Stop if you want to fully disarm.
+    if (wrapPending_) {
+        cancelPendingWrap();
+        playButton_->setText(tr("Play"));
+        const auto pos = player_->position().count();
+        FLOG_DEBUG("ui.transport",
+                   "wrap-pause cancelled via=play-button at={} ms", pos);
+        return;
+    }
+
     // Transitioning to Play.
     auto pos = player_->position().count();
 
@@ -572,11 +619,14 @@ void MainWindow::onStop() {
     // becomes a no-op when its lambda checks armedLoopId_.
     const bool wasArmed = armedLoopId_.has_value();
     armedLoopId_.reset();
-    wrapPending_ = false;
+    cancelPendingWrap();
     if (wasArmed && projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(std::nullopt);
-        projectViewerDock_->cancelCountdown();
     }
+    // Stop rewinds to 0 — sync the wrap-detection tracker too so a
+    // subsequent Play won't see a stale previous-position from
+    // before the Stop.
+    previousPosMs_ = 0;
 
     FLOG_DEBUG("ui.transport", "stop rewind=0 disarmed={}", wasArmed);
 }
@@ -588,7 +638,22 @@ void MainWindow::onSeek(int positionMs) {
     // is distinct ("seek via waveform" vs "seek via slider"). Adding
     // a log here would either duplicate or lose source information.
     if (!player_) return;
+    // MEMO: issue #13 — a user-initiated seek during a wrap-pause
+    // cancels the auto-resume. The player stays paused at the new
+    // position; the user presses Play to resume. Loop arming is
+    // unchanged. Without this, a seek past endMs would race the
+    // resume timer and cause a double-countdown on the next tick.
+    if (wrapPending_) {
+        cancelPendingWrap();
+        playButton_->setText(tr("Play"));
+        FLOG_DEBUG("ui.transport",
+                   "wrap-pause cancelled via=seek at={} ms", positionMs);
+    }
     player_->seek(std::chrono::milliseconds{positionMs});
+    // Sync the previous-position tracker so the next updatePosition
+    // tick doesn't see a fake "natural crossing" of endMs from a
+    // user-initiated jump. See issue #13 + wrapShouldFire().
+    previousPosMs_ = positionMs;
 }
 
 void MainWindow::onTempoChanged(int percent) {
@@ -877,6 +942,49 @@ void MainWindow::onMarkerActivated(std::int64_t id) {
                "marker-activated id={} ms={} via=dock", id, ms);
 }
 
+bool MainWindow::wrapShouldFire(std::int64_t previousPosMs,
+                                std::int64_t currentPosMs,
+                                std::int64_t endMs) noexcept {
+    // First-tick guard: no previous position observed yet, so we
+    // can't tell whether the current position came from natural
+    // playback or from initial state. Refuse to wrap on the first
+    // tick — the next one will have a real `previousPosMs`.
+    if (previousPosMs < 0) return false;
+    // Natural forward crossing of endMs is the only thing that
+    // triggers a wrap. Both-before, both-after, and after→before
+    // are all no-ops.
+    return previousPosMs < endMs && currentPosMs >= endMs;
+}
+
+void MainWindow::enterWrapPauseForTest(std::int64_t loopId, int pauseMs) {
+    // MEMO: production wrap entry lives in updatePosition's wrap
+    // branch and depends on audio actually advancing position past
+    // endMs. Headless CI hosts can't reliably reach that state. This
+    // seam mirrors the production setup verbatim minus the seek (the
+    // caller is responsible for placing the player wherever they
+    // want before calling). Both MainWindow's armedLoopId_ and the
+    // dock's setArmedLoopId are set so the post-condition matches
+    // "user armed this loop, played past endMs, wrap-pause begun".
+    armedLoopId_      = loopId;
+    wrapPending_      = true;
+    wrapTargetLoopId_ = loopId;
+    if (projectViewerDock_) {
+        projectViewerDock_->setArmedLoopId(loopId);
+        projectViewerDock_->startCountdown(pauseMs);
+    }
+    if (wrapTimer_) wrapTimer_->start(pauseMs);
+}
+
+void MainWindow::cancelPendingWrap() {
+    // Idempotent — safe to call when there's no wrap pending. The
+    // timer's stop() is a no-op when the timer isn't active, and
+    // the dock's cancelCountdown() short-circuits when the
+    // countdown isn't running.
+    if (wrapTimer_) wrapTimer_->stop();
+    wrapPending_ = false;
+    if (projectViewerDock_) projectViewerDock_->cancelCountdown();
+}
+
 void MainWindow::onLoopActivated(std::int64_t id) {
     // "Jump and play" for loops — arm + seek to startMs + play.
     // The transport then wraps around back to startMs whenever the
@@ -887,13 +995,9 @@ void MainWindow::onLoopActivated(std::int64_t id) {
     const auto& loop = loopModel_->loops()[*idx];
 
     armedLoopId_ = id;
-    wrapPending_ = false;
+    cancelPendingWrap();
     if (projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(id);
-        // Cancel any leftover countdown from a previous loop's
-        // pause-between-repeats — switching to a new loop must
-        // not show stale ticks depleting from the old one.
-        projectViewerDock_->cancelCountdown();
     }
 
     onSeek(static_cast<int>(loop.startMs));
@@ -916,19 +1020,17 @@ void MainWindow::onLoopArmToggleRequested(std::int64_t id, bool armed) {
     if (armed) {
         if (!loopModel_->indexOf(id)) return;
         armedLoopId_ = id;
-        wrapPending_ = false;
+        cancelPendingWrap();
         if (projectViewerDock_) {
             projectViewerDock_->setArmedLoopId(id);
-            projectViewerDock_->cancelCountdown();
         }
         FLOG_DEBUG("ui.score", "loop-armed id={} via=checkbox", id);
     } else {
         if (armedLoopId_ != id) return;
         armedLoopId_.reset();
-        wrapPending_ = false;
+        cancelPendingWrap();
         if (projectViewerDock_) {
             projectViewerDock_->setArmedLoopId(std::nullopt);
-            projectViewerDock_->cancelCountdown();
         }
         FLOG_DEBUG("ui.score", "loop-disarmed id={} via=checkbox", id);
     }
@@ -944,10 +1046,9 @@ void MainWindow::onLoopModelChanged() {
     }
     const auto droppedId = *armedLoopId_;
     armedLoopId_.reset();
-    wrapPending_ = false;
+    cancelPendingWrap();
     if (projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(std::nullopt);
-        projectViewerDock_->cancelCountdown();
     }
     FLOG_DEBUG("ui.score", "loop-disarmed id={} reason=removed-from-model",
                droppedId);
@@ -1171,13 +1272,19 @@ void MainWindow::updatePosition() {
     // simpler than threading the loop region through the audio
     // callback. wrapPending_ blocks re-entry while a pause-between-
     // repeats single-shot timer is in flight.
+    //
+    // MEMO: only wraps on a NATURAL forward crossing (see
+    // wrapShouldFire). User-initiated seeks past endMs are honored
+    // as-is — they're "navigate away from the loop", not "skip the
+    // current iteration". See issue #13 for the asymmetric-seek
+    // bug this rule fixes.
     if (armedLoopId_.has_value() && !wrapPending_ && loopModel_
         && player_->state() == audio::TransportState::Playing)
     {
         const auto idx = loopModel_->indexOf(*armedLoopId_);
         if (idx) {
             const auto& loop = loopModel_->loops()[*idx];
-            if (pos.count() >= loop.endMs) {
+            if (wrapShouldFire(previousPosMs_, pos.count(), loop.endMs)) {
                 const auto loopId  = *armedLoopId_;
                 const auto startMs = loop.startMs;
                 const auto pauseMs = loop.pauseMs;
@@ -1190,42 +1297,44 @@ void MainWindow::updatePosition() {
                                "loop-wrap id={} from={} to={} pause=0",
                                loopId, pos.count(), startMs);
                 } else {
-                    wrapPending_ = true;
+                    wrapPending_       = true;
+                    wrapTargetLoopId_  = loopId;
                     player_->pause();
                     // Seek now so the visible position slides back
                     // to startMs immediately; the user sees the
                     // pause as silence at the loop's beginning, not
                     // dead air at the end.
                     player_->seek(std::chrono::milliseconds{startMs});
+                    // MEMO: deliberately DO NOT change the play
+                    // button label here, even though the player is
+                    // technically paused. During the wrap-pause
+                    // we're conceptually still in playback mode —
+                    // a temporary silence between repeats — so the
+                    // button stays "Pause". Clicking it during the
+                    // pause is the user's "cancel the auto-resume,
+                    // stay paused for real" gesture (handled in
+                    // onPlayPause). See issue #13.
                     FLOG_DEBUG("ui.transport",
                                "loop-wrap id={} from={} to={} pause={}",
                                loopId, pos.count(), startMs, pauseMs);
                     // Drive the dock's countdown widget in lockstep
-                    // with the pause-between-repeats window — the
-                    // widget runs its own internal QTimer at
-                    // pauseMs / 16 cadence, so its depletion ends
-                    // ≈ when QTimer::singleShot below resumes
-                    // playback. See issue #9.
+                    // with the pause-between-repeats window — see
+                    // issue #9.
                     if (projectViewerDock_) {
                         projectViewerDock_->startCountdown(pauseMs);
                     }
-                    QPointer<MainWindow> self(this);
-                    QTimer::singleShot(pauseMs, this,
-                        [self, loopId, startMs]() {
-                            if (!self) return;
-                            self->wrapPending_ = false;
-                            // The user may have disarmed during the
-                            // pause (Stop, Del, file-load); the
-                            // checks below cover all those exits.
-                            if (self->armedLoopId_ != loopId) return;
-                            if (!self->player_) return;
-                            self->player_->play();
-                            self->playButton_->setText(self->tr("Pause"));
-                            (void)startMs;
-                        });
+                    // Start the wrap timer. Stored as a member
+                    // (rather than QTimer::singleShot) so user
+                    // gestures during the pause can stop it via
+                    // cancelPendingWrap. The timer's timeout
+                    // handler is wired once in the ctor.
+                    wrapTimer_->start(pauseMs);
                 }
                 // Don't fall through to the auto-pause-at-end logic
                 // below — the loop is what governs the transport now.
+                // Update previousPosMs_ before returning so the next
+                // tick has a sane reference point.
+                previousPosMs_ = pos.count();
                 return;
             }
         }
@@ -1239,6 +1348,12 @@ void MainWindow::updatePosition() {
         playButton_->setText(tr("Play"));
         FLOG_DEBUG("ui.transport", "auto-pause at-end ms={}", pos.count());
     }
+
+    // Track the position so the wrap rule on the NEXT tick can
+    // distinguish a natural forward crossing of endMs (wrap fires)
+    // from a user-initiated seek past endMs (no wrap — user is
+    // navigating away). See issue #13 + wrapShouldFire.
+    previousPosMs_ = pos.count();
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
