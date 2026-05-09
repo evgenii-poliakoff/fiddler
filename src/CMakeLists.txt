@@ -6,6 +6,8 @@ add_executable(fiddler
     ui/MainWindow.h
     ui/ProjectViewerDock.cpp
     ui/ProjectViewerDock.h
+    ui/ScoreOverlayBase.cpp
+    ui/ScoreOverlayBase.h
     ui/StaffWidget.cpp
     ui/StaffWidget.h
     ui/WaveformWidget.cpp
