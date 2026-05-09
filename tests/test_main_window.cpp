@@ -1249,6 +1249,15 @@ TEST_CASE("MainWindow: arming an unknown loop ID is a quiet no-op",
 
 // MEMO: the test fixture WAV is 2 seconds long, so all ms values
 // in this block stay strictly inside [0, 2000].
+//
+// MEMO[CI]: the Play button is gated on `hasAudioOutput()` — on CI
+// hosts without an audio device the button stays disabled, and a
+// QTest::mouseClick on a disabled button is a silent no-op, which
+// would mask the seek branch we're trying to verify. We
+// `setEnabled(true)` before clicking so the test exercises the
+// onPlayPause path regardless of audio availability. The
+// production guard is purely a UX nicety; the slot runs the same
+// logic either way.
 
 TEST_CASE("MainWindow: Play with armed loop and pos before startMs seeks to startMs",
           "[main-window][gui][integration][loops][play-armed]") {
@@ -1268,6 +1277,7 @@ TEST_CASE("MainWindow: Play with armed loop and pos before startMs seeks to star
     emit posSlider->sliderMoved(300);
     REQUIRE(loaded.window->player().position().count() == 300);
 
+    playBtn->setEnabled(true);
     QTest::mouseClick(playBtn, Qt::LeftButton);
 
     // Player now sits at startMs (or up to ~50ms past on hosts
@@ -1294,6 +1304,7 @@ TEST_CASE("MainWindow: Play with armed loop and pos inside the loop preserves po
     posSlider->setValue(1000);
     emit posSlider->sliderMoved(1000);
 
+    playBtn->setEnabled(true);
     QTest::mouseClick(playBtn, Qt::LeftButton);
 
     const auto pos = loaded.window->player().position().count();
@@ -1315,6 +1326,7 @@ TEST_CASE("MainWindow: Play with armed loop and pos past endMs seeks to startMs"
     posSlider->setValue(1500);
     emit posSlider->sliderMoved(1500);
 
+    playBtn->setEnabled(true);
     QTest::mouseClick(playBtn, Qt::LeftButton);
 
     const auto pos = loaded.window->player().position().count();
@@ -1523,6 +1535,7 @@ TEST_CASE("MainWindow: Play with no armed loop does not jump",
 
     posSlider->setValue(1500);
     emit posSlider->sliderMoved(1500);
+    playBtn->setEnabled(true);
     QTest::mouseClick(playBtn, Qt::LeftButton);
 
     const auto pos = window->player().position().count();
