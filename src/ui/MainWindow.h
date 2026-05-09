@@ -218,6 +218,15 @@ private slots:
     void onMarkerDeleteRequested (std::int64_t id);
     void onLoopDeleteRequested   (std::int64_t id);
 
+    // Drag-to-nudge requests from the score widgets (issue #11).
+    // Fired per mouse-move while the drag is in flight; we just
+    // forward to the model. Logging happens on the *Committed slots
+    // below — per-move logs would flood the event log.
+    void onMarkerDragRequested(std::int64_t id, std::int64_t newMs);
+    void onLoopDragRequested  (std::int64_t id,
+                               std::int64_t newStartMs,
+                               std::int64_t newEndMs);
+
     // The window-level 'Del' shortcut: removes the currently-selected
     // artifact (barline OR marker) regardless of which child widget
     // has focus. Selection is mutually exclusive between the two

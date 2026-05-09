@@ -70,6 +70,7 @@ private:
     void paintLoops(QPainter& painter)         const;
     void paintBarlines(QPainter& painter)      const;
     void paintMarkers(QPainter& painter)       const;
+    void paintSelectedLoopEdges(QPainter& painter) const;
     void paintSecondaryAnchor(QPainter& painter) const;
     void paintCursor(QPainter& painter)        const;
 

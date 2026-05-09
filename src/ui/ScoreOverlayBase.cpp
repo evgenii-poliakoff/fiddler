@@ -4,8 +4,12 @@
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 
+#include <QApplication>
 #include <QKeyEvent>
 #include <QMouseEvent>
+
+#include <algorithm>
+#include <cstdlib>
 
 namespace fiddler::ui {
 
@@ -15,6 +19,16 @@ namespace {
 // hit test for barlines and markers. Same value the widgets used
 // before the refactor (#12) so user feel is unchanged.
 constexpr int kHitTolerancePx = 5;
+
+// Loop-edge hit-test tolerance — slightly larger than the marker /
+// barline tolerance because edges are 1-px lines (not flagged ticks)
+// and benefit from a more generous catch radius. Issue #11.
+constexpr int kEdgeTolerancePx = 6;
+
+// Snap-to-anchor tolerance for loop-edge dragging — same value as
+// the edge hit radius so the affordances match: if you can grab the
+// edge from N px, you can also park it on an anchor from N px.
+constexpr int kSnapTolerancePx = 6;
 
 } // namespace
 
@@ -241,9 +255,22 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         (event->modifiers() & Qt::ControlModifier) != 0;
     const auto tolMs = pixelsToMs(kHitTolerancePx);
 
-    // MEMO: hit-test priority — markers FIRST (labelled and visually
-    // atop barlines, so a click on a flag should select the marker),
-    // then barlines, then plain seek.
+    // MEMO: hit-test priority — by default markers FIRST (labelled
+    // and visually atop barlines, so a click on a flag should select
+    // the marker), then barlines, then loop edges, then plain seek.
+    //
+    // Exception (#11): when a loop is currently SELECTED, that
+    // loop's edges take priority over markers / barlines that sit
+    // at the same x. Reason: a loop created from markers has its
+    // edges pinned to those markers' x-coordinates, so without this
+    // rule the user could never drag the edges to fine-tune the
+    // loop — every press would hit the anchor marker first. The
+    // selection is effectively "edit mode" for that loop. To drag
+    // a coincident marker, the user clicks the marker in the dock
+    // first (which switches selection via the cross-kind mutex).
+    // Paint order in WaveformWidget / StaffWidget mirrors this so
+    // the selected loop's edges visually sit on top of the marker
+    // tick — see "Drag-to-nudge" in docs/architecture.md.
 
     // MEMO: Ctrl+click semantics — "add as second anchor for loop
     // creation". The current primary's ms is captured into the
@@ -261,6 +288,39 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         }
     };
 
+    // 0. Selected loop's edges win first (see exception above).
+    if (selectedLoopId_.has_value() && loopModel_) {
+        const auto idx = loopModel_->indexOf(*selectedLoopId_);
+        if (idx) {
+            const auto& loop = loopModel_->loops()[*idx];
+            const int xStart = msToX(loop.startMs);
+            const int xEnd   = msToX(loop.endMs);
+            const int dStart = std::abs(x - xStart);
+            const int dEnd   = std::abs(x - xEnd);
+            const bool startCloser = (dStart <= dEnd);
+            const int  dBest = startCloser ? dStart : dEnd;
+            if (dBest <= kEdgeTolerancePx) {
+                prepareClickStateChange();
+                // Already selected — no setSelectedLoopId call needed
+                // (would be a no-op anyway). But the call would also
+                // reset secondary-anchor logic via mutual exclusion;
+                // prepareClickStateChange() above has already done that.
+                if (!ctrlHeld) {
+                    dragKind_     = startCloser
+                                    ? DragKind::LoopStart
+                                    : DragKind::LoopEnd;
+                    dragId_       = loop.id;
+                    dragPressPos_ = event->pos();
+                    dragActive_   = false;
+                    dragOriginalMs_ = startCloser
+                                      ? loop.startMs : loop.endMs;
+                }
+                event->accept();
+                return;
+            }
+        }
+    }
+
     // 1. Marker hit?
     if (markerModel_ && markerModel_->size() > 0 && tolMs >= 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
@@ -270,6 +330,19 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
                 setSelectedMarkerId(*markerHit);
                 emit seekRequested(
                     markerModel_->markers()[*idx].sourceMs);
+                // Drag candidate (#11): plain (non-Ctrl) press on a
+                // marker tick arms the drag state machine. If the
+                // user releases without crossing the threshold this
+                // stays a click; if they drag past it, mouseMove
+                // takes over.
+                if (!ctrlHeld) {
+                    dragKind_       = DragKind::Marker;
+                    dragId_         = *markerHit;
+                    dragPressPos_   = event->pos();
+                    dragActive_     = false;
+                    dragOriginalMs_ =
+                        markerModel_->markers()[*idx].sourceMs;
+                }
                 event->accept();
                 return;
             }
@@ -282,14 +355,56 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
             prepareClickStateChange();
             setSelectedBarline(*barHit);
             emit seekRequested(barlineModel_->barlines()[*barHit]);
+            // No drag candidate for barlines — issue #11 explicitly
+            // defers barline drag to step 6 when the staff widget
+            // grows note content.
             event->accept();
             return;
         }
     }
 
-    // 3. No artifact hit. Ctrl+click on empty space is a no-op so
+    // 3. Loop edge hit? (issue #11) Markers + barlines win first by
+    // priority — a marker sitting at a loop's startMs should be the
+    // hit target, not the edge. Only check loop edges if neither
+    // anchor kind matched.
+    if (const auto edgeHit = hitLoopEdge(x)) {
+        prepareClickStateChange();
+        setSelectedLoopId(edgeHit->id);
+        // Loop-edge selection deliberately does NOT seek — the user
+        // is editing region geometry, not navigating playback.
+        // Loops never had a hit-test before this PR, so there's no
+        // prior behaviour to preserve here.
+        if (!ctrlHeld && loopModel_) {
+            const auto idx = loopModel_->indexOf(edgeHit->id);
+            if (idx) {
+                const auto& loop = loopModel_->loops()[*idx];
+                dragKind_     = edgeHit->isStart
+                                ? DragKind::LoopStart
+                                : DragKind::LoopEnd;
+                dragId_       = edgeHit->id;
+                dragPressPos_ = event->pos();
+                dragActive_   = false;
+                dragOriginalMs_ = edgeHit->isStart
+                                  ? loop.startMs : loop.endMs;
+            }
+        }
+        event->accept();
+        return;
+    }
+
+    // 4. No artifact hit. Ctrl+click on empty space is a no-op so
     // the user can't accidentally lose their second anchor by
-    // missing a tick. Plain click clears everything and seeks.
+    // missing a tick. Plain click clears barline + marker
+    // selections (and the secondary anchor) and seeks.
+    //
+    // MEMO: empty-space click deliberately does NOT clear the loop
+    // selection. Loops are usually being edited via the dock or
+    // via edge-drag, and the user might want to scrub-seek with
+    // the loop still selected so they can come back and nudge an
+    // edge. To clear a loop selection from the waveform, click on
+    // a different artifact (the cross-kind mutex switches it) or
+    // clear from the dock. See the smoke test in #11 — the user
+    // confirmed this preservation is the intended workflow.
     if (ctrlHeld) {
         event->accept();
         return;
@@ -309,6 +424,182 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     }
     emit seekRequested(ms);
     event->accept();
+}
+
+void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
+    // Mouse-tracking is off (the default) so this only fires while
+    // a button is pressed. We only react when a drag candidate was
+    // armed during mousePressEvent — otherwise pass through.
+    if (dragKind_ == DragKind::None || !hasContent()) {
+        QWidget::mouseMoveEvent(event);
+        return;
+    }
+
+    // Click-vs-drag disambiguation (#11). Until the cursor leaves
+    // the start-drag radius around the press point, treat the press
+    // as a still-undecided click. Once it crosses, we commit to drag
+    // mode for the rest of this gesture.
+    if (!dragActive_) {
+        const int delta =
+            (event->pos() - dragPressPos_).manhattanLength();
+        if (delta < QApplication::startDragDistance()) {
+            QWidget::mouseMoveEvent(event);
+            return;
+        }
+        dragActive_ = true;
+    }
+
+    const auto cursorMs = xToMs(event->pos().x());
+
+    // Defensive: the dragged artifact may have been deleted
+    // (Ctrl+Z, Del on a sibling widget, model rebuild). If so the
+    // drag has nothing to commit to — drop quietly.
+    if (dragKind_ == DragKind::Marker) {
+        if (!markerModel_ || !markerModel_->indexOf(dragId_)) {
+            dragKind_ = DragKind::None;
+            event->accept();
+            return;
+        }
+        emit markerDragRequested(dragId_, cursorMs);
+        // Cursor follows the marker live so the user visually
+        // tracks where the marker is going.
+        emit seekRequested(cursorMs);
+        event->accept();
+        return;
+    }
+
+    // Loop edge drag — pull the loop's CURRENT range from the
+    // model so the partner edge stays put even after a previous
+    // mouse-move in this gesture mutated the loop.
+    if (!loopModel_) { event->accept(); return; }
+    const auto idx = loopModel_->indexOf(dragId_);
+    if (!idx) {
+        dragKind_ = DragKind::None;
+        event->accept();
+        return;
+    }
+    const auto& loop = loopModel_->loops()[*idx];
+
+    // Snap to nearby barline / marker before clamping. The snap
+    // result already reflects the user's intent ("magnet to this
+    // anchor"), so the clamp below operates on the post-snap value.
+    auto snappedMs = cursorMs;
+    if (const auto snap = findSnapAnchor(cursorMs)) {
+        snappedMs = *snap;
+    }
+
+    if (dragKind_ == DragKind::LoopStart) {
+        // Clamp newStart strictly less than current endMs. Refusing
+        // to commit (rather than pinning to endMs - 1) keeps the
+        // model's `start < end` invariant clean and avoids a 1-ms
+        // sliver loop that the user almost certainly didn't want.
+        if (snappedMs >= loop.endMs) {
+            event->accept();
+            return;
+        }
+        emit loopDragRequested(dragId_, snappedMs, loop.endMs);
+    } else { // LoopEnd
+        if (snappedMs <= loop.startMs) {
+            event->accept();
+            return;
+        }
+        emit loopDragRequested(dragId_, loop.startMs, snappedMs);
+    }
+    event->accept();
+}
+
+void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton
+        || dragKind_ == DragKind::None)
+    {
+        QWidget::mouseReleaseEvent(event);
+        return;
+    }
+
+    if (dragActive_) {
+        // Read the artifact's final ms from the model — that's the
+        // post-snap, post-clamp value (every successful move emitted
+        // a request that MainWindow committed). `dragOriginalMs_`
+        // gives us the from-side of the from→to log line.
+        if (dragKind_ == DragKind::Marker
+            && markerModel_)
+        {
+            if (const auto idx = markerModel_->indexOf(dragId_)) {
+                const auto toMs =
+                    markerModel_->markers()[*idx].sourceMs;
+                emit markerDragCommitted(dragId_, dragOriginalMs_, toMs);
+            }
+        } else if (loopModel_) {
+            if (const auto idx = loopModel_->indexOf(dragId_)) {
+                const auto& loop = loopModel_->loops()[*idx];
+                const bool isStart = (dragKind_ == DragKind::LoopStart);
+                const auto toMs = isStart ? loop.startMs : loop.endMs;
+                emit loopDragCommitted(dragId_, isStart,
+                                       dragOriginalMs_, toMs);
+            }
+        }
+    }
+
+    dragKind_       = DragKind::None;
+    dragActive_     = false;
+    dragId_         = 0;
+    dragOriginalMs_ = 0;
+    event->accept();
+}
+
+std::optional<ScoreOverlayBase::LoopEdgeHit>
+ScoreOverlayBase::hitLoopEdge(int x) const noexcept {
+    if (!loopModel_) return std::nullopt;
+    int bestDistPx = kEdgeTolerancePx + 1;
+    LoopEdgeHit best{};
+    bool found = false;
+    for (const auto& l : loopModel_->loops()) {
+        const int xStart = msToX(l.startMs);
+        const int xEnd   = msToX(l.endMs);
+        const int dStart = std::abs(x - xStart);
+        const int dEnd   = std::abs(x - xEnd);
+        if (dStart <= kEdgeTolerancePx && dStart < bestDistPx) {
+            bestDistPx = dStart;
+            best = {l.id, /*isStart=*/true};
+            found = true;
+        }
+        if (dEnd <= kEdgeTolerancePx && dEnd < bestDistPx) {
+            bestDistPx = dEnd;
+            best = {l.id, /*isStart=*/false};
+            found = true;
+        }
+    }
+    return found ? std::optional<LoopEdgeHit>(best) : std::nullopt;
+}
+
+std::optional<std::int64_t>
+ScoreOverlayBase::findSnapAnchor(std::int64_t cursorMs) const noexcept {
+    const auto tolMs = pixelsToMs(kSnapTolerancePx);
+    if (tolMs <= 0) return std::nullopt;
+
+    std::int64_t bestMs = 0;
+    std::int64_t bestDist = tolMs + 1;
+    if (barlineModel_) {
+        for (const auto bMs : barlineModel_->barlines()) {
+            const auto dist = std::abs(bMs - cursorMs);
+            if (dist <= tolMs && dist < bestDist) {
+                bestMs = bMs;
+                bestDist = dist;
+            }
+        }
+    }
+    if (markerModel_) {
+        for (const auto& m : markerModel_->markers()) {
+            const auto dist = std::abs(m.sourceMs - cursorMs);
+            if (dist <= tolMs && dist < bestDist) {
+                bestMs = m.sourceMs;
+                bestDist = dist;
+            }
+        }
+    }
+    return bestDist <= tolMs
+        ? std::optional<std::int64_t>(bestMs)
+        : std::nullopt;
 }
 
 void ScoreOverlayBase::keyPressEvent(QKeyEvent* event) {

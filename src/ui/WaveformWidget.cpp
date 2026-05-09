@@ -298,6 +298,30 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
         }
     }
 
+    // Selected loop's edges — re-drawn ON TOP of barlines and
+    // markers so the user can see (and drag) the edge even when a
+    // marker tick or barline sits at exactly the same x. Mirrors
+    // the hit-test rule in ScoreOverlayBase::mousePressEvent: a
+    // loop in "edit mode" wins z-order both for picking and for
+    // painting. Issue #11.
+    if (lpModel && selLoop.has_value()) {
+        if (const auto idx = lpModel->indexOf(*selLoop)) {
+            const auto& sel = lpModel->loops()[*idx];
+            const int xStart = msToX(sel.startMs);
+            const int xEnd   = msToX(sel.endMs);
+            const int xLeft  = std::max(0, xStart);
+            const int xRight = std::min(width(), xEnd);
+            const QColor edgeCol(180, 240, 200, 255);
+            painter.setPen(QPen(edgeCol, 2.0));
+            if (xStart == xLeft) {
+                painter.drawLine(xLeft, 0, xLeft, height());
+            }
+            if (xEnd == xRight) {
+                painter.drawLine(xRight - 1, 0, xRight - 1, height());
+            }
+        }
+    }
+
     // Playhead cursor — drawn before the secondary anchor tick so
     // the dashed indicator can pierce through it when both share an
     // x (which happens immediately after a tap-place because the

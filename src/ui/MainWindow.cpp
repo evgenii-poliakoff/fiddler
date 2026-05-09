@@ -318,6 +318,26 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(waveform_, &WaveformWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    connect(waveform_, &WaveformWidget::markerDragRequested,
+            this, &MainWindow::onMarkerDragRequested);
+    connect(waveform_, &WaveformWidget::loopDragRequested,
+            this, &MainWindow::onLoopDragRequested);
+    connect(waveform_, &WaveformWidget::markerDragCommitted,
+            this, [this](std::int64_t id,
+                         std::int64_t fromMs,
+                         std::int64_t toMs) {
+                FLOG_DEBUG("ui.score",
+                    "marker-drag id={} from={} to={} via=waveform",
+                    id, fromMs, toMs);
+            });
+    connect(waveform_, &WaveformWidget::loopDragCommitted,
+            this, [this](std::int64_t id, bool isStart,
+                         std::int64_t fromMs,
+                         std::int64_t toMs) {
+                FLOG_DEBUG("ui.score",
+                    "loop-drag id={} edge={} from={} to={} via=waveform",
+                    id, isStart ? "start" : "end", fromMs, toMs);
+            });
     layout->addWidget(waveform_, /*stretch=*/1);
 
     // Staff: the lower view. Fixed-ish height (its sizeHint), shares
@@ -345,6 +365,26 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(staff_, &StaffWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    connect(staff_, &StaffWidget::markerDragRequested,
+            this, &MainWindow::onMarkerDragRequested);
+    connect(staff_, &StaffWidget::loopDragRequested,
+            this, &MainWindow::onLoopDragRequested);
+    connect(staff_, &StaffWidget::markerDragCommitted,
+            this, [this](std::int64_t id,
+                         std::int64_t fromMs,
+                         std::int64_t toMs) {
+                FLOG_DEBUG("ui.score",
+                    "marker-drag id={} from={} to={} via=staff",
+                    id, fromMs, toMs);
+            });
+    connect(staff_, &StaffWidget::loopDragCommitted,
+            this, [this](std::int64_t id, bool isStart,
+                         std::int64_t fromMs,
+                         std::int64_t toMs) {
+                FLOG_DEBUG("ui.score",
+                    "loop-drag id={} edge={} from={} to={} via=staff",
+                    id, isStart ? "start" : "end", fromMs, toMs);
+            });
     layout->addWidget(staff_);
 
     positionSlider_ = new QSlider(Qt::Horizontal, central);
@@ -1332,6 +1372,31 @@ void MainWindow::onLoopDeleteRequested(std::int64_t id) {
     loopModel_->remove(id);
     FLOG_DEBUG("ui.score", "delete-loop id={} via=dock-key size={}",
                id, loopModel_->size());
+}
+
+void MainWindow::onMarkerDragRequested(std::int64_t id,
+                                       std::int64_t newMs) {
+    // Live drag (issue #11). Fires per mouse-move while the user is
+    // dragging a marker tick on either score widget. We just push
+    // the new position into the model — every connected view +
+    // the dock's property page repaints automatically through the
+    // model's changed() signal. No log here: the per-move rate
+    // would flood the event log; the widget emits a separate
+    // *DragCommitted signal on release that we DO log.
+    if (!markerModel_) return;
+    markerModel_->setPosition(id, newMs);
+}
+
+void MainWindow::onLoopDragRequested(std::int64_t id,
+                                     std::int64_t newStartMs,
+                                     std::int64_t newEndMs) {
+    // Live drag for a loop boundary. setRange validates the
+    // start < end invariant and rejects invalid ranges; the widget
+    // already filters those out before emitting, but the model is
+    // the authoritative gate. No log per move (see
+    // onMarkerDragRequested).
+    if (!loopModel_) return;
+    loopModel_->setRange(id, newStartMs, newEndMs);
 }
 
 void MainWindow::onDeleteSelectedArtifact() {

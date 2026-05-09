@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <QPoint>
 #include <QWidget>
 
 #include <cstddef>
@@ -108,9 +109,38 @@ signals:
     void barlineDeleteRequested (std::size_t index);
     void markerDeleteRequested  (std::int64_t id);
 
+    // Live drag updates (issue #11). Fired on every mouse-move past
+    // the click-vs-drag threshold so the dock + sibling widgets see
+    // the artifact track the cursor in real time. MainWindow turns
+    // these into MarkerModel::setPosition / LoopModel::setRange
+    // calls — the widget holds only `shared_ptr<const>` handles, so
+    // model writes have to round-trip through the parent.
+    void markerDragRequested(std::int64_t id, std::int64_t newMs);
+    void loopDragRequested  (std::int64_t id,
+                             std::int64_t newStartMs,
+                             std::int64_t newEndMs);
+
+    // Fired ONCE on mouse release after a drag has actually committed
+    // (i.e. the threshold was crossed). MainWindow logs this; the
+    // intermediate per-move signals stay quiet to avoid log flooding.
+    // `fromMs` is the artifact's position at press; `toMs` is the
+    // final landed value (post-snap, post-clamp).
+    void markerDragCommitted(std::int64_t id,
+                             std::int64_t fromMs,
+                             std::int64_t toMs);
+    // For loops the "edge" boolean disambiguates start vs end so the
+    // log line and any future replay machinery can tell which side
+    // moved.
+    void loopDragCommitted(std::int64_t id,
+                           bool        isStartEdge,
+                           std::int64_t fromMs,
+                           std::int64_t toMs);
+
 protected:
-    void mousePressEvent(QMouseEvent* event) override;
-    void keyPressEvent  (QKeyEvent*   event) override;
+    void mousePressEvent  (QMouseEvent* event) override;
+    void mouseMoveEvent   (QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void keyPressEvent    (QKeyEvent*   event) override;
 
     // Subclass declares "I have something loaded; clicks should be
     // processed". Without content the base treats clicks as
@@ -128,6 +158,33 @@ private slots:
     void onLoopModelChanged();
 
 private:
+    // Drag state (issue #11). What was hit on press, where the press
+    // landed (for the click-vs-drag threshold), and whether we've
+    // crossed it yet. `dragOriginalMs_` snapshots the artifact's
+    // position at press so the mouseRelease commit signal can report
+    // a meaningful from→to pair.
+    enum class DragKind { None, Marker, LoopStart, LoopEnd };
+    DragKind     dragKind_       = DragKind::None;
+    std::int64_t dragId_         = 0;
+    QPoint       dragPressPos_;
+    bool         dragActive_     = false;
+    std::int64_t dragOriginalMs_ = 0;
+
+    // Hit-test the loop band edges at pixel x. Returns the loop id
+    // and which edge (start/end) was hit, within `kEdgeTolerancePx`.
+    // Used by mousePressEvent (after the marker / barline checks
+    // since markers visually sit atop barlines and edges).
+    struct LoopEdgeHit { std::int64_t id; bool isStart; };
+    [[nodiscard]] std::optional<LoopEdgeHit>
+        hitLoopEdge(int x) const noexcept;
+
+    // Find the nearest barline OR marker to `cursorMs` within
+    // `pixelsToMs(kSnapTolerancePx)`. Used by loop-edge drag to
+    // implement live snap-to-anchor (the magnet feel from DAWs).
+    // Returns the snapped ms, or nullopt if no anchor is in range.
+    [[nodiscard]] std::optional<std::int64_t>
+        findSnapAnchor(std::int64_t cursorMs) const noexcept;
+
     std::shared_ptr<const score::BarlineModel> barlineModel_;
     std::shared_ptr<const score::MarkerModel>  markerModel_;
     std::shared_ptr<const score::LoopModel>    loopModel_;
