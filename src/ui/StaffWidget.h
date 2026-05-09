@@ -1,17 +1,22 @@
 // StaffWidget — empty 5-line music staff with the current time
-// signature, the user-placed barlines, and a playhead cursor.
+// signature, the user-placed barlines, marker overlays, loop
+// bands, secondary anchor, and a playhead cursor.
+//
+// MEMO[refactor]: the artifact-related state, mouse hit-testing,
+// and key navigation moved to `ScoreOverlayBase` in #12. StaffWidget
+// now contributes:
+//
+//   * `durationMs_` (the source-time duration; the staff has no
+//     waveform overview to read it from)
+//   * coord transforms based on `durationMs_`
+//   * the staff-specific paint (5 lines, time-sig digits, tune-type
+//     label) plus the artifact-overlay paint shared in shape but
+//     not in details with WaveformWidget
 //
 // The widget does not know about Player, the audio engine, or any
-// audio decoding. It receives:
-//
-//   * the source-time duration of the file (via setDurationMs),
-//   * the shared BarlineModel (via setBarlineModel),
-//   * the current playback position in source-time (via setPositionMs),
-//
-// and emits seekRequested(ms) on left-click. MainWindow wires those
-// signals back to Player. This is the same shape as WaveformWidget,
-// so the two views can sit next to each other and stay in sync via
-// MainWindow's plumbing.
+// audio decoding. It receives the duration via setDurationMs and
+// the playback position via setPositionMs (inherited from base),
+// and emits seekRequested(ms) (also inherited) on left-click.
 //
 // Why source-time-proportional bar widths (and not equal-width bars
 // like real engraving): for an empty staff with no notes yet, lining
@@ -23,27 +28,16 @@
 
 #pragma once
 
-#include <QWidget>
+#include "ui/ScoreOverlayBase.h"
 
-#include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <optional>
 
-class QKeyEvent;
-class QMouseEvent;
 class QPaintEvent;
 class QPainter;
 
-namespace fiddler::score {
-class BarlineModel;
-class LoopModel;
-class MarkerModel;
-}
-
 namespace fiddler::ui {
 
-class StaffWidget : public QWidget {
+class StaffWidget : public ScoreOverlayBase {
     Q_OBJECT
 public:
     explicit StaffWidget(QWidget* parent = nullptr);
@@ -55,98 +49,19 @@ public:
     void setDurationMs(std::int64_t ms);
     [[nodiscard]] std::int64_t durationMs() const noexcept { return durationMs_; }
 
-    // Attach (or detach with nullptr) a BarlineModel. The widget
-    // listens to the model's `changed()` signal and repaints; if the
-    // currently selected entry is removed, the selection is cleared
-    // automatically.
-    void setBarlineModel(std::shared_ptr<const score::BarlineModel> model);
-    [[nodiscard]] std::shared_ptr<const score::BarlineModel>
-        barlineModel() const noexcept { return barlineModel_; }
-
-    // Marker overlay — same shape as WaveformWidget's. Selection is
-    // by stable ID (because setPosition can reorder), and is mutually
-    // exclusive with barline selection (the project viewer needs a
-    // single "selected artifact" concept).
-    void setMarkerModel(std::shared_ptr<const score::MarkerModel> model);
-    [[nodiscard]] std::shared_ptr<const score::MarkerModel>
-        markerModel() const noexcept { return markerModel_; }
-
-    // Loop overlay — same dock-driven selection model as WaveformWidget.
-    // The widget renders bands; selection comes from the project
-    // viewer dock. MEMO: loop selection is mutually exclusive with
-    // barline + marker selection (single "selected artifact").
-    void setLoopModel(std::shared_ptr<const score::LoopModel> model);
-    [[nodiscard]] std::shared_ptr<const score::LoopModel>
-        loopModel() const noexcept { return loopModel_; }
-
-    [[nodiscard]] std::int64_t positionMs() const noexcept { return positionMs_; }
-    [[nodiscard]] std::optional<std::size_t>
-        selectedBarline() const noexcept { return selectedBarline_; }
-    [[nodiscard]] std::optional<std::int64_t>
-        selectedMarkerId() const noexcept { return selectedMarkerId_; }
-    [[nodiscard]] std::optional<std::int64_t>
-        selectedLoopId() const noexcept { return selectedLoopId_; }
-
-    // See WaveformWidget for the full secondary-anchor rationale —
-    // the staff mirrors the same shape (Ctrl+left-click promotes the
-    // current primary's ms to a secondary anchor; dashed tick at the
-    // captured ms; cleared by plain click or Esc).
-    [[nodiscard]] std::optional<std::int64_t>
-        secondaryAnchorMs() const noexcept { return secondaryAnchorMs_; }
-    [[nodiscard]] std::optional<std::int64_t>
-        primaryAnchorMs() const noexcept;
-
-    // Coordinate transforms — public so other code can map between
-    // pixel columns and source-time milliseconds without
-    // reimplementing the math. xToMs() returns 0 when no duration
-    // is set; msToX() returns 0 in the same case.
-    [[nodiscard]] std::int64_t xToMs(int x) const noexcept;
-    [[nodiscard]] int          msToX(std::int64_t ms) const noexcept;
+    // Coord transforms — overrides ScoreOverlayBase's pure virtuals.
+    // Both return 0 when no duration is set.
+    [[nodiscard]] std::int64_t xToMs(int x) const noexcept override;
+    [[nodiscard]] int          msToX(std::int64_t ms) const noexcept override;
 
     [[nodiscard]] QSize sizeHint() const override;
     [[nodiscard]] QSize minimumSizeHint() const override;
 
-public slots:
-    void setPositionMs(std::int64_t ms);
-    // Programmatic selection setters. MainWindow uses these to keep
-    // the waveform and staff (and dock) showing the same selected
-    // artifact. MEMO: setting one kind clears the other (mutual
-    // exclusion).
-    void setSelectedBarline(std::optional<std::size_t> index);
-    void setSelectedMarkerId(std::optional<std::int64_t> id);
-    void setSelectedLoopId  (std::optional<std::int64_t> id);
-    void setSecondaryAnchorMs(std::optional<std::int64_t> ms);
-
-signals:
-    // Fires on left-click. The argument is the source-time the user
-    // clicked (or the exact ms of a clicked-on artifact). MainWindow
-    // wires this to Player::seek().
-    void seekRequested(std::int64_t ms);
-
-    // Selection state changes — by click, arrow-key, Esc, or model
-    // invalidation. MainWindow mirrors the value to siblings.
-    void barlineSelectionChanged(std::optional<std::size_t> index);
-    void markerSelectionChanged (std::optional<std::int64_t> id);
-    // Loop-selection signal — emitted only when the widget's loop
-    // selection clears as a side effect of mutual exclusion or model
-    // invalidation. The widget never originates loop selection.
-    void loopSelectionChanged   (std::optional<std::int64_t> id);
-    void secondaryAnchorChanged (std::optional<std::int64_t> ms);
-
-    // User pressed Del while an artifact was selected.
-    void barlineDeleteRequested(std::size_t index);
-    void markerDeleteRequested (std::int64_t id);
-
 protected:
-    void paintEvent(QPaintEvent* event)        override;
-    void mousePressEvent(QMouseEvent* event)   override;
-    void keyPressEvent(QKeyEvent* event)       override;
+    void paintEvent(QPaintEvent* event) override;
+    [[nodiscard]] bool hasContent() const noexcept override;
 
 private:
-    void onBarlineModelChanged();
-    void onMarkerModelChanged();
-    void onLoopModelChanged();
-
     // paintEvent's work is split into one helper per visual concern.
     // Each helper assumes `painter` is already targeting this widget
     // and the background has been filled.
@@ -162,15 +77,7 @@ private:
     [[nodiscard]] int staffTopY()    const noexcept;
     [[nodiscard]] int staffBottomY() const noexcept;
 
-    std::shared_ptr<const score::BarlineModel> barlineModel_;
-    std::shared_ptr<const score::MarkerModel>  markerModel_;
-    std::shared_ptr<const score::LoopModel>    loopModel_;
-    std::int64_t                               durationMs_      = 0;
-    std::int64_t                               positionMs_      = 0;
-    std::optional<std::size_t>                 selectedBarline_;
-    std::optional<std::int64_t>                selectedMarkerId_;
-    std::optional<std::int64_t>                selectedLoopId_;
-    std::optional<std::int64_t>                secondaryAnchorMs_;
+    std::int64_t durationMs_ = 0;
 };
 
 } // namespace fiddler::ui

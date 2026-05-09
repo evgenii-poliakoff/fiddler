@@ -69,6 +69,7 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/ui/LoopCountdownWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/ProjectViewerDock.cpp
+    ${CMAKE_SOURCE_DIR}/src/ui/ScoreOverlayBase.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/StaffWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/WaveformWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/util/Log.cpp
