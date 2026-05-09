@@ -20,6 +20,8 @@
 #include <QComboBox>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QAction>
+#include <QSettings>
 #include <QSlider>
 #include <QString>
 #include <QTest>
@@ -1541,4 +1543,117 @@ TEST_CASE("MainWindow: Play with no armed loop does not jump",
     const auto pos = window->player().position().count();
     REQUIRE(pos >= 1500);
     REQUIRE(pos <= 1550);
+}
+
+// ---------------------------------------------------------------------------
+// View menu + dock toggle + QSettings persistence (issue #7)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: View menu has a Project Viewer toggle action",
+          "[main-window][gui][integration][dock-toggle]") {
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* action =
+        window.findChild<QAction*>("toggleProjectViewerAction");
+    REQUIRE(action);
+    REQUIRE(action->isCheckable());
+    // Initially the dock is visible, so the action is checked.
+    REQUIRE(action->isChecked());
+    REQUIRE(action->shortcut() == QKeySequence(Qt::Key_F4));
+}
+
+TEST_CASE("MainWindow: triggering the toggle action hides + shows the dock",
+          "[main-window][gui][integration][dock-toggle]") {
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* dock   = window.findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* action =
+        window.findChild<QAction*>("toggleProjectViewerAction");
+    REQUIRE(dock);
+    REQUIRE(action);
+    REQUIRE(dock->isVisible());
+
+    action->trigger();
+    REQUIRE_FALSE(dock->isVisible());
+    REQUIRE_FALSE(action->isChecked());
+
+    action->trigger();
+    REQUIRE(dock->isVisible());
+    REQUIRE(action->isChecked());
+}
+
+TEST_CASE("MainWindow: F4 keyboard shortcut toggles the dock",
+          "[main-window][gui][integration][dock-toggle]") {
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* dock = window.findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock->isVisible());
+
+    QTest::keyClick(&window, Qt::Key_F4);
+    REQUIRE_FALSE(dock->isVisible());
+
+    QTest::keyClick(&window, Qt::Key_F4);
+    REQUIRE(dock->isVisible());
+}
+
+TEST_CASE("MainWindow: closing the dock then reopening the window keeps it hidden",
+          "[main-window][gui][integration][dock-toggle]") {
+    // MEMO: round-trip test for QSettings persistence. closeEvent
+    // calls saveLayout(); the next MainWindow's ctor calls
+    // restoreLayout(). With QStandardPaths test-mode enabled in
+    // qt_test_app's main(), this writes to a per-process scratch
+    // dir, never the user's real config. qtApp() clears
+    // QSettings every call so the test starts from a clean slate.
+    qtApp();
+    {
+        MainWindow first;
+        first.show();
+        (void)QTest::qWaitForWindowExposed(&first);
+        auto* dock = first.findChild<ProjectViewerDock*>("projectViewerDock");
+        REQUIRE(dock->isVisible());
+        dock->setVisible(false);
+        REQUIRE_FALSE(dock->isVisible());
+        // Trigger close — saveLayout writes the hidden state.
+        first.close();
+    }
+
+    // Skip the qtApp() clear here so we read the just-saved state.
+    MainWindow second;
+    second.show();
+    (void)QTest::qWaitForWindowExposed(&second);
+    auto* dock2 = second.findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock2);
+    REQUIRE_FALSE(dock2->isVisible());
+
+    // Cleanup: restore visible state for any later tests sharing
+    // the same process.
+    auto* action2 =
+        second.findChild<QAction*>("toggleProjectViewerAction");
+    action2->trigger();
+    second.close();
+}
+
+TEST_CASE("MainWindow: a fresh QSettings keeps the default visible layout",
+          "[main-window][gui][integration][dock-toggle]") {
+    // MEMO: with no persisted state, the dock should be visible
+    // (Qt's default for an attached dock added via addDockWidget).
+    // restoreLayout no-ops on empty values so this is the path
+    // every first-launch user takes.
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* dock = window.findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock);
+    REQUIRE(dock->isVisible());
 }

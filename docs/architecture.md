@@ -364,6 +364,16 @@ guard).
 under the tree's invisible root, plus one new page in the
 property `QStackedWidget`. No restructuring required.
 
+**Reopening the dock after closing.** The dock's title-bar X
+hides it; a `View → Project Viewer` menu entry (with **F4**
+shortcut) brings it back. The action is `dock->toggleViewAction()`
+— Qt wires its checkable state to the dock's visibility
+automatically. Layout (including dock visibility, floating
+state, position, and sizes) is persisted via QSettings: the
+`closeEvent` saves geometry + state, and the constructor
+restores them. The user's chosen layout therefore survives
+across launches.
+
 ### Combined `Ctrl+Z` across barlines + markers + loops
 
 The user's mental model is "Z = undo last placement", regardless

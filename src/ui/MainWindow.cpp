@@ -20,10 +20,13 @@
 #include <QKeySequence>
 #include <QLabel>
 #include <QMenuBar>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPointer>
 #include <QPushButton>
+#include <QSettings>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -110,6 +113,11 @@ MainWindow::MainWindow(QWidget* parent)
     setWindowTitle("Fiddler");
     buildMenus();
     buildCentralWidget();
+    // MEMO: restoreLayout AFTER buildCentralWidget so the dock
+    // exists before we ask Qt to push its persisted state into it.
+    // Qt's restoreState matches dock widgets by objectName — set
+    // in ProjectViewerDock's ctor.
+    restoreLayout();
     statusBar()->showMessage("Ready");
 
     // Tap-to-place: 'B' anywhere in the window adds a barline at the
@@ -350,6 +358,23 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopAnchorClearRequested,
             this, &MainWindow::onDockLoopAnchorClearRequested);
+
+    // ---- View menu ------------------------------------------------------
+    // MEMO: built here (not in buildMenus) because it needs the
+    // dock's toggleViewAction, and the dock isn't constructed until
+    // this method runs. F4 mirrors the Inspector-toggle shortcut
+    // used in DaVinci Resolve, Final Cut, and Qt Creator. Without
+    // this menu, closing the dock via its X button would leave the
+    // user with no way to reopen it short of restarting the app —
+    // see issue #7.
+    auto* viewMenu = menuBar()->addMenu(tr("&View"));
+    auto* toggleProjectViewer = projectViewerDock_->toggleViewAction();
+    toggleProjectViewer->setText(tr("&Project Viewer"));
+    toggleProjectViewer->setShortcut(QKeySequence(Qt::Key_F4));
+    // objectName lets integration tests reach the action without
+    // walking the menu by index.
+    toggleProjectViewer->setObjectName("toggleProjectViewerAction");
+    viewMenu->addAction(toggleProjectViewer);
 }
 
 void MainWindow::onOpenFile() {
@@ -1190,7 +1215,27 @@ void MainWindow::updatePosition() {
 
 void MainWindow::closeEvent(QCloseEvent* event) {
     FLOG_DEBUG("ui.file", "close");
+    saveLayout();
     QMainWindow::closeEvent(event);
+}
+
+void MainWindow::saveLayout() const {
+    // MEMO: keys are namespaced under "mainwindow/" so future
+    // panels / tool windows can share the same QSettings file
+    // without colliding. Geometry encodes window position +
+    // size; state encodes dock layout (visibility, floating,
+    // tabbed grouping, sizes).
+    QSettings settings;
+    settings.setValue("mainwindow/geometry", saveGeometry());
+    settings.setValue("mainwindow/state",    saveState());
+}
+
+void MainWindow::restoreLayout() {
+    QSettings settings;
+    const auto geometry = settings.value("mainwindow/geometry").toByteArray();
+    const auto state    = settings.value("mainwindow/state").toByteArray();
+    if (!geometry.isEmpty()) restoreGeometry(geometry);
+    if (!state.isEmpty())    restoreState(state);
 }
 
 } // namespace fiddler::ui
