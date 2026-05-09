@@ -451,7 +451,10 @@ bool MainWindow::loadFile(const QString& path) {
     // doing it here too.
     armedLoopId_.reset();
     wrapPending_ = false;
-    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
+    if (projectViewerDock_) {
+        projectViewerDock_->setArmedLoopId(std::nullopt);
+        projectViewerDock_->cancelCountdown();
+    }
 
     // Tell the staff how long this file is (so its msToX mapping
     // works). The waveform gets its duration via the WaveformOverview
@@ -572,6 +575,7 @@ void MainWindow::onStop() {
     wrapPending_ = false;
     if (wasArmed && projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(std::nullopt);
+        projectViewerDock_->cancelCountdown();
     }
 
     FLOG_DEBUG("ui.transport", "stop rewind=0 disarmed={}", wasArmed);
@@ -884,7 +888,13 @@ void MainWindow::onLoopActivated(std::int64_t id) {
 
     armedLoopId_ = id;
     wrapPending_ = false;
-    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(id);
+    if (projectViewerDock_) {
+        projectViewerDock_->setArmedLoopId(id);
+        // Cancel any leftover countdown from a previous loop's
+        // pause-between-repeats — switching to a new loop must
+        // not show stale ticks depleting from the old one.
+        projectViewerDock_->cancelCountdown();
+    }
 
     onSeek(static_cast<int>(loop.startMs));
     if (player_->state() != audio::TransportState::Playing) {
@@ -907,13 +917,19 @@ void MainWindow::onLoopArmToggleRequested(std::int64_t id, bool armed) {
         if (!loopModel_->indexOf(id)) return;
         armedLoopId_ = id;
         wrapPending_ = false;
-        if (projectViewerDock_) projectViewerDock_->setArmedLoopId(id);
+        if (projectViewerDock_) {
+            projectViewerDock_->setArmedLoopId(id);
+            projectViewerDock_->cancelCountdown();
+        }
         FLOG_DEBUG("ui.score", "loop-armed id={} via=checkbox", id);
     } else {
         if (armedLoopId_ != id) return;
         armedLoopId_.reset();
         wrapPending_ = false;
-        if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
+        if (projectViewerDock_) {
+            projectViewerDock_->setArmedLoopId(std::nullopt);
+            projectViewerDock_->cancelCountdown();
+        }
         FLOG_DEBUG("ui.score", "loop-disarmed id={} via=checkbox", id);
     }
 }
@@ -929,7 +945,10 @@ void MainWindow::onLoopModelChanged() {
     const auto droppedId = *armedLoopId_;
     armedLoopId_.reset();
     wrapPending_ = false;
-    if (projectViewerDock_) projectViewerDock_->setArmedLoopId(std::nullopt);
+    if (projectViewerDock_) {
+        projectViewerDock_->setArmedLoopId(std::nullopt);
+        projectViewerDock_->cancelCountdown();
+    }
     FLOG_DEBUG("ui.score", "loop-disarmed id={} reason=removed-from-model",
                droppedId);
 }
@@ -1181,6 +1200,15 @@ void MainWindow::updatePosition() {
                     FLOG_DEBUG("ui.transport",
                                "loop-wrap id={} from={} to={} pause={}",
                                loopId, pos.count(), startMs, pauseMs);
+                    // Drive the dock's countdown widget in lockstep
+                    // with the pause-between-repeats window — the
+                    // widget runs its own internal QTimer at
+                    // pauseMs / 16 cadence, so its depletion ends
+                    // ≈ when QTimer::singleShot below resumes
+                    // playback. See issue #9.
+                    if (projectViewerDock_) {
+                        projectViewerDock_->startCountdown(pauseMs);
+                    }
                     QPointer<MainWindow> self(this);
                     QTimer::singleShot(pauseMs, this,
                         [self, loopId, startMs]() {

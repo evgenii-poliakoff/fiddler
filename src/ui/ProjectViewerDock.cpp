@@ -2,6 +2,7 @@
 
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "ui/LoopCountdownWidget.h"
 
 #include <QCheckBox>
 #include <QFormLayout>
@@ -195,6 +196,17 @@ void ProjectViewerDock::buildUi() {
                 this, &ProjectViewerDock::onLoopArmedToggled);
         form->addRow(QString(), loopArmedCheck_);
 
+        // MEMO: countdown sits at the bottom of the loop property
+        // page so it's always associated with the loop being
+        // edited. setIdleVisible(true) means the ring shows full
+        // when no countdown is running — the user sees what the
+        // affordance is even before they hit Play. MainWindow
+        // calls startCountdown / cancelCountdown around the
+        // transport's pause-between-repeats window.
+        loopCountdown_ = new LoopCountdownWidget(page);
+        loopCountdown_->setObjectName("loopCountdown");
+        form->addRow(QString(), loopCountdown_);
+
         propertyStack_->insertWidget(kPageLoop, page);
     }
 
@@ -328,6 +340,14 @@ void ProjectViewerDock::setSelectedLoopId(
 
     refreshPropertyPage();
     emit loopSelectionChanged(selectedLoopId_);
+}
+
+void ProjectViewerDock::startCountdown(int totalMs) {
+    if (loopCountdown_) loopCountdown_->start(totalMs);
+}
+
+void ProjectViewerDock::cancelCountdown() {
+    if (loopCountdown_) loopCountdown_->cancel();
 }
 
 void ProjectViewerDock::setArmedLoopId(
@@ -497,7 +517,13 @@ void ProjectViewerDock::refreshPropertyPage() {
             loopEndBox_->setValue(static_cast<int>(l.endMs));
             loopStartBox_->setMaximum(static_cast<int>(l.endMs) - 1);
             loopPauseBox_->setValue(l.pauseMs);
-            loopArmedCheck_->setChecked(armedLoopId_ == l.id);
+            const bool isLoopArmed = (armedLoopId_ == l.id);
+            loopArmedCheck_->setChecked(isLoopArmed);
+            // Forward armed state to the countdown widget — drives
+            // the three-tier visual weight (disabled / ready /
+            // active) on the ring. See
+            // memory/feedback_progressive_visual_weight.md.
+            if (loopCountdown_) loopCountdown_->setArmed(isLoopArmed);
             updatingPropertyPage_ = false;
             propertyStack_->setCurrentIndex(kPageLoop);
             return;
