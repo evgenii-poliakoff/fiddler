@@ -1769,3 +1769,194 @@ TEST_CASE("MainWindow: deleting the armed loop cancels a stale countdown",
     REQUIRE(loaded.window->loopModel().empty());
     REQUIRE_FALSE(countdown->isCountingDown());
 }
+
+// ---------------------------------------------------------------------------
+// Wrap-pause cancellation by user gestures (issue #13)
+//
+// MEMO[refactor]: tests use the `enterWrapPauseForTest` test seam
+// because the production wrap entry depends on audio advancing
+// position past endMs, which doesn't happen reliably on headless
+// CI. The seam puts the window in exactly the same state the
+// production wrap path produces, minus the audio playback.
+// Each TEST_CASE pins one rule: which user gesture cancels the
+// wrap, and what state the window settles into.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: clicking play/pause button during wrap-pause cancels and stays paused",
+          "[main-window][gui][integration][loops][wrap-cancel]") {
+    // MEMO: load-bearing rule for #13 — during wrap-pause, the
+    // button label still reads "Pause" (transport is conceptually
+    // in playback mode, just temporarily silent). Click is
+    // interpreted as "cancel the auto-resume, pause for real".
+    // Loop stays armed.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(playBtn);
+    REQUIRE(countdown);
+
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*pauseMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+
+    // Click the play/pause button — Option-2 semantics: cancel
+    // the auto-resume, stay paused.
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+    REQUIRE(playBtn->text() == "Play");
+    REQUIRE(dock->armedLoopId() == loaded.loopId);
+}
+
+TEST_CASE("MainWindow: seeking during wrap-pause cancels and stays paused at new position",
+          "[main-window][gui][integration][loops][wrap-cancel]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    REQUIRE(posSlider);
+
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*pauseMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+
+    // Seek to outside the loop — the bug from #13 was a double
+    // countdown firing after this seek. With the cancel in place,
+    // the wrap is dropped cleanly.
+    posSlider->setValue(1700);
+    emit posSlider->sliderMoved(1700);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+    REQUIRE(playBtn->text() == "Play");
+    // Loop arming is preserved.
+    REQUIRE(dock->armedLoopId() == loaded.loopId);
+}
+
+TEST_CASE("MainWindow: seeking inside the loop during wrap-pause also cancels",
+          "[main-window][gui][integration][loops][wrap-cancel]") {
+    // MEMO: design choice — seek anywhere cancels, regardless of
+    // whether the destination is inside or outside the loop. Seek
+    // means "navigate"; if the user is mid-listen and wants to
+    // resume from the new position, they press Play (which will
+    // route through the seek-on-armed-Play branch if the new pos
+    // is outside the loop).
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*pauseMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+
+    posSlider->setValue(1000);   // INSIDE the loop range
+    emit posSlider->sliderMoved(1000);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: after canceling via Play button, pressing Play resumes from startMs",
+          "[main-window][gui][integration][loops][wrap-cancel]") {
+    // MEMO: end-to-end check that the user's recovery path works.
+    // First click "Pauses" (cancels wrap, stays paused, label flips
+    // to "Play"). Second click resumes — and the seek-on-Play-armed
+    // logic re-seeks to startMs because the cursor is at startMs (we
+    // left it there when wrap-pause entered). play() takes effect.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+
+    // Manually park the player at startMs (the production wrap path
+    // would have seeked here; the test seam doesn't seek so we do it).
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(500);
+    emit posSlider->sliderMoved(500);
+
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*pauseMs=*/5000);
+
+    // First click: cancel + stay paused.
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE(playBtn->text() == "Play");
+
+    // Second click: normal play. Position should still be near startMs.
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    REQUIRE(playBtn->text() == "Pause");
+    const auto pos = loaded.window->player().position().count();
+    REQUIRE(pos >= 500);
+    REQUIRE(pos <= 550);
+}
+
+TEST_CASE("MainWindow::wrapShouldFire — natural forward crossing only",
+          "[main-window][wrap-cancel]") {
+    // MEMO: pure-helper test for the wrap-trigger rule. The full
+    // updatePosition path requires player.state == Playing, which
+    // is unreliable on headless CI. Pinning the rule directly here
+    // catches future regressions without needing audio.
+    constexpr std::int64_t endMs = 1500;
+
+    // Natural forward crossing: previous tick was BEFORE endMs,
+    // current tick is AT or PAST endMs. This is the only case
+    // that fires.
+    REQUIRE(MainWindow::wrapShouldFire(1499, 1500, endMs));
+    REQUIRE(MainWindow::wrapShouldFire(1450, 1505, endMs));
+    REQUIRE(MainWindow::wrapShouldFire(0,    9999, endMs));
+
+    // Both before endMs (still inside or before the loop). Plays on.
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(500,  1000, endMs));
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(1499, 1499, endMs));
+
+    // Both at/after endMs. The user seeked past, or playback was
+    // already past — don't drag them back. This is the bug from
+    // #13: previously, ANY pos >= endMs while armed-and-playing
+    // triggered a wrap, even if the position came from a seek.
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(1500, 1505, endMs));
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(1700, 1750, endMs));
+
+    // Backward (e.g. wrap just completed and the visible position
+    // returned to startMs). Don't double-fire.
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(1505, 500, endMs));
+
+    // First-tick guard: previousPosMs_ == -1 means we haven't
+    // observed a prior position yet. Don't wrap on the very first
+    // tick regardless of where the player happens to be.
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(-1, 1700, endMs));
+    REQUIRE_FALSE(MainWindow::wrapShouldFire(-1, 0,    endMs));
+}
+
+TEST_CASE("MainWindow: Stop during wrap-pause cancels wrap AND disarms",
+          "[main-window][gui][integration][loops][wrap-cancel]") {
+    // MEMO: regression — Stop's existing behavior (cancel + disarm)
+    // is preserved through the cancelPendingWrap refactor.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* stopBtn = loaded.window->findChild<QPushButton*>("stopButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*pauseMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+
+    QTest::mouseClick(stopBtn, Qt::LeftButton);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+    REQUIRE_FALSE(dock->armedLoopId().has_value());   // disarmed
+}
