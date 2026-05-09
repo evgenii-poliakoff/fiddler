@@ -646,24 +646,10 @@ TEST_CASE("ProjectViewerDock: editing loop End round-trips through setRange",
     REQUIRE(model->loops()[0].endMs == 2500);
 }
 
-TEST_CASE("ProjectViewerDock: editing pause-between-repeats round-trips through setPauseMs",
-          "[project-viewer-dock][gui][loops]") {
-    qtApp();
-    ProjectViewerDock dock;
-    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
-    auto model = makeLoopModelWith(
-        std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
-    dock.setLoopModel(model);
-    dock.setSelectedLoopId(*model->idAt(0));
-
-    auto* pauseBox = dock.findChild<QSpinBox*>("loopPauseBox");
-    REQUIRE(pauseBox);
-    REQUIRE(pauseBox->value() == 500);   // default pause from the model
-
-    pauseBox->setValue(750);
-    emit pauseBox->editingFinished();
-    REQUIRE(model->loops()[0].pauseMs == 750);
-}
+// MEMO: per-loop "Pause" spinbox was removed in issue #16 — the
+// pause-between-repeats is now a global MainWindow setting.
+// The previous round-trip test for setPauseMs lived here; the new
+// global-pre-roll tests live in test_main_window.cpp.
 
 TEST_CASE("ProjectViewerDock: editing the loop Name round-trips through rename",
           "[project-viewer-dock][gui][loops]") {
@@ -887,13 +873,13 @@ TEST_CASE("ProjectViewerDock: removing the selected loop clears selection",
     REQUIRE(spy.count() >= 1);
 }
 
-TEST_CASE("ProjectViewerDock: countdown widget reflects armed state of selected loop",
-          "[project-viewer-dock][gui][loops][countdown][progressive-weight]") {
-    // MEMO: pin the three-tier visual weight wiring. The countdown
-    // widget's armed flag drives the disabled / ready / active
-    // colour tier. The dock forwards this whenever the property
-    // page refreshes — selection change AND armed-state change
-    // both go through refreshPropertyPage.
+TEST_CASE("ProjectViewerDock: countdown widget is global, visibility tracks prerollEnabled",
+          "[project-viewer-dock][gui][countdown][preroll]") {
+    // MEMO[issue #16]: the countdown widget used to live in the
+    // loop property page and reflect that loop's armed state. With
+    // global pre-roll, it now lives at the bottom of the dock and
+    // its visibility is driven by setPrerollEnabled. Loop selection
+    // / arming no longer affects it.
     qtApp();
     ProjectViewerDock dock;
     const std::pair<std::int64_t, std::int64_t> ranges[] = {
@@ -902,35 +888,56 @@ TEST_CASE("ProjectViewerDock: countdown widget reflects armed state of selected 
     auto model = makeLoopModelWith(
         std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
     dock.setLoopModel(model);
+    dock.show();
+    (void)QTest::qWaitForWindowExposed(&dock);
 
     auto* countdown =
         dock.findChild<fiddler::ui::LoopCountdownWidget*>("loopCountdown");
     REQUIRE(countdown);
 
-    const auto firstId  = *model->idAt(0);
-    const auto secondId = *model->idAt(1);
+    // Default: pre-roll is disabled, widget is hidden.
+    REQUIRE_FALSE(dock.prerollEnabled());
+    REQUIRE_FALSE(countdown->isVisible());
 
-    // Select first loop, no arm — countdown should be in the
-    // disabled tier.
+    // Enable: widget becomes visible.
+    dock.setPrerollEnabled(true);
+    REQUIRE(dock.prerollEnabled());
+    REQUIRE(countdown->isVisible());
+
+    // Selecting / arming loops while pre-roll is on doesn't
+    // change visibility (the global widget isn't tied to a
+    // specific loop anymore).
+    const auto firstId = *model->idAt(0);
     dock.setSelectedLoopId(firstId);
-    REQUIRE_FALSE(countdown->isArmed());
-
-    // Arm the first loop — the dock pushes that to the widget.
+    REQUIRE(countdown->isVisible());
     dock.setArmedLoopId(firstId);
-    REQUIRE(countdown->isArmed());
-
-    // Switch selection to the second (un-armed) loop — the
-    // countdown must drop back to the disabled tier even though
-    // the FIRST loop is still armed somewhere in transport.
-    dock.setSelectedLoopId(secondId);
-    REQUIRE_FALSE(countdown->isArmed());
-
-    // And back — selecting the armed loop again restores the
-    // ready tier.
-    dock.setSelectedLoopId(firstId);
-    REQUIRE(countdown->isArmed());
-
-    // Disarm — falls back to disabled.
+    REQUIRE(countdown->isVisible());
     dock.setArmedLoopId(std::nullopt);
-    REQUIRE_FALSE(countdown->isArmed());
+    REQUIRE(countdown->isVisible());
+
+    // Disable: widget hidden again.
+    dock.setPrerollEnabled(false);
+    REQUIRE_FALSE(countdown->isVisible());
+}
+
+TEST_CASE("ProjectViewerDock: disabling pre-roll mid-countdown cancels the widget",
+          "[project-viewer-dock][gui][countdown][preroll]") {
+    // MEMO: leaving a frozen ring visible after the user toggles
+    // off would be confusing. setPrerollEnabled(false) cancels any
+    // active countdown before hiding.
+    qtApp();
+    ProjectViewerDock dock;
+    auto model = std::make_shared<LoopModel>();
+    dock.setLoopModel(model);
+
+    auto* countdown =
+        dock.findChild<fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(countdown);
+
+    dock.setPrerollEnabled(true);
+    dock.startCountdown(5000);
+    REQUIRE(countdown->isCountingDown());
+
+    dock.setPrerollEnabled(false);
+    REQUIRE_FALSE(countdown->isCountingDown());
 }

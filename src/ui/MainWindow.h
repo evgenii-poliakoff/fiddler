@@ -12,8 +12,10 @@
 #include <vector>
 
 class QAction;
+class QCheckBox;
 class QComboBox;
 class QPushButton;
+class QSpinBox;
 class QSlider;
 class QLabel;
 class QShortcut;
@@ -55,8 +57,39 @@ public:
     // tests can verify the cancel paths (Play press / seek during
     // pause) without depending on audio actually advancing position
     // past endMs, which is unreliable on headless CI.
-    void enterWrapPauseForTest(std::int64_t loopId, int pauseMs);
+    void enterWrapPauseForTest(std::int64_t loopId, int prerollMs);
     [[nodiscard]] bool wrapPending() const noexcept { return wrapPending_; }
+
+    // Global pre-roll setting (issue #16). Replaces the per-loop
+    // pauseMs that used to live on `Loop`. Applies uniformly to
+    // every transition to Playing — Play press (with or without
+    // armed loop), double-click jump-and-play (markers + loops),
+    // Arm-then-Play, cancel-then-resume — AND to the pause-between-
+    // repeats window for armed loops. Same value, same feel.
+    //
+    // Two-mode design:
+    //   * **passive listening** (`prerollEnabled = false`): no
+    //     pre-roll on Play, no wrap silence. Effective pre-roll =
+    //     0 regardless of the spinbox value.
+    //   * **practice mode** (`prerollEnabled = true`): every
+    //     transition to Playing inserts a countdown for `prerollMs`
+    //     so the player has time to prepare (hand from mouse to
+    //     instrument, position bow).
+    //
+    // Default at first launch is **off** — the user starts by
+    // listening, then explicitly switches into practice mode.
+    // Persisted across launches via QSettings.
+    //
+    // `prerollMs()` returns the EFFECTIVE value (0 when disabled).
+    // `prerollMsValue()` returns the raw spinbox value regardless
+    // of enabled state — useful for tests + UI restore.
+    [[nodiscard]] int  prerollMs() const noexcept {
+        return prerollEnabled_ ? prerollMs_ : 0;
+    }
+    [[nodiscard]] int  prerollMsValue() const noexcept { return prerollMs_; }
+    [[nodiscard]] bool prerollEnabled() const noexcept { return prerollEnabled_; }
+    void setPrerollMs(int ms);
+    void setPrerollEnabled(bool enabled);
 
     // Pure helper for the wrap-trigger rule: wrap only when the
     // playhead crossed `endMs` going forward during NATURAL
@@ -93,6 +126,12 @@ private slots:
     void onStop();
     void onSeek(int positionMs);
     void onTempoChanged(int percent);
+    // editingFinished on the pre-roll spinbox — commits the new
+    // value, persists to QSettings, no immediate transport effect
+    // (next Play / wrap will pick it up).
+    void onPrerollChanged();
+    // toggled on the pre-roll checkbox — flips practice mode on/off.
+    void onPrerollEnabledToggled(bool enabled);
     void updatePosition();
 
     // The 'B' shortcut: place a barline at the player's current
@@ -208,7 +247,9 @@ private:
     QSlider*        tempoSlider_    = nullptr;
     QLabel*         tempoLabel_     = nullptr;
     QLabel*         statusLabel_    = nullptr;
-    QTimer*         positionTimer_  = nullptr;
+    QSpinBox*       prerollBox_       = nullptr;
+    QCheckBox*      prerollEnabledBox_ = nullptr;
+    QTimer*         positionTimer_    = nullptr;
     WaveformWidget* waveform_       = nullptr;
     StaffWidget*    staff_          = nullptr;
     QComboBox*      tuneTypeCombo_  = nullptr;
@@ -270,6 +311,12 @@ private:
     // when the user interrupts the pause via Play / seek.
     bool wrapPending_ = false;
 
+    // Global pre-roll setting (issue #16). Lives on MainWindow
+    // because it's a UI / transport policy, not a domain-model
+    // concept. Persisted across launches via QSettings.
+    int  prerollMs_      = 500;     // raw spinbox value
+    bool prerollEnabled_ = false;   // off by default — see header doc
+
     // Position observed at the END of the previous updatePosition
     // tick (or after a user seek). The wrap rule fires only on a
     // forward crossing of endMs (`previousPosMs_ < endMs && pos >=
@@ -290,16 +337,31 @@ private:
     // the player paused at the new position. See issue #13 for
     // the rationale.
     QTimer*      wrapTimer_         = nullptr;
-    // The loop id captured at wrap entry. The timer's timeout
-    // handler compares this against `armedLoopId_` — if the user
-    // armed a different loop in the meantime, the auto-resume
-    // becomes a no-op rather than playing the wrong loop.
-    std::int64_t wrapTargetLoopId_  = 0;
+    // The loop id captured at wrap entry, or nullopt for a generic
+    // (no-armed-loop) Play pre-roll. The timer's timeout handler
+    // checks the optional: if it has a value, it must still match
+    // `armedLoopId_` (rejects the case where the user armed a
+    // different loop during the pause); if it's nullopt, the timer
+    // simply resumes playback wherever the player currently sits.
+    std::optional<std::int64_t> wrapTargetLoopId_;
 
-    // Cancel any pending pause-between-repeats. Stops the timer,
-    // clears `wrapPending_`, cancels the dock's countdown widget.
-    // Idempotent — safe to call when no wrap is pending.
+    // Cancel any pending pre-roll / pause-between-repeats. Stops
+    // the timer, clears `wrapPending_`, cancels the dock's
+    // countdown widget. Idempotent — safe to call when no wrap is
+    // pending.
     void cancelPendingWrap();
+
+    // Single source of truth for "transition the player to playing".
+    // Routes through a pre-roll wrap-pause when the effective
+    // `prerollMs() > 0` (i.e. checkbox enabled and value > 0);
+    // otherwise plays immediately. Used by every Play path
+    // (onPlayPause, onLoopActivated, onMarkerActivated, the
+    // cancel-then-resume case, etc.) so the user gets consistent
+    // pre-roll feel regardless of how they entered the play state.
+    // MEMO: do NOT call from the wrap timer's lambda (that fires
+    // AFTER the wrap-pause that was the pre-roll for the next
+    // iteration — calling this would loop forever).
+    void startPlayback();
 
     // Generation counter for async overview builds: rapid loadFile
     // calls invalidate older builds so a slow build for file A can't

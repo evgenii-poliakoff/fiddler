@@ -15,6 +15,11 @@
 //   │ Properties                      │
 //   │   Name:     [Mark 1____]        │ ← QStackedWidget; per-type property page
 //   │   Position: [1000   ↕]          │   (here, the Marker page)
+//   ├─────────────────────────────────┤
+//   │           ◯ ◯ ◯                 │ ← LoopCountdownWidget; visible only
+//   │         ◯       ◯               │   when the global pre-roll setting is
+//   │           ◯ ◯ ◯                 │   enabled. Drives the practice-mode
+//   │                                 │   ready/active visual.
 //   └─────────────────────────────────┘
 //
 // MEMO: the dock is the home for "all transcription-project
@@ -77,7 +82,7 @@ public:
     // Attach (or detach with nullptr) the loop model. Same lifecycle
     // contract as the marker model — writes happen via the model's
     // public API; the dock holds a non-const handle so it can call
-    // setRange / rename / setPauseMs.
+    // setRange / rename.
     void setLoopModel(std::shared_ptr<score::LoopModel> model);
     [[nodiscard]] std::shared_ptr<score::LoopModel>
         loopModel() const noexcept { return loopModel_; }
@@ -102,13 +107,21 @@ public slots:
     // the UI matches transport state. nullopt = nothing armed.
     void setArmedLoopId(std::optional<std::int64_t> id);
 
-    // Pushed by MainWindow when transport enters / exits the
-    // pause-between-repeats window. `totalMs > 0` starts the
-    // countdown widget on the loop property page; cancel() halts
-    // it. The dock just forwards to the widget — countdown
-    // animation lives entirely in ui::LoopCountdownWidget.
+    // Pushed by MainWindow when transport enters / exits a pre-roll
+    // (Play press in practice mode) or a pause-between-repeats
+    // window. `totalMs > 0` starts the countdown widget at the
+    // bottom of the dock; cancel() halts it. The dock just forwards
+    // to the widget — countdown animation lives entirely in
+    // ui::LoopCountdownWidget.
     void startCountdown(int totalMs);
     void cancelCountdown();
+
+    // Show / hide the global countdown widget. The widget lives at
+    // the bottom of the dock and is meaningful only when the user
+    // has enabled pre-roll (issue #16). MainWindow drives this in
+    // sync with its own `prerollEnabled_` state.
+    void setPrerollEnabled(bool enabled);
+    [[nodiscard]] bool prerollEnabled() const noexcept { return prerollEnabled_; }
 
 signals:
     // Selection changed in the dock — by tree click, by programmatic
@@ -192,7 +205,6 @@ private slots:
     void onLoopNameEdited();
     void onLoopStartEdited();
     void onLoopEndEdited();
-    void onLoopPauseEdited();
     void onLoopArmedToggled(bool checked);
 
 private:
@@ -240,9 +252,15 @@ private:
     QLineEdit*           loopNameEdit_      = nullptr;
     QSpinBox*            loopStartBox_      = nullptr;
     QSpinBox*            loopEndBox_        = nullptr;
-    QSpinBox*            loopPauseBox_      = nullptr;
     QCheckBox*           loopArmedCheck_    = nullptr;
+
+    // Global countdown widget — sits at the bottom of the dock,
+    // visible only when prerollEnabled_ is true. Decoupled from
+    // any specific loop because pre-roll is a global setting now
+    // (issue #16) and fires on every Play press, not just armed
+    // loops.
     LoopCountdownWidget* loopCountdown_     = nullptr;
+    bool                 prerollEnabled_    = false;
 
     // MEMO: invariant — set true while we're populating the
     // property-page widgets from the model, so their valueChanged

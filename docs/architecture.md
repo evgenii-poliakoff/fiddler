@@ -188,10 +188,12 @@ named region rather than a single anchor.
   The model never silently fixes user input; the UI is responsible
   for keeping the property-page spinboxes valid (the End spinbox's
   lower bound is dynamically clamped to Start + 1 and vice versa).
-- **Per-loop pause-between-repeats.** Each loop carries its own
-  `pauseMs`, defaulting to **500 ms** — a short breath the user
-  asked for so the ear can reset before the next pass without
-  dragging the practice tempo. Negative values clamp to 0.
+- ~~**Per-loop pause-between-repeats.**~~ **(Dropped in #16.)** The
+  pause-between-repeats moved off `LoopModel` onto a global
+  `prerollMs` setting on `MainWindow`. Hand-to-violin time is a
+  property of the player + instrument, not the music — so it
+  belongs at the transport layer. Loops are now just (name,
+  startMs, endMs).
 - **No `nearest()` helper.** Loops are selected from the dock or
   from the band overlay — never by tick hit-test — so the lookup
   pattern that `BarlineModel` and `MarkerModel` need doesn't apply.
@@ -267,29 +269,62 @@ gestures, with deliberately different intents:
 
 Pressing the **Play button while a loop is armed** seeks to
 `startMs` first if the cursor is outside `[startMs, endMs)` —
-otherwise plays from current (mid-listen continuity). Three
-branches:
-- pos < startMs → seek (the "I armed and pressed Play to drill
-  the loop" scenario; without the seek the user hears the whole
-  tune up to endMs once before wrap engages).
-- pos in loop → no seek (mid-listen continuity).
-- pos >= endMs → seek (without it the user is stuck past endMs;
-  the GUI wrap path would only fire once and from a stale frame).
+otherwise plays from current (mid-listen continuity).
+
+### Global pre-roll (#16)
+
+Every transition to "playing" routes through a `startPlayback()`
+helper that respects the **global** pre-roll setting on
+`MainWindow`. The setting is a checkbox + spinbox pair in the
+transport row (`prerollEnabled` + `prerollMs`); both values are
+persisted across launches via QSettings (alongside the dock layout
+from #7). The checkbox lets the user flip between modes without
+losing their preferred ms value.
+
+Two modes:
+- `prerollEnabled = false` (default) → **passive listening**. No
+  pre-roll, no wrap silence, continuous loop. Same feel as a DAW
+  playing a region. The user starts here while just listening to
+  a recording.
+- `prerollEnabled = true` → **practice mode**. Every transition to
+  Playing enters a wrap-pause for `prerollMs` first — the user
+  gets a "ready, set, go" countdown before audio actually starts.
+  Pause-between-repeats uses the same value so the cadence between
+  iterations matches the cadence of the first.
+
+`startPlayback` reads an *effective* `prerollMs()` that returns
+the spinbox value when the checkbox is on, 0 otherwise — one
+branch in the helper instead of two.
+
+Pre-roll fires on every Play gesture, not just armed loops:
+pressing Play from any position, double-clicking a marker, double-
+clicking a loop, cancel-then-resume — all route through
+`startPlayback`. Even simple listening from a position gets the
+ready-set-go time so the user can pick up the violin between the
+click and audio starting.
+
+Why **global** rather than per-loop:
+- Hand-to-violin time is a property of the player, not the music.
+- Different loops carrying different pause values produces jarring
+  inconsistency in practice cadence.
+- Single source of truth: user sets it once per session.
 
 **Wrap-around** lives in `MainWindow::updatePosition` — the
 existing 50 ms GUI-poll timer. When `pos >= loop.endMs`:
-- `pauseMs == 0` → tight wrap with `seek(startMs)` while playing.
-- `pauseMs > 0` → pause, seek to `startMs` immediately (so the
-  visible position slides back right away — silence reads as
-  "loop break", not "dead air at the end of the tune"), then
-  `QTimer::singleShot(pauseMs, ...)` to resume play.
+- effective pre-roll is 0 → tight wrap with `seek(startMs)` while
+  playing.
+- effective pre-roll > 0 → pause, seek to `startMs` immediately
+  (so the visible position slides back right away — silence reads
+  as "loop break", not "dead air at the end of the tune"), then
+  the member `wrapTimer_` fires after the pre-roll to resume play.
 
 GUI-driven (rather than audio-callback-driven) is the deliberate
 Rule-8 choice: ~50 ms wrap jitter is inaudible during practice,
 and it keeps the loop region out of the Player + Rubber Band
 internals. A `wrapPending_` flag blocks re-entry while the pause
-timer is in flight; the timer's lambda re-checks `armedLoopId_`
-so disarm-during-pause is a quiet no-op.
+timer is in flight. The wrap timer is **cancellable** (#13) — Play
+press / seek / Stop / disarm during the pause all stop the timer
+cleanly via `cancelPendingWrap()`.
 
 **Stop disarms.** Per the design discussion, Stop is the user's
 "exit loop mode" gesture. The next Play press resumes normal
@@ -914,7 +949,7 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 4** — Waveform view synchronised with playback position. `audio::WaveformOverview` (peak buckets keyed on source-time ms) is built on a detached worker thread on file open; `ui::WaveformWidget` paints peaks plus a cursor and emits `seekRequested(ms)` on click. Decoupled from `Player`; public `xToMs`/`msToX` so step 5's overlays plug in without restructuring.
 - ✅ **Step 5** — Empty staff widget; user-placed barlines mapped to audio timestamps. `score::BarlineModel` is the shared data layer (descriptive `TimeSignature`, no uniformity enforcement — supports crooked tunes); `ui::StaffWidget` and `ui::WaveformWidget` both observe it. Tap-to-place is the primary gesture (`B`); `Ctrl+Z` undoes the last placement; `Del` removes the selected (auto-selected on tap) bar. Tradition-named time-signature picker; `QPainter` rather than `QGraphicsView` — see "Score widgets" above for the deferred features.
 - ✅ **Step 5.5 (part A)** — Markers + project viewer dock. `score::MarkerModel` is the second project-artifact model (stable IDs, auto-named, repositionable, free-text rename). `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts the marker list and a property editor; double-click on a marker row "jump and plays". Tap-to-place is `M`; `Ctrl+Z` is now combined across barlines + markers; `Del` removes whichever is selected (mutually-exclusive selection).
-- ✅ **Step 5.5 (part B)** — Practice loops. `score::LoopModel` is the third project-artifact model (paired `start_ms` + `end_ms`, stable IDs, per-loop pause-between-repeats default 500 ms). Two-anchor creation gesture: click first anchor, Ctrl+click second (any combination of barlines + markers, on any of the three surfaces — waveform, staff, dock), press `L` to create. Loops appear under a "Loops" category in the dock with a property page; double-click arms + jumps + plays, the Arm checkbox arms in place. Pressing Play with an armed loop seeks to startMs if the cursor is outside the loop. Wrap-around lives in the 50 ms GUI poll (jitter inaudible at practice tempos); Stop disarms.
+- ✅ **Step 5.5 (part B)** — Practice loops. `score::LoopModel` is the third project-artifact model (paired `start_ms` + `end_ms`, stable IDs). Two-anchor creation gesture: click first anchor, Ctrl+click second (any combination of barlines + markers, on any of the three surfaces — waveform, staff, dock), press `L` to create. Loops appear under a "Loops" category in the dock with a property page; double-click arms + jumps + plays, the Arm checkbox arms in place. Pressing Play with an armed loop seeks to startMs if the cursor is outside the loop. Wrap-around lives in the 50 ms GUI poll (jitter inaudible at practice tempos); Stop disarms. Pause-between-repeats and pre-roll-on-Play share a global `prerollMs` setting on the transport row (#16) — practice-mode countdown gives the player ready-set-go time on every loop-start gesture.
 - 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 

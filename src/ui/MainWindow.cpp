@@ -13,6 +13,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QFileDialog>
@@ -30,6 +31,7 @@
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
+#include <QSpinBox>
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -123,12 +125,16 @@ MainWindow::MainWindow(QWidget* parent)
     wrapTimer_->setSingleShot(true);
     connect(wrapTimer_, &QTimer::timeout, this, [this]() {
         wrapPending_ = false;
-        // Defensive: if the user disarmed (or armed a DIFFERENT
-        // loop) during the pause, the captured loopId no longer
-        // matches and we just bail. The countdown widget completes
-        // its own depletion in parallel; nothing to do here.
-        if (!armedLoopId_.has_value()
-            || *armedLoopId_ != wrapTargetLoopId_) {
+        // If we entered the pause for a SPECIFIC armed loop,
+        // defensively check it's still the armed one. The user may
+        // have disarmed or armed a different loop during the pause;
+        // either way the auto-resume becomes a no-op rather than
+        // playing the wrong loop. nullopt means "this was a generic
+        // Play-pre-roll, no loop in particular" — just resume.
+        if (wrapTargetLoopId_.has_value()
+            && (!armedLoopId_.has_value()
+                || *armedLoopId_ != *wrapTargetLoopId_))
+        {
             return;
         }
         if (!player_) return;
@@ -249,6 +255,37 @@ void MainWindow::buildCentralWidget() {
     connect(tuneTypeCombo_, &QComboBox::activated,
             this, &MainWindow::onTuneTypePresetChosen);
     transport->addWidget(tuneTypeCombo_);
+    transport->addSpacing(20);
+
+    // Global pre-roll spinbox + enable checkbox (issue #16).
+    // Disabled checkbox = passive listening mode (no pre-roll, no
+    // wrap silence). Enabled = practice mode (countdown before
+    // every Play press AND between loop repeats). The spinbox
+    // stays visible-but-greyed when disabled so the user sees
+    // their preferred value without losing it.
+    //
+    // MEMO: editingFinished, not valueChanged — see the marker
+    // Position spinbox for the leading-zero rationale.
+    auto* prerollLabel = new QLabel(tr("Pre-roll:"), central);
+    transport->addWidget(prerollLabel);
+    prerollEnabledBox_ = new QCheckBox(central);
+    prerollEnabledBox_->setObjectName("prerollEnabledBox");
+    prerollEnabledBox_->setToolTip(
+        tr("Enable practice-mode pre-roll countdown before each Play"));
+    prerollEnabledBox_->setChecked(prerollEnabled_);
+    connect(prerollEnabledBox_, &QCheckBox::toggled,
+            this, &MainWindow::onPrerollEnabledToggled);
+    transport->addWidget(prerollEnabledBox_);
+    prerollBox_ = new QSpinBox(central);
+    prerollBox_->setObjectName("prerollBox");
+    prerollBox_->setRange(0, 5000);
+    prerollBox_->setSingleStep(100);
+    prerollBox_->setSuffix(tr(" ms"));
+    prerollBox_->setValue(prerollMs_);
+    prerollBox_->setEnabled(prerollEnabled_);
+    connect(prerollBox_, &QSpinBox::editingFinished,
+            this, &MainWindow::onPrerollChanged);
+    transport->addWidget(prerollBox_);
     transport->addStretch();
     layout->addLayout(transport);
 
@@ -352,6 +389,12 @@ void MainWindow::buildCentralWidget() {
     projectViewerDock_ = new ProjectViewerDock(this);
     projectViewerDock_->setMarkerModel(markerModel_);
     projectViewerDock_->setLoopModel(loopModel_);
+    // Sync the dock's countdown-widget visibility with our current
+    // prerollEnabled_ state. restoreLayout() will push the
+    // persisted value through later if a previous session saved
+    // one; this initial call keeps things consistent for the
+    // first-ever launch.
+    projectViewerDock_->setPrerollEnabled(prerollEnabled_);
     addDockWidget(Qt::RightDockWidgetArea, projectViewerDock_);
     connect(projectViewerDock_,
             &ProjectViewerDock::markerSelectionChanged,
@@ -592,6 +635,7 @@ void MainWindow::onPlayPause() {
             if (pos < loop.startMs || pos >= loop.endMs) {
                 player_->seek(std::chrono::milliseconds{loop.startMs});
                 pos = loop.startMs;
+                previousPosMs_ = pos;
                 FLOG_DEBUG("ui.transport",
                            "play-armed-seek id={} to={}",
                            *armedLoopId_, loop.startMs);
@@ -599,10 +643,14 @@ void MainWindow::onPlayPause() {
         }
     }
 
-    player_->play();
-    playButton_->setText(tr("Pause"));
+    // MEMO: route through startPlayback so the global pre-roll
+    // (issue #16) fires uniformly. When pre-roll is disabled or
+    // 0 this is an immediate play; otherwise the user gets the
+    // "ready, set, go" countdown before audio actually starts.
+    startPlayback();
     FLOG_DEBUG("ui.transport",
-               "play from={} ms audio={}", pos, player_->hasAudioOutput());
+               "play from={} ms audio={} preroll={}",
+               pos, player_->hasAudioOutput(), prerollMs());
 }
 
 void MainWindow::onStop() {
@@ -921,8 +969,10 @@ void MainWindow::onStaffMarkerSelectionChanged(
 
 void MainWindow::onMarkerActivated(std::int64_t id) {
     // "Jump and play" — double-click handler from the dock.
-    // We seek to the marker's exact source-time, then start
-    // playback if the player isn't already running.
+    // We seek to the marker's exact source-time, then route
+    // through startPlayback so global pre-roll (issue #16) fires
+    // uniformly. With pre-roll enabled the user gets a moment to
+    // grab the violin between the click and audio starting.
     if (!markerModel_ || !player_) return;
     const auto idx = markerModel_->indexOf(id);
     if (!idx) return;
@@ -934,8 +984,7 @@ void MainWindow::onMarkerActivated(std::int64_t id) {
     onSeek(ms);
 
     if (player_->state() != audio::TransportState::Playing) {
-        player_->play();
-        playButton_->setText(tr("Pause"));
+        startPlayback();
     }
 
     FLOG_DEBUG("ui.score",
@@ -956,7 +1005,7 @@ bool MainWindow::wrapShouldFire(std::int64_t previousPosMs,
     return previousPosMs < endMs && currentPosMs >= endMs;
 }
 
-void MainWindow::enterWrapPauseForTest(std::int64_t loopId, int pauseMs) {
+void MainWindow::enterWrapPauseForTest(std::int64_t loopId, int prerollMs) {
     // MEMO: production wrap entry lives in updatePosition's wrap
     // branch and depends on audio actually advancing position past
     // endMs. Headless CI hosts can't reliably reach that state. This
@@ -970,9 +1019,57 @@ void MainWindow::enterWrapPauseForTest(std::int64_t loopId, int pauseMs) {
     wrapTargetLoopId_ = loopId;
     if (projectViewerDock_) {
         projectViewerDock_->setArmedLoopId(loopId);
-        projectViewerDock_->startCountdown(pauseMs);
+        projectViewerDock_->startCountdown(prerollMs);
     }
-    if (wrapTimer_) wrapTimer_->start(pauseMs);
+    if (wrapTimer_) wrapTimer_->start(prerollMs);
+}
+
+void MainWindow::startPlayback() {
+    // Single source of truth for "transition the player to playing".
+    // Routes through a pre-roll wrap-pause when the effective
+    // pre-roll is > 0 (checkbox enabled AND prerollMs_ > 0) so the
+    // user gets a "ready, set, go" countdown before audio starts;
+    // otherwise plays immediately. Fires uniformly whether or not
+    // a loop is armed — issue #16 generalised this beyond the
+    // armed-loop case so simply pressing Play (or activating a
+    // marker) also gives the player time to switch from mouse to
+    // instrument.
+    //
+    // MEMO: do NOT call from the wrap timer's lambda (timeout) —
+    // that fires AFTER the wrap-pause that was the pre-roll for
+    // the next iteration. Calling this would loop forever.
+    if (!player_) return;
+
+    const int effective = prerollMs();
+    if (effective > 0) {
+        // Enter pre-roll wrap-pause. Same machinery as between-
+        // repeats wrap (issue #13's wrapTimer_), just initiated
+        // from the start-playing path rather than from a natural
+        // endMs crossing. wrapTargetLoopId_ may be nullopt (generic
+        // Play, no specific loop to defend against re-arming).
+        wrapPending_      = true;
+        wrapTargetLoopId_ = armedLoopId_;
+        player_->pause();
+        if (projectViewerDock_) {
+            projectViewerDock_->startCountdown(effective);
+        }
+        wrapTimer_->start(effective);
+        // Conceptually we're entering "playback mode with a brief
+        // silence first" — flip the button label to "Pause" so the
+        // user sees that clicking again would cancel the pre-roll.
+        // (Same Option-2 semantics as the between-repeats wrap.)
+        playButton_->setText(tr("Pause"));
+        const std::string idStr = armedLoopId_.has_value()
+            ? std::to_string(*armedLoopId_)
+            : std::string{"none"};
+        FLOG_DEBUG("ui.transport",
+                   "preroll-start id={} ms={}", idStr, effective);
+        return;
+    }
+
+    // Pre-roll disabled or zero: play immediately.
+    player_->play();
+    playButton_->setText(tr("Pause"));
 }
 
 void MainWindow::cancelPendingWrap() {
@@ -980,9 +1077,22 @@ void MainWindow::cancelPendingWrap() {
     // timer's stop() is a no-op when the timer isn't active, and
     // the dock's cancelCountdown() short-circuits when the
     // countdown isn't running.
+    const bool wasPending = wrapPending_;
     if (wrapTimer_) wrapTimer_->stop();
     wrapPending_ = false;
+    wrapTargetLoopId_.reset();
     if (projectViewerDock_) projectViewerDock_->cancelCountdown();
+    // MEMO: during wrap-pause we deliberately keep the button label
+    // as "Pause" (the user might want to cancel the auto-resume —
+    // see issue #13). Once the wrap IS cancelled the player is
+    // paused for real, so the label needs to flip to "Play". All
+    // cancel-paths (Play during wrap, seek during wrap, Stop,
+    // disarm, toggle-pre-roll-off) end up here, so handling the
+    // label centrally avoids each caller forgetting it (issue #16
+    // smoke test 6.1 was the toggle-off case missing this).
+    if (wasPending && playButton_) {
+        playButton_->setText(tr("Play"));
+    }
 }
 
 void MainWindow::onLoopActivated(std::int64_t id) {
@@ -1001,14 +1111,15 @@ void MainWindow::onLoopActivated(std::int64_t id) {
     }
 
     onSeek(static_cast<int>(loop.startMs));
-    if (player_->state() != audio::TransportState::Playing) {
-        player_->play();
-        playButton_->setText(tr("Pause"));
-    }
+    // Route through playArmedLoop so the pre-roll (issue #16) fires
+    // before playback when prerollMs_ > 0. With pre-roll, double-
+    // click means "jump, give me a moment to prepare, then play"
+    // — practice-tool feel.
+    startPlayback();
 
     FLOG_DEBUG("ui.score",
-               "loop-activated id={} start={} end={} pause={} via=dock",
-               id, loop.startMs, loop.endMs, loop.pauseMs);
+               "loop-activated id={} start={} end={} preroll={} via=dock",
+               id, loop.startMs, loop.endMs, prerollMs_);
 }
 
 void MainWindow::onLoopArmToggleRequested(std::int64_t id, bool armed) {
@@ -1287,18 +1398,23 @@ void MainWindow::updatePosition() {
             if (wrapShouldFire(previousPosMs_, pos.count(), loop.endMs)) {
                 const auto loopId  = *armedLoopId_;
                 const auto startMs = loop.startMs;
-                const auto pauseMs = loop.pauseMs;
+                // MEMO: pause-between-repeats now uses the global
+                // effective pre-roll (issue #16). Per-loop pauseMs
+                // is gone — hand-to-violin time is a property of
+                // the player, not the music. When the checkbox is
+                // off the effective value is 0 → tight wrap.
+                const auto wrapMs  = prerollMs();
 
-                if (pauseMs <= 0) {
+                if (wrapMs <= 0) {
                     // Tight wrap: seek back to startMs without
                     // pausing. Keep the player in Playing state.
                     player_->seek(std::chrono::milliseconds{startMs});
                     FLOG_DEBUG("ui.transport",
-                               "loop-wrap id={} from={} to={} pause=0",
+                               "loop-wrap id={} from={} to={} preroll=0",
                                loopId, pos.count(), startMs);
                 } else {
                     wrapPending_       = true;
-                    wrapTargetLoopId_  = loopId;
+                    wrapTargetLoopId_  = loopId;   // assigns into optional
                     player_->pause();
                     // Seek now so the visible position slides back
                     // to startMs immediately; the user sees the
@@ -1315,20 +1431,12 @@ void MainWindow::updatePosition() {
                     // stay paused for real" gesture (handled in
                     // onPlayPause). See issue #13.
                     FLOG_DEBUG("ui.transport",
-                               "loop-wrap id={} from={} to={} pause={}",
-                               loopId, pos.count(), startMs, pauseMs);
-                    // Drive the dock's countdown widget in lockstep
-                    // with the pause-between-repeats window — see
-                    // issue #9.
+                               "loop-wrap id={} from={} to={} preroll={}",
+                               loopId, pos.count(), startMs, wrapMs);
                     if (projectViewerDock_) {
-                        projectViewerDock_->startCountdown(pauseMs);
+                        projectViewerDock_->startCountdown(wrapMs);
                     }
-                    // Start the wrap timer. Stored as a member
-                    // (rather than QTimer::singleShot) so user
-                    // gestures during the pause can stop it via
-                    // cancelPendingWrap. The timer's timeout
-                    // handler is wired once in the ctor.
-                    wrapTimer_->start(pauseMs);
+                    wrapTimer_->start(wrapMs);
                 }
                 // Don't fall through to the auto-pause-at-end logic
                 // below — the loop is what governs the transport now.
@@ -1367,10 +1475,14 @@ void MainWindow::saveLayout() const {
     // panels / tool windows can share the same QSettings file
     // without colliding. Geometry encodes window position +
     // size; state encodes dock layout (visibility, floating,
-    // tabbed grouping, sizes).
+    // tabbed grouping, sizes). The pre-roll setting (issue #16)
+    // rides along here too — it's a session-level UX preference
+    // that benefits from the same survive-relaunch contract.
     QSettings settings;
-    settings.setValue("mainwindow/geometry", saveGeometry());
-    settings.setValue("mainwindow/state",    saveState());
+    settings.setValue("mainwindow/geometry",       saveGeometry());
+    settings.setValue("mainwindow/state",          saveState());
+    settings.setValue("mainwindow/prerollMs",      prerollMs_);
+    settings.setValue("mainwindow/prerollEnabled", prerollEnabled_);
 }
 
 void MainWindow::restoreLayout() {
@@ -1379,6 +1491,83 @@ void MainWindow::restoreLayout() {
     const auto state    = settings.value("mainwindow/state").toByteArray();
     if (!geometry.isEmpty()) restoreGeometry(geometry);
     if (!state.isEmpty())    restoreState(state);
+    // Restore pre-roll if a previous session saved it; otherwise
+    // keep the default 500 ms. Clamp into the spinbox's range
+    // so a corrupted settings value can't push us into a bad UI
+    // state.
+    if (settings.contains("mainwindow/prerollMs")) {
+        const int saved = settings.value("mainwindow/prerollMs",
+                                         prerollMs_).toInt();
+        prerollMs_ = std::clamp(saved, 0, 5000);
+        if (prerollBox_) prerollBox_->setValue(prerollMs_);
+    }
+    if (settings.contains("mainwindow/prerollEnabled")) {
+        const bool saved =
+            settings.value("mainwindow/prerollEnabled", prerollEnabled_)
+                .toBool();
+        // Use setPrerollEnabled to push the value through the same
+        // sync paths (checkbox state, spinbox enable, dock
+        // visibility) used by the user-driven toggle.
+        setPrerollEnabled(saved);
+    }
+}
+
+void MainWindow::setPrerollMs(int ms) {
+    const int clamped = std::clamp(ms, 0, 5000);
+    if (prerollMs_ == clamped) return;
+    prerollMs_ = clamped;
+    if (prerollBox_ && prerollBox_->value() != clamped) {
+        QSignalBlocker block(prerollBox_);
+        prerollBox_->setValue(clamped);
+    }
+    // Persist immediately so a crash or force-quit doesn't lose
+    // the user's choice. saveLayout would also catch it on close,
+    // but redundancy is cheap and avoids surprises.
+    QSettings settings;
+    settings.setValue("mainwindow/prerollMs", prerollMs_);
+    FLOG_DEBUG("ui.transport", "preroll set ms={}", prerollMs_);
+}
+
+void MainWindow::setPrerollEnabled(bool enabled) {
+    if (prerollEnabled_ == enabled) return;
+    prerollEnabled_ = enabled;
+    // Sync the checkbox so a programmatic call (restoreLayout, test
+    // seam) reflects in the UI without bouncing through the toggled
+    // signal.
+    if (prerollEnabledBox_ && prerollEnabledBox_->isChecked() != enabled) {
+        QSignalBlocker block(prerollEnabledBox_);
+        prerollEnabledBox_->setChecked(enabled);
+    }
+    // Spinbox is only meaningful when pre-roll is enabled — grey
+    // it out otherwise so the user understands at a glance that
+    // editing has no current effect (but keeps the value).
+    if (prerollBox_) prerollBox_->setEnabled(enabled);
+    // Show / hide the global countdown widget at the bottom of
+    // the dock.
+    if (projectViewerDock_) {
+        projectViewerDock_->setPrerollEnabled(enabled);
+    }
+    // If pre-roll just got disabled mid-pause, cancel any active
+    // wrap-pause so the player isn't stuck silent waiting for a
+    // countdown that's now hidden. The auto-resume timer would
+    // still fire, but the user's mental model is "pre-roll is off,
+    // nothing should be silent".
+    if (!enabled) {
+        cancelPendingWrap();
+    }
+    QSettings settings;
+    settings.setValue("mainwindow/prerollEnabled", prerollEnabled_);
+    FLOG_DEBUG("ui.transport", "preroll enabled={}", prerollEnabled_);
+}
+
+void MainWindow::onPrerollChanged() {
+    // editingFinished — the spinbox just committed a new value.
+    if (!prerollBox_) return;
+    setPrerollMs(prerollBox_->value());
+}
+
+void MainWindow::onPrerollEnabledToggled(bool enabled) {
+    setPrerollEnabled(enabled);
 }
 
 } // namespace fiddler::ui

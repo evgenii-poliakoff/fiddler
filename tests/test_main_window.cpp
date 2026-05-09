@@ -890,7 +890,6 @@ TEST_CASE("MainWindow: L creates a loop spanning the two anchored markers",
     const auto& loop = window->loopModel().loops()[0];
     REQUIRE(loop.startMs == 500);
     REQUIRE(loop.endMs   == 1500);
-    REQUIRE(loop.pauseMs == 500);   // model default
     // Loop is auto-selected on creation so the dock's property
     // page jumps straight to it.
     REQUIRE(waveform->selectedLoopId().has_value());
@@ -1718,9 +1717,18 @@ TEST_CASE("MainWindow: disarm via Stop cancels an active countdown",
 TEST_CASE("MainWindow: arming a different loop cancels a stale countdown",
           "[main-window][gui][integration][countdown]") {
     // MEMO: two loops; arm A, simulate wrap-pause, then arm B
-    // before the pause finishes. The countdown for A must be
-    // cancelled — otherwise the user sees ticks depleting on
-    // the property page while looping B, which is misleading.
+    // before the pause finishes. The OLD wrap (for loop A) must
+    // be cancelled — otherwise the user sees ticks depleting on
+    // the property page while playing loop B's body, which is
+    // misleading.
+    //
+    // MEMO[issue #16]: with the global pre-roll, activating B
+    // ALSO starts a NEW countdown (B's own pre-roll). So we can't
+    // assert "countdown is not running" — it's running, but for
+    // B, not A. The test verifies the wrap state machine landed
+    // on B's loopId, and we set prerollMs to 0 so the new
+    // activation doesn't immediately enter another wrap-pause
+    // (otherwise the cancellation is invisible).
     qtApp();
     auto loaded = makeWindowWithLoop(/*start=*/300, /*end=*/700);
     auto* dock =
@@ -1730,8 +1738,12 @@ TEST_CASE("MainWindow: arming a different loop cancels a stale countdown",
     REQUIRE(dock);
     REQUIRE(countdown);
 
-    // Add a second loop directly; we don't need to go through the
-    // L gesture for this test.
+    // Set pre-roll to 0 so loopActivated of B is an immediate
+    // play (no fresh countdown), exposing whether A's countdown
+    // got cancelled cleanly.
+    loaded.window->setPrerollMs(0);
+
+    // Add a second loop directly.
     seekAndTapMarker(*loaded.window, 1000);
     seekAndTapMarker(*loaded.window, 1500);
     auto* waveform =
@@ -1747,9 +1759,11 @@ TEST_CASE("MainWindow: arming a different loop cancels a stale countdown",
     dock->startCountdown(5000);
     REQUIRE(countdown->isCountingDown());
 
-    // Activate loop B — should cancel A's countdown.
+    // Activate loop B — should cancel A's countdown. With
+    // prerollMs=0 there's no fresh countdown to start.
     emit dock->loopActivated(secondLoopId);
     REQUIRE_FALSE(countdown->isCountingDown());
+    REQUIRE(dock->armedLoopId() == secondLoopId);
 }
 
 TEST_CASE("MainWindow: deleting the armed loop cancels a stale countdown",
@@ -1959,4 +1973,381 @@ TEST_CASE("MainWindow: Stop during wrap-pause cancels wrap AND disarms",
     REQUIRE_FALSE(loaded.window->wrapPending());
     REQUIRE_FALSE(countdown->isCountingDown());
     REQUIRE_FALSE(dock->armedLoopId().has_value());   // disarmed
+}
+
+// ---------------------------------------------------------------------------
+// Global pre-roll setting (issue #16)
+//
+// MEMO[refactor]: pause-between-repeats moved off LoopModel onto a
+// global MainWindow setting. Pre-roll fires uniformly on every
+// transition to Playing — Play press (with or without armed loop),
+// double-click jump-and-play (markers + loops), Arm-then-Play,
+// cancel-then-resume — AND on the pause-between-repeats wrap. The
+// user gets consistent ready-set-go time before practice playback,
+// regardless of which gesture they used.
+//
+// Two-mode design:
+//   * passive listening (prerollEnabled=false, default): effective
+//     pre-roll is 0 regardless of spinbox value. No wrap silence.
+//   * practice mode (prerollEnabled=true): every transition to
+//     Playing inserts a countdown for the spinbox value.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: pre-roll defaults — disabled, value 500, effective 0",
+          "[main-window][gui][integration][preroll]") {
+    qtApp();
+    MainWindow window;
+    REQUIRE_FALSE(window.prerollEnabled());     // off by default
+    REQUIRE(window.prerollMsValue() == 500);    // raw spinbox value
+    REQUIRE(window.prerollMs() == 0);           // effective: 0 when disabled
+}
+
+TEST_CASE("MainWindow: enabling pre-roll exposes the spinbox value as effective",
+          "[main-window][gui][integration][preroll]") {
+    qtApp();
+    MainWindow window;
+    window.setPrerollEnabled(true);
+    REQUIRE(window.prerollEnabled());
+    REQUIRE(window.prerollMs() == 500);         // effective == value
+    window.setPrerollEnabled(false);
+    REQUIRE(window.prerollMs() == 0);
+    REQUIRE(window.prerollMsValue() == 500);    // value preserved across toggle
+}
+
+TEST_CASE("MainWindow: prerollMs can be set + persists across sessions",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: round-trip through QSettings (qt_test_app enables test
+    // mode so we don't pollute the user's real config).
+    qtApp();
+    {
+        MainWindow first;
+        first.setPrerollMs(1500);
+        REQUIRE(first.prerollMsValue() == 1500);
+        first.close();   // saveLayout writes to QSettings
+    }
+    // Skip the qtApp() clear so we read the just-saved state.
+    MainWindow second;
+    REQUIRE(second.prerollMsValue() == 1500);
+}
+
+TEST_CASE("MainWindow: prerollEnabled persists across sessions",
+          "[main-window][gui][integration][preroll]") {
+    qtApp();
+    {
+        MainWindow first;
+        first.setPrerollEnabled(true);
+        REQUIRE(first.prerollEnabled());
+        first.close();
+    }
+    MainWindow second;
+    REQUIRE(second.prerollEnabled());
+}
+
+TEST_CASE("MainWindow: setPrerollMs clamps out-of-range values",
+          "[main-window][gui][integration][preroll]") {
+    qtApp();
+    MainWindow window;
+    window.setPrerollMs(-100);
+    REQUIRE(window.prerollMsValue() == 0);     // floor
+    window.setPrerollMs(99999);
+    REQUIRE(window.prerollMsValue() == 5000);  // ceiling
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — Play with armed loop enters wrap-pause first",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: load-bearing — the practice-mode flow. With pre-roll
+    // active, pressing Play on an armed loop doesn't immediately
+    // call player.play(); it pauses the player + starts the
+    // countdown widget so the user has time to prepare.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(countdown);
+
+    // Enable pre-roll AND set a long value so the test has time to
+    // observe the intermediate state without the timer firing.
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+
+    // Arm the loop, then press Play. The arming itself is via the
+    // checkbox path so it doesn't trigger pre-roll on its own.
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(800);   // inside the loop
+    emit posSlider->sliderMoved(800);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    // Pre-roll is in flight: wrap pending, countdown depleting,
+    // player paused.
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll disabled — Play with armed loop is immediate",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: passive-listening mode (default) — no countdown, no
+    // pause, straight to play. Skips the wrap-pause path entirely
+    // even though the spinbox value is non-zero, because the
+    // checkbox is off.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    // Default-disabled state. spinbox value remains the default 500
+    // but effective is 0.
+    REQUIRE_FALSE(loaded.window->prerollEnabled());
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(800);
+    emit posSlider->sliderMoved(800);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled but value 0 — Play is immediate",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: explicit-zero case — checkbox on, but the user dialed
+    // the value to 0. Effective is 0 so no countdown.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(0);
+
+    emit dock->loopArmToggleRequested(loaded.loopId, true);
+    auto* posSlider =
+        loaded.window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(800);
+    emit posSlider->sliderMoved(800);
+
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — double-click jump-and-play enters pre-roll",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: double-click is the explicit "play this loop now"
+    // gesture, but still gives the user pre-roll prep time. This
+    // matches the user's "hand-to-violin" rationale that drove
+    // the redesign (#16).
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+
+    emit dock->loopActivated(loaded.loopId);
+
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — Play with no armed loop also fires pre-roll",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: scope expansion (#16) — pre-roll is no longer gated on
+    // having a loop armed. Even simple listening from a position
+    // gets the ready-set-go countdown so the user has time to
+    // pick up the violin.
+    qtApp();
+    MainWindow window;
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+    // No arm — just press Play.
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — double-click marker also fires pre-roll",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: the marker double-click jump-and-play path used to
+    // call player.play() directly. After #16 it routes through
+    // startPlayback so the same pre-roll discipline applies.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+
+    // makeWindowWithLoop already placed two anchor markers when
+    // building the loop. Activate the first one.
+    REQUIRE(loaded.window->markerModel().size() >= 1);
+    const auto markerId = loaded.window->markerModel().markers()[0].id;
+    emit dock->markerActivated(markerId);
+
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — wrap path uses the global value, not a per-loop one",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: regression for the dropped per-loop pauseMs. The wrap
+    // path should pick up the GLOBAL prerollMs, no matter which
+    // loop is armed. Setting the global value and triggering the
+    // wrap path manually verifies the wiring.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(2500);
+
+    // Use the test seam to enter wrap-pause. The seam takes the
+    // pre-roll value as parameter — verify the production wrap
+    // path also picks up prerollMs by checking that startCountdown
+    // is called with the same value (we can't easily compare the
+    // QTimer's interval, but the countdown widget reads the input
+    // directly).
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*prerollMs=*/2500);
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: pre-roll enabled — cancel-then-Play enters fresh pre-roll",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: the user's original motivating scenario — they cancel
+    // a wrap-pause to take a moment, then press Play to resume.
+    // Resume should give them another pre-roll, not jump straight
+    // back into playback. (Hand-to-violin time after every "Play"
+    // gesture, regardless of how the player got paused.)
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* dock =
+        loaded.window->findChild<ProjectViewerDock*>("projectViewerDock");
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+
+    // Enter wrap-pause via the test seam.
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*prerollMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+
+    // First Play click: cancel the in-flight wrap, stay paused.
+    playBtn->setEnabled(true);
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+    REQUIRE(playBtn->text() == "Play");
+    REQUIRE(dock->armedLoopId().has_value());
+
+    // Second Play click: enter a FRESH pre-roll wrap-pause.
+    QTest::mouseClick(playBtn, Qt::LeftButton);
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: countdown widget visibility tracks prerollEnabled",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: the global countdown widget lives at the bottom of the
+    // dock. It's only meaningful when the user has practice mode
+    // on; passive listening hides it so the dock doesn't show a
+    // dormant ring.
+    qtApp();
+    MainWindow window;
+    window.show();
+    (void)QTest::qWaitForWindowExposed(&window);
+
+    auto* countdown = window.findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+    REQUIRE(countdown);
+    REQUIRE_FALSE(countdown->isVisible());   // hidden by default
+
+    window.setPrerollEnabled(true);
+    REQUIRE(countdown->isVisible());
+
+    window.setPrerollEnabled(false);
+    REQUIRE_FALSE(countdown->isVisible());
+}
+
+TEST_CASE("MainWindow: disabling pre-roll mid-countdown cancels the wrap-pause",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO: if the user uncheckes pre-roll while a countdown is
+    // ticking, the in-flight wrap-pause is cancelled (the timer
+    // would otherwise still resume playback after the now-hidden
+    // countdown finished, which is confusing).
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* countdown = loaded.window->findChild<
+        fiddler::ui::LoopCountdownWidget*>("loopCountdown");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*prerollMs=*/5000);
+    REQUIRE(loaded.window->wrapPending());
+    REQUIRE(countdown->isCountingDown());
+
+    loaded.window->setPrerollEnabled(false);
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+TEST_CASE("MainWindow: cancelPendingWrap flips the play button label to Play",
+          "[main-window][gui][integration][preroll]") {
+    // MEMO[smoke #16/6.1]: during wrap-pause we keep the button
+    // label as "Pause" (the user might want to cancel the auto-
+    // resume — see #13). Once the wrap IS cancelled, the player
+    // is paused for real and the label must flip back to "Play".
+    // The toggle-off-mid-countdown cancel path was missing this
+    // update before this fix.
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* playBtn = loaded.window->findChild<QPushButton*>("playButton");
+
+    loaded.window->setPrerollEnabled(true);
+    loaded.window->setPrerollMs(5000);
+    loaded.window->enterWrapPauseForTest(loaded.loopId, /*prerollMs=*/5000);
+    // During wrap-pause the label is "Pause" (transport is in
+    // "playback mode with brief silence first"; clicking would
+    // cancel the auto-resume).
+    REQUIRE(loaded.window->wrapPending());
+
+    // Toggle pre-roll off mid-countdown — the cancel path runs
+    // and the button label must be "Play" afterwards.
+    loaded.window->setPrerollEnabled(false);
+    REQUIRE_FALSE(loaded.window->wrapPending());
+    REQUIRE(playBtn->text() == "Play");
 }

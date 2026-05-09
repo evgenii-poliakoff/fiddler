@@ -37,20 +37,18 @@ struct Loop {
     std::int64_t id        = 0;     // stable; never zero for valid loops
     std::int64_t startMs   = 0;     // inclusive
     std::int64_t endMs     = 0;     // exclusive (wrap-trigger boundary)
-    int          pauseMs   = 0;     // pause between repeats; 0 = none
     QString      name;              // auto-named on add() if empty
 };
 
 class LoopModel : public QObject {
     Q_OBJECT
 public:
-    // Default pause-between-repeats for newly-added loops. The user
-    // explicitly asked for ~500 ms — a short breath that lets the ear
-    // reset before the next pass without dragging the practice tempo.
-    // MEMO: see memory/feedback_simple_first.md — this lives at the
-    // model layer (single source of truth) rather than being baked
-    // into the L-press handler in MainWindow. UI may override per-loop.
-    static constexpr int kDefaultPauseMs = 500;
+    // MEMO: pause-between-repeats moved out of the per-loop model
+    // in issue #16. Hand-to-violin time is a property of the
+    // player + instrument, not the music — so it's now a global
+    // `prerollMs` setting on MainWindow, applied uniformly to
+    // every "loop body starts playing" transition. Loops are just
+    // (name, startMs, endMs) again.
 
     explicit LoopModel(QObject* parent = nullptr);
 
@@ -63,12 +61,9 @@ public:
     // Add a loop spanning [startMs, endMs). Returns the new loop's
     // stable ID, or 0 if the range is invalid (endMs <= startMs).
     // If `name` is empty, auto-named "Loop N" (monotonic counter).
-    // pauseMs defaults to kDefaultPauseMs; pass a different value to
-    // override (UI uses the default; tests sometimes want 0).
     std::int64_t add(std::int64_t startMs,
                      std::int64_t endMs,
-                     QString      name    = {},
-                     int          pauseMs = kDefaultPauseMs);
+                     QString      name = {});
 
     // Rename by ID. Empty name accepted (UI may need a transient
     // empty edit). Returns true if the loop existed.
@@ -79,10 +74,6 @@ public:
     bool setRange(std::int64_t id,
                   std::int64_t newStartMs,
                   std::int64_t newEndMs);
-
-    // Set pause-between-repeats in ms. Negative values clamp to 0.
-    // Returns true if the loop existed.
-    bool setPauseMs(std::int64_t id, int newPauseMs);
 
     // Remove a loop by ID. Drops the entry from addHistory_.
     bool remove(std::int64_t id);
