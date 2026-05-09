@@ -1394,6 +1394,85 @@ TEST_CASE("MainWindow: dock Ctrl+click on a marker creates a loop with L",
     REQUIRE(loop.endMs   == 1500);
 }
 
+TEST_CASE("MainWindow: bar selected on waveform + Ctrl+click marker in dock keeps secondary alive",
+          "[main-window][gui][integration][loops][dock-ctrl-click]") {
+    // MEMO: regression repro for the user's bug report — primary
+    // selection is a barline placed via the waveform; secondary
+    // gesture comes from Ctrl+click on a marker row in the dock.
+    // The sequence triggers two state-changing paths in close
+    // succession (loopAnchorAddRequested THEN markerSelectionChanged
+    // from the tree's selection change). We need to verify the
+    // secondary survives the second path's mutual-exclusion clearing
+    // so the paint code's isAnchor check still fires.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock     =
+        window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    // Setup: 1 barline at 500 ms, 1 marker at 1500 ms.
+    auto* posSlider = window->findChild<QSlider*>("positionSlider");
+    posSlider->setValue(500);
+    emit posSlider->sliderMoved(500);
+    QTest::keyClick(window.get(), Qt::Key_B);
+    posSlider->setValue(1500);
+    emit posSlider->sliderMoved(1500);
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->markerModel().size()  == 1);
+
+    // Clear any stale state from the auto-select-on-place path.
+    waveform->setSelectedMarkerId(std::nullopt);
+    waveform->setSecondaryAnchorMs(std::nullopt);
+
+    // Step 1: select the bar via waveform — sets selectedBarline_=0.
+    waveform->setSelectedBarline(0);
+    REQUIRE(waveform->selectedBarline() == 0);
+    REQUIRE_FALSE(waveform->selectedMarkerId().has_value());
+    REQUIRE_FALSE(waveform->secondaryAnchorMs().has_value());
+
+    // Step 2: Ctrl+click the marker row in the dock. This fires
+    // loopAnchorAddRequested first (capturing the bar's ms as
+    // secondary), then Qt processes the click and selection moves
+    // to the marker, triggering mutual exclusion that clears
+    // selectedBarline_.
+    auto* tree = dock->findChild<QTreeWidget*>("projectViewerTree");
+    REQUIRE(tree);
+    constexpr int kRole = Qt::UserRole + 1;
+    auto* category = tree->topLevelItem(0);
+    QTreeWidgetItem* markerRow = nullptr;
+    for (int i = 0; i < category->childCount(); ++i) {
+        if (category->child(i)->data(0, kRole).toLongLong()
+            == window->markerModel().markers()[0].id) {
+            markerRow = category->child(i);
+            break;
+        }
+    }
+    REQUIRE(markerRow);
+
+    QTest::mouseClick(tree->viewport(), Qt::LeftButton,
+                      Qt::ControlModifier,
+                      tree->visualItemRect(markerRow).center());
+
+    // The painted-as-dashed contract: secondaryAnchorMs_ holds the
+    // barline's ms, selectedBarline_ is cleared (mutual exclusion),
+    // selectedMarkerId_ points at the new marker. The bar's isAnchor
+    // check in paintEvent then fires.
+    REQUIRE(waveform->secondaryAnchorMs() == 500);
+    REQUIRE_FALSE(waveform->selectedBarline().has_value());
+    REQUIRE(*waveform->selectedMarkerId()
+            == window->markerModel().markers()[0].id);
+    // Same on staff (mirror).
+    REQUIRE(staff->secondaryAnchorMs() == 500);
+}
+
 TEST_CASE("MainWindow: dock secondary-anchor mirrors to staff",
           "[main-window][gui][integration][loops][dock-ctrl-click]") {
     // MEMO: when the dock fires loopAnchorAddRequested, MainWindow

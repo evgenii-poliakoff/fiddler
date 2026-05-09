@@ -1101,6 +1101,58 @@ TEST_CASE("WaveformWidget: paint survives secondary anchor on a marker ms",
     SUCCEED();
 }
 
+TEST_CASE("WaveformWidget: dashed barline at secondary anchor renders distinctly",
+          "[waveform-widget][gui][secondary-anchor]") {
+    // MEMO: pixel-level regression — render the widget to a QImage
+    // and inspect the column at the barline's x. The fix replaced
+    // the standalone tick with an artifact-painted-dashed rendering;
+    // verify the column is dashed (mix of yellow + non-yellow rows)
+    // rather than solid yellow.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 200);
+
+    auto barlines = std::make_shared<BarlineModel>();
+    barlines->add(1000);   // x=200 in an 800-px / 4-second view
+    w.setBarlineModel(barlines);
+
+    // No primary selection on the bar (mirrors the user's bug
+    // scenario: after Ctrl+click in dock, mutual exclusion clears
+    // selectedBarline_ on the waveform).
+    w.setSecondaryAnchorMs(1000);
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(w.secondaryAnchorMs() == 1000);
+
+    // Render to image without showing the widget.
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Walk down the column at x=200 and bin pixels into "bright
+    // yellow" (dashed pen color 255,220,130 ± slack) vs "dark/other"
+    // (gap or no line). A dashed line should produce both kinds in
+    // roughly equal measure; a solid line produces only bright
+    // yellow rows.
+    const int x = 200;
+    int yellowRows = 0;
+    int otherRows  = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        const QColor c = image.pixelColor(x, y);
+        const bool isYellow = c.red() > 200 && c.green() > 180
+                           && c.blue() < 180;
+        if (isYellow) ++yellowRows;
+        else          ++otherRows;
+    }
+
+    // Both kinds must appear — that's what makes the line "dashed".
+    // The exact ratio depends on Qt's dash pattern at width 2, but
+    // we should see plenty of both. Pick a generous threshold so
+    // tiny rendering changes don't flap the test.
+    REQUIRE(yellowRows > 20);
+    REQUIRE(otherRows  > 20);
+}
+
 TEST_CASE("WaveformWidget: setSecondaryAnchorMs is idempotent",
           "[waveform-widget][gui][secondary-anchor]") {
     qtApp();
