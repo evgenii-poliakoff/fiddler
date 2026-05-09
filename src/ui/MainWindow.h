@@ -164,6 +164,14 @@ private slots:
 private:
     void buildMenus();
     void buildCentralWidget();
+    // Save / restore window geometry + dock layout in QSettings.
+    // MEMO: the user can close the project viewer dock via its X
+    // button; without persistence they'd be greeted by a fresh-
+    // looking layout on every launch. QSettings encodes the
+    // current dock layout, including which docks are hidden,
+    // floating, or resized.
+    void saveLayout() const;
+    void restoreLayout();
 
     // Owned audio engine. Forward-declared so Player.h's PortAudio /
     // FFmpeg fwd-decls don't ripple into Qt-only TUs.
