@@ -68,15 +68,21 @@ QPixmap grabAtScale(QWidget& w, const QRect& rect, double scale) {
 }
 
 // Union the geometries of named widgets, mapped into the main
-// window's coordinate space. Returns an empty QRect if no name
-// resolves to a widget.
+// window's coordinate space. Names that don't resolve to a widget
+// are appended to `outMissing` so the caller can fail loudly;
+// silently dropping a missing name produced wrong-but-plausible
+// PNGs (a partial union of just the names that did resolve).
 QRect unionInWindow(const ui::MainWindow& window,
-                    const QStringList& names)
+                    const QStringList& names,
+                    QStringList& outMissing)
 {
     QRect out;
     for (const QString& name : names) {
         auto* widget = window.findChild<QWidget*>(name);
-        if (!widget) continue;
+        if (!widget) {
+            outMissing.append(name);
+            continue;
+        }
         const QRect r(widget->mapTo(&window, QPoint{0, 0}),
                       widget->size());
         out = out.isEmpty() ? r : out.united(r);
@@ -220,12 +226,22 @@ bool runScene(ui::MainWindow& window,
         break;
     }
     case CaptureKind::Region: {
-        QRect region = unionInWindow(window, spec.capture.objectNames);
+        QStringList missing;
+        QRect region = unionInWindow(
+            window, spec.capture.objectNames, missing);
+        if (!missing.isEmpty()) {
+            std::cerr << "screenshot: '"
+                      << spec.id.toStdString()
+                      << "' — unresolved object name(s): "
+                      << missing.join(", ").toStdString()
+                      << "\n";
+            return false;
+        }
         if (region.isEmpty()) {
             std::cerr << "screenshot: '"
                       << spec.id.toStdString()
-                      << "' — none of the listed object names "
-                         "resolved to a widget\n";
+                      << "' — region is empty (no object names "
+                         "given?)\n";
             return false;
         }
         region = padRect(region, marginH, marginV,
