@@ -91,6 +91,13 @@ public:
     [[nodiscard]] virtual std::int64_t xToMs(int x) const noexcept = 0;
     [[nodiscard]] virtual int          msToX(std::int64_t ms) const noexcept = 0;
 
+    // Test seam (#22) — query the live drag-ghost ms for an
+    // artifact, or nullopt if no ghost matches it. Used by
+    // integration tests to verify that the sister widget mirrored
+    // a partner-driven drag.
+    [[nodiscard]] std::optional<std::int64_t>
+        dragGhostMs(std::int64_t id) const noexcept;
+
 public slots:
     void setPositionMs(std::int64_t ms);
     // MEMO: setting any one selection clears the others (cross-kind
@@ -99,6 +106,16 @@ public slots:
     void setSelectedMarkerId(std::optional<std::int64_t> id);
     void setSelectedLoopId(std::optional<std::int64_t> id);
     void setSecondaryAnchorMs(std::optional<std::int64_t> ms);
+
+    // Drag-ghost mirrors (issue #22). When the partner widget is
+    // driving a drag, MainWindow forwards its live ghost position
+    // to this widget so the dragged artifact glides under the
+    // cursor on BOTH surfaces, not just the one being touched.
+    // The model isn't written during the drag — the ghost is a
+    // paint-only override; the model commits once on release.
+    void setMarkerDragGhost(std::int64_t id, std::int64_t ms);
+    void setLoopDragGhost  (std::int64_t id, bool isStart, std::int64_t ms);
+    void clearDragGhost();
 
 signals:
     void seekRequested(std::int64_t ms);
@@ -109,16 +126,31 @@ signals:
     void barlineDeleteRequested (std::size_t index);
     void markerDeleteRequested  (std::int64_t id);
 
-    // Live drag updates (issue #11). Fired on every mouse-move past
-    // the click-vs-drag threshold so the dock + sibling widgets see
-    // the artifact track the cursor in real time. MainWindow turns
-    // these into MarkerModel::setPosition / LoopModel::setRange
-    // calls — the widget holds only `shared_ptr<const>` handles, so
-    // model writes have to round-trip through the parent.
+    // Live drag updates (issues #11, #22). Fired on every mouse-move
+    // past the click-vs-drag threshold. MainWindow forwards these to
+    // the SISTER widget's drag-ghost slots so the artifact glides
+    // under the cursor on both surfaces. The model is NOT written
+    // during the drag — the ghost is a paint-only override; the
+    // single model write happens on release via *DragCommitted.
+    //
+    // MEMO[#22]: pre-#22 this signal triggered a per-move
+    // setPosition / setRange that re-sorted the model and rebuilt
+    // the dock tree, starving the GUI thread. Decoupling the live
+    // path from model writes is what makes the drag visually
+    // smooth at typical mouse speeds.
     void markerDragRequested(std::int64_t id, std::int64_t newMs);
     void loopDragRequested  (std::int64_t id,
                              std::int64_t newStartMs,
                              std::int64_t newEndMs);
+
+    // One-shot signals bracketing an active drag — fired when the
+    // user crosses the click-vs-drag threshold (started) and on
+    // release after a successful commit (ended). MainWindow uses
+    // these to pause the playback-position poll while the drag is
+    // in flight, removing one more source of mid-drag repaint
+    // noise.
+    void dragStarted();
+    void dragEnded();
 
     // Fired ONCE on mouse release after a drag has actually committed
     // (i.e. the threshold was crossed). MainWindow logs this; the
@@ -152,6 +184,20 @@ protected:
     // the subclass implements.
     [[nodiscard]] std::int64_t pixelsToMs(int px) const noexcept;
 
+    // Drag-ghost overrides for paint code (issue #22). Subclass
+    // paintMarkers / paintLoops call these instead of reading
+    // sourceMs / startMs / endMs from the model directly. If a
+    // drag ghost matches the artifact, the ghost's ms wins; else
+    // the model's value is returned unchanged. This is what makes
+    // the dragged tick glide under the cursor without writing to
+    // the model on every mouse-move.
+    [[nodiscard]] std::int64_t effectiveMarkerMs(std::int64_t id,
+                                                 std::int64_t modelMs) const noexcept;
+    [[nodiscard]] std::pair<std::int64_t, std::int64_t>
+        effectiveLoopRange(std::int64_t id,
+                           std::int64_t modelStartMs,
+                           std::int64_t modelEndMs) const noexcept;
+
 private slots:
     void onBarlineModelChanged();
     void onMarkerModelChanged();
@@ -169,6 +215,29 @@ private:
     QPoint       dragPressPos_;
     bool         dragActive_     = false;
     std::int64_t dragOriginalMs_ = 0;
+
+    // Per-move snapshot of the dragged artifact's "where would it
+    // land if released right now" position. Set on press (with
+    // `dragOriginalMs_`), updated on every mouseMove past the
+    // click-vs-drag threshold, cleared on release / cancel.
+    // Subclass paint code consults `effectiveMarkerMs` /
+    // `effectiveLoopRange` rather than the model directly so the
+    // dragged tick paints at the ghost ms without a model write.
+    //
+    // The same struct holds the SISTER widget's ghost when the
+    // partner is driving — both widgets paint with the same data.
+    struct DragGhost {
+        DragKind     kind = DragKind::None;
+        std::int64_t id   = 0;
+        std::int64_t ms   = 0;
+    };
+    std::optional<DragGhost> dragGhost_;
+
+    // Cache of the last seekRequested value so a per-move drag
+    // doesn't keep firing identical seeks (mouse-move events can
+    // burst at the same pixel, especially under load — log noise
+    // and wasted player work).
+    std::optional<std::int64_t> lastSeekMs_;
 
     // Hit-test the loop band edges at pixel x. Returns the loop id
     // and which edge (start/end) was hit, within `kEdgeTolerancePx`.

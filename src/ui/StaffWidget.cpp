@@ -183,8 +183,12 @@ void StaffWidget::paintLoops(QPainter& painter) const {
     const QFontMetrics fm(labelFont);
 
     for (const auto& l : loops) {
-        const int xStart = msToX(l.startMs);
-        const int xEnd   = msToX(l.endMs);
+        // MEMO[#22]: paint via effective range so a live edge drag
+        // glides here too, not just on the widget being touched.
+        const auto [effStart, effEnd] =
+            effectiveLoopRange(l.id, l.startMs, l.endMs);
+        const int xStart = msToX(effStart);
+        const int xEnd   = msToX(effEnd);
         if (xEnd <= 0 || xStart >= width()) continue;
 
         const int xLeft  = std::max(0, xStart);
@@ -271,11 +275,13 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
     const QFontMetrics fm(flagFont);
 
     for (const auto& m : markers) {
-        const int x = msToX(m.sourceMs);
+        // MEMO[#22]: paint via effective ms so a live drag glides.
+        const auto effMs = effectiveMarkerMs(m.id, m.sourceMs);
+        const int x = msToX(effMs);
         if (x < 0 || x >= width()) continue;
         const bool selected = (selMark == m.id);
         const bool isAnchor = secAnchor.has_value()
-                          && m.sourceMs == *secAnchor;
+                          && effMs == *secAnchor;
         const QColor lineCol = selected
             ? QColor(140, 230, 250)
             : QColor(100, 200, 220);
@@ -364,8 +370,10 @@ void StaffWidget::paintSelectedLoopEdges(QPainter& painter) const {
     const auto idx = lpModel->indexOf(*selLoop);
     if (!idx) return;
     const auto& sel = lpModel->loops()[*idx];
-    const int xStart = msToX(sel.startMs);
-    const int xEnd   = msToX(sel.endMs);
+    const auto [effStart, effEnd] =
+        effectiveLoopRange(sel.id, sel.startMs, sel.endMs);
+    const int xStart = msToX(effStart);
+    const int xEnd   = msToX(effEnd);
     const int xLeft  = std::max(0, xStart);
     const int xRight = std::min(width(), xEnd);
     const QColor edgeCol(180, 240, 200, 255);

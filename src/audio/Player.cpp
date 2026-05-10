@@ -150,23 +150,38 @@ void Player::seek(std::chrono::milliseconds position) {
 
     FLOG_DEBUG("player", "seek to {} ms", position.count());
 
+    // MEMO[#22]: non-blocking from the GUI's perspective. The
+    // decoder thread holds mutex_ during its FFmpeg read + ring
+    // write, which blocks ~140 ms when the ring is being filled.
+    // Pre-#22 Player::seek acquired that mutex on the GUI thread
+    // and stalled at typical drag speeds. Now we just publish the
+    // pending position and update the anchor; the decoder thread
+    // does decoder_.seek + stretcher_->reset + ring_->reset at
+    // the top of its next iteration.
+    //
+    // Pa_Stop/Start stays on the GUI side for now — those are
+    // 1–9 ms each, real but not the dominant cost. Removing them
+    // requires the audio callback to gracefully ride a ring reset,
+    // which is bigger architectural work (filed as a follow-up).
     const bool wasPlaying = (state_.load() == TransportState::Playing);
     if (wasPlaying && stream_ && Pa_IsStreamActive(stream_) == 1) {
         Pa_StopStream(stream_);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        decoder_.seek(position);
-        if (stretcher_) stretcher_->reset();
-        if (ring_) ring_->reset();
-        eofFlushed_ = false;
-        // Anchor the source position at the seek target. We don't
-        // touch framesPlayed_ — the callback keeps counting from
-        // wherever it was; the anchor delta starts at zero.
-        anchorSourceMs_.store(position.count());
-        anchorOutFrames_.store(framesPlayed_.load());
-    }
+    // Anchor the source position at the seek target IMMEDIATELY so
+    // position() returns the new value to GUI callers (cursor
+    // follow during drag) without waiting for the decoder thread.
+    // The atomics are observed by the audio callback's position
+    // formula too, but the deltaFrames component clamps to zero
+    // until framesPlayed_ ticks past the new anchorOutFrames_.
+    anchorSourceMs_.store(position.count());
+    anchorOutFrames_.store(framesPlayed_.load());
+
+    // Hand off the heavy decoder.seek + stretcher.reset to the
+    // decoder thread. exchange semantics: if a previous seek is
+    // still pending, this one overwrites it — the decoder will
+    // see only the latest target, which is correct for drag.
+    pendingSeekMs_.store(position.count());
 
     if (wasPlaying && stream_) {
         Pa_StartStream(stream_);
@@ -241,6 +256,23 @@ void Player::decoderThread() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (decoder_.isOpen() && ring_ && stretcher_) {
+                // 0a. (#22) Pending seek? Pull the latest value
+                //     out and execute the heavy seek work here on
+                //     the decoder thread, off the GUI hot path.
+                //     exchange returns whatever was there; -1
+                //     means no seek pending. The GUI may overwrite
+                //     this between the load and our exchange — that's
+                //     fine, we'll catch the newer value next iteration.
+                const auto pending =
+                    pendingSeekMs_.exchange(kNoPendingSeek);
+                if (pending != kNoPendingSeek) {
+                    decoder_.seek(std::chrono::milliseconds{pending});
+                    stretcher_->reset();
+                    ring_->reset();
+                    eofFlushed_ = false;
+                    didWork = true;
+                }
+
                 // 0. If the GUI moved the tempo slider since last
                 //    iteration, advance the position anchor using the
                 //    OLD ratio (so source-time stays consistent up to
