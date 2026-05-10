@@ -1,0 +1,201 @@
+# Scene manifest for fiddler-screenshots.
+#
+# Each scene is a declarative description of one PNG to capture
+# from the running app. The tool reads this file, runs each scene
+# in order, and writes the named output into docs/img/.
+#
+# Schema:
+#
+#   - id: <stable-identifier>          # used in logs; usually matches output basename
+#     output: <basename>.png            # written under docs/img/
+#     capture: window                   # full main-window grab (overview)
+#     capture:
+#       region: [objName, objName, ...] # bounding box of these widgets, unioned
+#     capture:
+#       element: objName                # one widget, padded with margin
+#     capture:
+#       popup: comboObjName             # closed combo cell + its open popup
+#                                       # stacked vertically (use show-popup
+#                                       # in setup to open it)
+#     setup:                            # optional list of named actions
+#       - <action-name>
+#       - <action-name>: <arg-string>   # action with a positional argument
+#     margin:                           # optional override; default = style metric
+#       horizontal: 12
+#       vertical: 16
+#     dpi-scale: 2.0                    # optional override; default 2.0 (retina)
+#
+# Setup actions are registered in scene_actions.cpp. Available:
+#   - load-fixture
+#   - preroll-enable / preroll-disable
+#   - set-tempo: <percent>
+#   - seek-ms: <ms>
+#   - tap-barlines-at: <ms,ms,...>
+#   - tap-markers-at: <ms,ms,...>
+#   - select-marker: <ordinal>
+#   - select-loop: <ordinal>
+#   - build-loop-marker-pair: <a,b>
+#   - show-popup: <comboObjName>
+#   - enter-countdown: <ordinal>
+#
+# Each scene starts from a freshly-loaded fixture (load-fixture
+# clears all artifacts), so order between scenes doesn't matter.
+
+# ---- Chapters 1, 3 — overview hero shot ----------------------------------
+
+- id: manual-overview
+  output: manual-overview.png
+  capture: window
+  setup:
+    - load-fixture
+    - tap-markers-at: 1500,3500,5500
+    - tap-barlines-at: 2000,4000,6000
+    - build-loop-marker-pair: 1,3
+    - select-loop: 1
+
+# ---- Chapter 4 — playback controls ---------------------------------------
+
+- id: manual-transport-row
+  output: manual-transport-row.png
+  capture:
+    region:
+      - playButton
+      - stopButton
+      - tuneTypeCombo
+      - prerollLabel
+      - prerollEnabledBox
+      - prerollBox
+  setup:
+    - load-fixture
+  margin:
+    vertical: 2
+
+- id: manual-tempo-slider
+  output: manual-tempo-slider.png
+  capture:
+    region: [tempoLabel, tempoSlider]
+  setup:
+    - load-fixture
+    - set-tempo: 70
+  margin:
+    horizontal: 16
+    vertical: 8
+
+- id: manual-position-slider
+  output: manual-position-slider.png
+  capture:
+    region: [positionSlider]
+  setup:
+    - load-fixture
+    - seek-ms: 3000
+  margin:
+    vertical: 4
+
+# ---- Chapter 5 — barlines + tune type ------------------------------------
+
+- id: manual-staff-barlines
+  output: manual-staff-barlines.png
+  capture:
+    region: [staffWidget]
+  setup:
+    - load-fixture
+    - tap-barlines-at: 1000,3000,5000,7000
+  # Staff sits between waveform and position slider; both abut.
+  # Zero vertical margin avoids bleeding into the neighbours.
+  margin:
+    vertical: 0
+
+- id: manual-tune-picker
+  output: manual-tune-picker.png
+  capture:
+    popup: tuneTypeCombo
+  setup:
+    - load-fixture
+    - show-popup: tuneTypeCombo
+  margin:
+    horizontal: 8
+    vertical: 6
+
+# ---- Chapter 6 — markers --------------------------------------------------
+
+- id: manual-marker-flag
+  output: manual-marker-flag.png
+  capture:
+    region: [waveformWidget]
+  setup:
+    - load-fixture
+    - tap-markers-at: 2000,4500
+    - select-marker: 1
+  margin:
+    vertical: 0
+
+- id: manual-dock-markers
+  output: manual-dock-markers.png
+  capture:
+    region: [projectViewerDock]
+  setup:
+    - load-fixture
+    - tap-markers-at: 1500,3500,5500
+    - select-marker: 2
+
+# ---- Chapter 7 — practice loops ------------------------------------------
+
+- id: manual-loop-band
+  output: manual-loop-band.png
+  capture:
+    region: [waveformWidget]
+  setup:
+    - load-fixture
+    - tap-markers-at: 1500,5500
+    - build-loop-marker-pair: 1,2
+    - select-loop: 1
+  margin:
+    vertical: 0
+
+- id: manual-loop-edge-snap
+  output: manual-loop-edge-snap.png
+  capture:
+    region: [waveformWidget]
+  setup:
+    - load-fixture
+    - tap-barlines-at: 2000,4000,6000
+    - tap-markers-at: 1500,5500
+    - build-loop-marker-pair: 1,2
+    - select-loop: 1
+  margin:
+    vertical: 0
+
+- id: manual-preroll-group
+  output: manual-preroll-group.png
+  capture:
+    region: [prerollLabel, prerollEnabledBox, prerollBox]
+  setup:
+    - load-fixture
+    - preroll-enable
+
+- id: manual-preroll-countdown
+  output: manual-preroll-countdown.png
+  capture:
+    region: [loopCountdown]
+  setup:
+    - load-fixture
+    - tap-markers-at: 1500,5500
+    - build-loop-marker-pair: 1,2
+    - preroll-enable
+    - enter-countdown: 1
+  margin:
+    horizontal: 12
+    vertical: 12
+
+# ---- Chapter 8 — project viewer dock -------------------------------------
+
+- id: manual-dock-detail
+  output: manual-dock-detail.png
+  capture:
+    region: [projectViewerDock]
+  setup:
+    - load-fixture
+    - tap-markers-at: 1500,3500,5500
+    - tap-barlines-at: 2000,4000,6000
+    - build-loop-marker-pair: 1,3
+    - select-loop: 1

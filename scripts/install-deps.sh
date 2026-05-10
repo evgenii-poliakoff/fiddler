@@ -19,6 +19,7 @@ sudo apt-get install -y \
     portaudio19-dev \
     librubberband-dev \
     libspdlog-dev \
+    libyaml-cpp-dev \
     catch2
 
 echo "Dependencies installed."

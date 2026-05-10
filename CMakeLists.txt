@@ -41,7 +41,15 @@ pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
 # the canonical integration point. See Rule 3 in docs/architecture.md.
 pkg_check_modules(RUBBERBAND REQUIRED IMPORTED_TARGET rubberband)
 
+# yaml-cpp — used by tools/screenshots to parse the scene manifest.
+# Per the same Rule 3 (prefer pkg-config on Ubuntu), libyaml-cpp-dev
+# ships yaml-cpp.pc, so we pull it in via pkg_check_modules. Optional
+# overall: only the screenshots tool links against it; the app + tests
+# don't care.
+pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
+
 enable_testing()
 
 add_subdirectory(src)
 add_subdirectory(tests)
+add_subdirectory(tools/screenshots)
