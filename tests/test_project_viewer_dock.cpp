@@ -82,6 +82,39 @@ findMarkerRow(QTreeWidget& tree, std::int64_t id) {
     return nullptr;
 }
 
+// Wire the dock's edit-request signals back into the model. In
+// production MainWindow does this AND captures undo snapshots; the
+// dock's unit tests don't care about undo, so a thin pass-through
+// preserves the old "edit a field, model updates" assertion shape.
+// MEMO: keep this in sync with the equivalent connect block in
+// MainWindow (src/ui/MainWindow.cpp's "Property-page edits" comment)
+// so the dock's contract is exercised the same way both places.
+void wireDockMarkerWritesToModel(ProjectViewerDock& dock,
+                                 std::shared_ptr<MarkerModel> model) {
+    QObject::connect(&dock, &ProjectViewerDock::markerRenameRequested,
+                     model.get(), [m = model](std::int64_t id, QString name) {
+                         m->rename(id, std::move(name));
+                     });
+    QObject::connect(&dock, &ProjectViewerDock::markerPositionEditRequested,
+                     model.get(), [m = model](std::int64_t id, std::int64_t newMs) {
+                         m->setPosition(id, newMs);
+                     });
+}
+
+void wireDockLoopWritesToModel(ProjectViewerDock& dock,
+                               std::shared_ptr<LoopModel> model) {
+    QObject::connect(&dock, &ProjectViewerDock::loopRenameRequested,
+                     model.get(), [m = model](std::int64_t id, QString name) {
+                         m->rename(id, std::move(name));
+                     });
+    QObject::connect(&dock, &ProjectViewerDock::loopRangeEditRequested,
+                     model.get(), [m = model](std::int64_t id,
+                                               std::int64_t s,
+                                               std::int64_t e) {
+                         m->setRange(id, s, e);
+                     });
+}
+
 // Same for loops — Loops category is at top-level index 1.
 QTreeWidgetItem*
 findLoopRow(QTreeWidget& tree, std::int64_t id) {
@@ -216,6 +249,7 @@ TEST_CASE("ProjectViewerDock: editing the Name field renames the marker",
     const std::int64_t stamps[] = { 1000 };
     auto model = makeModelWith(std::span<const std::int64_t>{stamps});
     dock.setMarkerModel(model);
+    wireDockMarkerWritesToModel(dock, model);
     dock.setSelectedMarkerId(*model->idAt(0));
 
     auto* nameEdit =
@@ -236,6 +270,7 @@ TEST_CASE("ProjectViewerDock: editing the Position spinbox moves the marker",
     const std::int64_t stamps[] = { 1000 };
     auto model = makeModelWith(std::span<const std::int64_t>{stamps});
     dock.setMarkerModel(model);
+    wireDockMarkerWritesToModel(dock, model);
     const auto markerId = *model->idAt(0);
     dock.setSelectedMarkerId(markerId);
 
@@ -269,6 +304,7 @@ TEST_CASE("ProjectViewerDock: in-progress spinbox edits don't strip leading zero
     const std::int64_t stamps[] = { 30004 };
     auto model = makeModelWith(std::span<const std::int64_t>{stamps});
     dock.setMarkerModel(model);
+    wireDockMarkerWritesToModel(dock, model);
     dock.setSelectedMarkerId(*model->idAt(0));
 
     QSignalSpy modelSpy(model.get(), &MarkerModel::changed);
@@ -616,6 +652,7 @@ TEST_CASE("ProjectViewerDock: editing loop Start round-trips through setRange",
     auto model = makeLoopModelWith(
         std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
     dock.setLoopModel(model);
+    wireDockLoopWritesToModel(dock, model);
     const auto loopId = *model->idAt(0);
     dock.setSelectedLoopId(loopId);
 
@@ -636,6 +673,7 @@ TEST_CASE("ProjectViewerDock: editing loop End round-trips through setRange",
     auto model = makeLoopModelWith(
         std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
     dock.setLoopModel(model);
+    wireDockLoopWritesToModel(dock, model);
     dock.setSelectedLoopId(*model->idAt(0));
 
     auto* endBox = dock.findChild<QSpinBox*>("loopEndBox");
@@ -659,6 +697,7 @@ TEST_CASE("ProjectViewerDock: editing the loop Name round-trips through rename",
     auto model = makeLoopModelWith(
         std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
     dock.setLoopModel(model);
+    wireDockLoopWritesToModel(dock, model);
     dock.setSelectedLoopId(*model->idAt(0));
 
     auto* nameEdit = dock.findChild<QLineEdit*>("loopNameEdit");

@@ -57,6 +57,22 @@ public:
     // same source-ms are allowed.
     std::int64_t add(std::int64_t sourceMs, QString name = {});
 
+    // Re-insert a marker that was previously deleted, restoring its
+    // original ID and name. Used by the unified undo path so a
+    // delete-undo round-trips ID-stable selection / dock state.
+    // Returns true on success; false if `id` is already in use or
+    // not positive. nextId_ is bumped so future `add()` calls don't
+    // collide with the restored id.
+    //
+    // MEMO: deliberately a thin extension of add() — same insertion
+    // logic, just with a caller-supplied id and no auto-naming.
+    // Intended for the undo-of-delete path; safe to call from
+    // anywhere, but `add()` is the right gesture for normal
+    // placements because it allocates a fresh id.
+    bool addWithId(std::int64_t id,
+                   std::int64_t sourceMs,
+                   QString      name);
+
     // Rename by ID. Returns true if the marker existed. The new name
     // can be empty — we don't enforce non-empty names since the
     // property editor needs to allow temporary empty edits.
@@ -68,17 +84,11 @@ public:
     bool setPosition(std::int64_t id, std::int64_t newSourceMs);
 
     // Remove a marker by ID. Returns true if anything was removed.
-    // Also drops the entry from the placement-history LIFO so a
-    // subsequent undoLastAdd() doesn't try to re-remove it.
     bool remove(std::int64_t id);
 
-    // Drop everything: markers, placement history, and counters all
-    // reset to their default-constructed state. Used on file load.
+    // Drop everything: markers and counters reset to their
+    // default-constructed state. Used on file load.
     void clear();
-
-    // Remove the most-recently-placed marker still present in the
-    // model (LIFO order). Returns true if anything was removed.
-    bool undoLastAdd();
 
     // Find the index (in sorted order) of the marker with the given
     // ID. Used by widgets to translate an ID-based selection into
@@ -102,10 +112,6 @@ private:
     // Sorted ascending by sourceMs. Ties broken by ID (older
     // first) so the order is fully deterministic.
     std::vector<Marker> markers_;
-
-    // LIFO of IDs in placement order. Kept consistent with
-    // markers_: remove() and clear() drop the corresponding entry.
-    std::vector<std::int64_t> addHistory_;
 
     // MEMO: monotonic counters — never reused across this model's
     // lifetime. clear() resets them so a fresh project starts

@@ -78,7 +78,7 @@ Tap-to-place is the primary gesture for adding barlines. Clicking on the wavefor
 
 Drag a placed barline to nudge its position. Press it on the waveform or the staff and drag horizontally; release to commit. The cursor follows the barline as you drag, so you hear where you're moving it to.
 
-To delete a barline, click it once to select, then press **Delete**. To take back the most recent placement, press **Ctrl+Z**.
+To delete a barline, click it once to select, then press **Delete**. To take back the most recent edit — a placement, a drag, a position change in the dock, a delete, or a rename — press **Ctrl+Z**.
 
 ### Tune type and time signature
 
@@ -174,7 +174,9 @@ Press **F4** to hide or show the dock. The dock's visibility persists across ses
 
 ## 9. Undo and reopen
 
-Press **Ctrl+Z** to undo the most recent placement. The undo history covers barlines, markers, and loops in the order you placed them, regardless of kind.
+Press **Ctrl+Z** to reverse the most recent edit. The undo history covers every kind of action across barlines, markers, and loops, in the order you took them: placements, drags, dock spinbox edits, renames, and deletes. Pre-roll changes — both the duration spinbox and the enable checkbox — are covered too. A deleted artifact returns with the same name and the same position it had before.
+
+Repeated **Ctrl+Z** presses walk back through the history one step at a time. When the history drains, further presses are quiet no-ops. Redo (**Ctrl+Shift+Z**) is on the roadmap.
 
 Note that Fiddler does not yet save its project state to disk: closing the window discards the placed barlines, markers, and loops. The window's geometry, dock visibility, and pre-roll settings do persist between sessions. Project save and reopen is on the roadmap.
 
@@ -191,7 +193,7 @@ Note that Fiddler does not yet save its project state to disk: closing the windo
 | **Drag** | Move a marker tick or a loop edge | waveform, staff |
 | **Double-click** | Jump and play a marker; jump, arm, and play a loop | dock |
 | **Delete** | Remove the selected artifact | anywhere |
-| **Ctrl+Z** | Undo the most recent placement | anywhere |
+| **Ctrl+Z** | Undo the most recent edit (placement, drag, dock edit, rename, or delete) | anywhere |
 | **F4** | Show / hide the project viewer dock | anywhere |
 | **Esc** | Clear the current selection | waveform, staff |
 | **← / →** | Step through artifacts of the same kind | waveform, staff |

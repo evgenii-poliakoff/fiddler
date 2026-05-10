@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "ui/UndoEntry.h"
+
 #include <QMainWindow>
 #include <atomic>
 #include <cstddef>
@@ -114,6 +116,15 @@ public:
     [[nodiscard]] const score::LoopModel&    loopModel()    const noexcept;
 
 protected:
+    // MEMO: per-widget event filter installed on every input that
+    // would otherwise consume Ctrl+Z for its own text-undo
+    // (QSpinBox / QLineEdit accept Qt::ShortcutOverride for the
+    // standard editing shortcuts). The filter rejects the
+    // override so our window-level Ctrl+Z always reverses the
+    // last document edit, regardless of focus. ProjectViewerDock
+    // installs an equivalent filter on its own inputs.
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
     // MEMO: closeEvent is overridden purely to emit a `[ui.file] close`
     // log line — when the user closes the window we want the log to
     // record the boundary of the session, so a later log-replay test
@@ -144,12 +155,15 @@ private slots:
     // user can rename via the project viewer dock.
     void onTapMarker();
 
-    // The 'Ctrl+Z' shortcut: peel the most-recently-added artifact
-    // (barline, marker, or loop — whichever was most recent) from
-    // its model. MEMO: see placementHistory_ — this is the combined
-    // LIFO that makes "Z = undo last placement" feel right
-    // regardless of kind.
-    void onUndoLastPlacement();
+    // The 'Ctrl+Z' shortcut: reverse the most recent user-driven
+    // model mutation, regardless of kind — placement, drag, dock
+    // edit, rename, or delete. MEMO: see undoHistory_ — every push
+    // point captures enough state to round-trip the mutation
+    // exactly (e.g. drag-undo restores the pre-drag position;
+    // delete-undo restores the artifact with its original id and
+    // name). Per `feedback_simple_first.md` the implementation is
+    // a tagged-variant LIFO, not QUndoStack.
+    void onUndo();
 
     // The 'L' shortcut: turn a primary + secondary anchor pair into
     // a new loop. Reads both anchors off the waveform widget; the
@@ -208,6 +222,16 @@ private slots:
     // start happening at endMs); `armed=false` disarms.
     void onLoopArmToggleRequested(std::int64_t id, bool armed);
 
+    // Property-page edit slots. The dock emits these (instead of
+    // mutating the model directly) so MainWindow can snapshot the
+    // pre-edit value into the undo history before applying.
+    void onDockMarkerRenameRequested      (std::int64_t id, QString name);
+    void onDockMarkerPositionEditRequested(std::int64_t id, std::int64_t newMs);
+    void onDockLoopRenameRequested        (std::int64_t id, QString name);
+    void onDockLoopRangeEditRequested     (std::int64_t id,
+                                           std::int64_t newStartMs,
+                                           std::int64_t newEndMs);
+
     // Connected to LoopModel::changed — drops the armed state if
     // the armed loop has been removed from the model.
     void onLoopModelChanged();
@@ -234,6 +258,19 @@ private slots:
     void onDeleteSelectedArtifact();
 
 private:
+    // Push a drag-commit's pre-drag snapshot onto the undo history.
+    // Called from the markerDragCommitted / loopDragCommitted slot
+    // lambdas after the model has already taken the new value —
+    // the signal carries fromMs (pre-drag) which we use as the
+    // previous-value to restore on Ctrl+Z.
+    void pushMarkerDragCommit(std::int64_t id,
+                              std::int64_t fromMs,
+                              std::int64_t toMs);
+    void pushLoopDragCommit  (std::int64_t id,
+                              bool         isStart,
+                              std::int64_t fromMs,
+                              std::int64_t toMs);
+
     void buildMenus();
     void buildCentralWidget();
     // Save / restore window geometry + dock layout in QSettings.
@@ -292,18 +329,24 @@ private:
     // logs and forwards. Reset after the forwarding calls return.
     bool mirroringSelection_ = false;
 
-    // Combined undo LIFO across barlines + markers, owned by
-    // MainWindow rather than by either model. Each tap pushes its
-    // kind; Ctrl+Z pops the back and dispatches to the matching
-    // model's undoLastAdd. MEMO: invariant — manual deletion of an
-    // artifact via Del does *not* update this stack, so a stale
-    // entry can sit at the top after a delete; onUndoLastPlacement
-    // peels through stale entries until either an undoLastAdd
-    // succeeds or the history drains. See feedback_simple_first.md
-    // — this is the simple route; a full QUndoStack would be richer
-    // but we don't need redo or cross-action undo yet.
-    enum class PlacementKind { Barline, Marker, Loop };
-    std::vector<PlacementKind> placementHistory_;
+    // Combined undo LIFO across every user-driven mutation —
+    // placements, drags, dock edits, renames, and deletes. Owned by
+    // MainWindow rather than by any model so cross-kind ordering is
+    // preserved. Each push captures enough state to reverse that
+    // exact mutation; onUndo() pops the back and dispatches via
+    // std::visit. See `ui/UndoEntry.h` for the variant arms.
+    //
+    // MEMO: under this design, deletes are themselves history
+    // entries (DeleteMarker / DeleteLoop / DeleteBarline carry the
+    // pre-delete snapshot), so there is no stale-after-delete case
+    // — onUndo always reverses what's on top, never peels.
+    std::vector<undo::Entry> undoHistory_;
+
+    // True while onUndo() is dispatching. Push points consult this
+    // flag and skip pushing so the dispatch's own model mutators
+    // don't pollute the history (otherwise Ctrl+Z would push its
+    // own reversal entry and the next Ctrl+Z would re-do it).
+    bool applyingUndo_ = false;
 
     // MEMO: armedLoopId_ is the canonical "transport is wrapping
     // around this loop" state. The dock mirrors it via setArmedLoopId

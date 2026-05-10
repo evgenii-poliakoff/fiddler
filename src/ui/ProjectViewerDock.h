@@ -148,6 +148,19 @@ signals:
     // in the event log.
     void loopArmToggleRequested(std::int64_t id, bool armed);
 
+    // Property-page edits. The dock reads the new value off the
+    // QSpinBox / QLineEdit and asks MainWindow to apply it; MainWindow
+    // is the single place that mutates the models so it can capture
+    // the pre-edit snapshot for the undo history before forwarding.
+    // MEMO: same pattern as loopArmToggleRequested — the dock sees
+    // the user gesture, MainWindow owns the side-effecting policy.
+    void markerRenameRequested      (std::int64_t id, QString name);
+    void markerPositionEditRequested(std::int64_t id, std::int64_t newMs);
+    void loopRenameRequested        (std::int64_t id, QString name);
+    void loopRangeEditRequested     (std::int64_t id,
+                                     std::int64_t newStartMs,
+                                     std::int64_t newEndMs);
+
     // The user pressed Del on a focused tree entry. MainWindow turns
     // these into model->remove calls.
     void markerDeleteRequested(std::int64_t id);

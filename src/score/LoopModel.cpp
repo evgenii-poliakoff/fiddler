@@ -38,9 +38,30 @@ std::int64_t LoopModel::add(std::int64_t startMs,
     const auto it = std::lower_bound(loops_.begin(), loops_.end(),
                                      loop, loopLess);
     loops_.insert(it, loop);
-    addHistory_.push_back(loop.id);
     emit changed();
     return loop.id;
+}
+
+bool LoopModel::addWithId(std::int64_t id,
+                          std::int64_t startMs,
+                          std::int64_t endMs,
+                          QString      name) {
+    if (id <= 0) return false;
+    if (endMs <= startMs) return false;
+    if (indexOf(id).has_value()) return false;
+    Loop loop;
+    loop.id      = id;
+    loop.startMs = startMs;
+    loop.endMs   = endMs;
+    loop.name    = std::move(name);
+    const auto it = std::lower_bound(loops_.begin(), loops_.end(),
+                                     loop, loopLess);
+    loops_.insert(it, loop);
+    // Keep nextId_ ahead of every existing id so future add()
+    // allocations don't collide with the restored loop.
+    if (id >= nextId_) nextId_ = id + 1;
+    emit changed();
+    return true;
 }
 
 bool LoopModel::rename(std::int64_t id, QString name) {
@@ -74,42 +95,19 @@ bool LoopModel::remove(std::int64_t id) {
     if (!idx) return false;
     loops_.erase(loops_.begin()
                  + static_cast<std::ptrdiff_t>(*idx));
-
-    // Same trick as MarkerModel: walk addHistory_ backwards and drop
-    // the matching ID so undoLastAdd() doesn't try to re-remove it.
-    for (std::size_t i = addHistory_.size(); i > 0; --i) {
-        if (addHistory_[i - 1] == id) {
-            addHistory_.erase(addHistory_.begin()
-                              + static_cast<std::ptrdiff_t>(i - 1));
-            break;
-        }
-    }
     emit changed();
     return true;
 }
 
 void LoopModel::clear() {
-    if (loops_.empty() && addHistory_.empty()
+    if (loops_.empty()
         && nextId_ == 1 && nextNameNumber_ == 1) {
         return;   // nothing to do
     }
     loops_.clear();
-    addHistory_.clear();
     nextId_         = 1;
     nextNameNumber_ = 1;
     emit changed();
-}
-
-bool LoopModel::undoLastAdd() {
-    if (addHistory_.empty()) return false;
-    const auto id = addHistory_.back();
-    addHistory_.pop_back();
-    const auto idx = indexOf(id);
-    if (!idx) return false;   // defensive — see MarkerModel::undoLastAdd
-    loops_.erase(loops_.begin()
-                 + static_cast<std::ptrdiff_t>(*idx));
-    emit changed();
-    return true;
 }
 
 std::optional<std::size_t>

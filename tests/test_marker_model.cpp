@@ -302,67 +302,59 @@ TEST_CASE("MarkerModel: clear empties markers + history + counters",
     REQUIRE(spy2.count() == 0);
 }
 
+// MEMO: per-model undoLastAdd was removed when MainWindow took over
+// undo with a unified tagged-variant LIFO (#20). The matching
+// integration tests now live in test_main_window.cpp; what remains
+// here is a small group of MarkerModel::addWithId tests below since
+// addWithId is the model-level seam the undo dispatch uses.
+
 // ---------------------------------------------------------------------------
-// undoLastAdd — LIFO of placements
+// addWithId — used by undo-of-delete to restore the original id+name
 // ---------------------------------------------------------------------------
 
-TEST_CASE("MarkerModel: undoLastAdd peels in placement order",
+TEST_CASE("MarkerModel: addWithId restores a previously-deleted marker",
           "[marker-model]") {
-    // MEMO: this is what makes Ctrl+Z mean "remove the most-recently-
-    // tapped marker", regardless of where it sorted in the markers_
-    // vector. The placement-order LIFO is what gives us the right
-    // semantics; sort order alone wouldn't.
     qtApp();
     MarkerModel m;
-
-    m.add(2000);    // sorted index 0 at this point
-    m.add(500);     // becomes sorted index 0; pushed last to LIFO
-    m.add(1500);    // sorted index 1 now
-
-    REQUIRE(positions(m.markers())
-            == std::vector<std::int64_t>{500, 1500, 2000});
-
-    REQUIRE(m.undoLastAdd());                // removes the 1500 marker
-    REQUIRE(positions(m.markers())
-            == std::vector<std::int64_t>{500, 2000});
-
-    REQUIRE(m.undoLastAdd());                // removes the 500 marker
-    REQUIRE(positions(m.markers())
-            == std::vector<std::int64_t>{2000});
-
-    REQUIRE(m.undoLastAdd());                // removes the 2000 marker
-    REQUIRE(m.empty());
-
-    REQUIRE_FALSE(m.undoLastAdd());          // empty LIFO → false
-}
-
-TEST_CASE("MarkerModel: remove of latest entry keeps undoLastAdd in sync",
-          "[marker-model]") {
-    // MEMO: load-bearing — undoLastAdd must not try to remove an
-    // already-gone entry. remove() must clean up its corresponding
-    // history entry; this test guards that invariant.
-    qtApp();
-    MarkerModel m;
-    const auto id1 = m.add(1000);
-    const auto id2 = m.add(2000);            // referenced in a comment below
-    const auto id3 = m.add(3000);
-
-    REQUIRE(m.remove(id3));                  // most-recent gone via Del
-
-    REQUIRE(m.undoLastAdd());                // peels id2, not id3
+    const auto id1 = m.add(1000, "First");
+    const auto id2 = m.add(2000, "Second");
+    REQUIRE(m.remove(id1));
     REQUIRE(m.size() == 1);
-    REQUIRE(m.markers()[0].id == id1);
-    (void)id2;                                // narrative-only, silences -Wunused
+
+    REQUIRE(m.addWithId(id1, 1000, "First"));
+    REQUIRE(m.size() == 2);
+    REQUIRE(m.indexOf(id1).has_value());
+    // Restored marker keeps its original id + name.
+    const auto idx = *m.indexOf(id1);
+    REQUIRE(m.markers()[idx].id == id1);
+    REQUIRE(m.markers()[idx].name == "First");
+    (void)id2;
 }
 
-TEST_CASE("MarkerModel: clear drains the placement LIFO",
+TEST_CASE("MarkerModel: addWithId rejects an id already in use",
           "[marker-model]") {
     qtApp();
     MarkerModel m;
-    m.add(1000);
-    m.add(2000);
-    m.clear();
-    REQUIRE_FALSE(m.undoLastAdd());
+    const auto id = m.add(1000, "A");
+    REQUIRE_FALSE(m.addWithId(id, 2000, "B"));
+}
+
+TEST_CASE("MarkerModel: addWithId bumps nextId_ to avoid future collisions",
+          "[marker-model]") {
+    qtApp();
+    MarkerModel m;
+    REQUIRE(m.addWithId(50, 1000, "Restored"));
+    // A subsequent add() must allocate id > 50, not collide with it.
+    const auto fresh = m.add(2000);
+    REQUIRE(fresh > 50);
+}
+
+TEST_CASE("MarkerModel: addWithId rejects non-positive ids",
+          "[marker-model]") {
+    qtApp();
+    MarkerModel m;
+    REQUIRE_FALSE(m.addWithId(0,  1000, "z"));
+    REQUIRE_FALSE(m.addWithId(-1, 1000, "z"));
 }
 
 // ---------------------------------------------------------------------------

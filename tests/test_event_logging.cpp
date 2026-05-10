@@ -403,7 +403,7 @@ TEST_CASE("ui.score: tap-place at near-duplicate ms is logged as 'ignored'",
     REQUIRE(containsLog(entries, "ui.score", "ignored (within"));
 }
 
-TEST_CASE("ui.score: undo-last logs success and empty no-op cases",
+TEST_CASE("ui.score: undo logs the kind and the empty no-op",
           "[event-logging][gui][ui.score]") {
     qtApp();
     auto lw = makeLoadedWindow();
@@ -412,20 +412,21 @@ TEST_CASE("ui.score: undo-last logs success and empty no-op cases",
     QTest::mouseClick(lw.stopButton, Qt::LeftButton);
     QTest::keyClick(lw.window.get(), Qt::Key_B);
 
-    SECTION("with at least one barline placed: 'undo-last kind=barline …'") {
-        // MEMO: format change in step 5.5 — undo-last now reports
-        // the kind ("barline" / "marker") and both model sizes,
-        // because Ctrl+Z dispatches across the combined LIFO.
+    SECTION("with a barline placed: 'undo kind=add-barline …'") {
+        // MEMO: format change in #20 — the unified undo path tags
+        // every entry kind (add-barline / add-marker / edit-marker-pos
+        // / delete-loop / etc.) so the log reflects what was reversed,
+        // not just which kind of artifact was touched.
         CapturedLogs logs;
         QTest::keyClick(lw.window.get(), Qt::Key_Z, Qt::ControlModifier);
 
         const auto entries = logs.snapshot();
-        REQUIRE(containsLog(entries, "ui.score", "undo-last kind=barline"));
+        REQUIRE(containsLog(entries, "ui.score", "undo kind=add-barline"));
         REQUIRE(containsLog(entries, "ui.score", "bar-size=0"));
         REQUIRE_FALSE(containsLog(entries, "ui.score", "no-op"));
     }
 
-    SECTION("with empty model: 'undo-last empty (no-op)'") {
+    SECTION("with empty history: 'undo empty (no-op)'") {
         // Drain the one bar we placed, then try undo on empty.
         QTest::keyClick(lw.window.get(), Qt::Key_Z, Qt::ControlModifier);
 
@@ -433,7 +434,7 @@ TEST_CASE("ui.score: undo-last logs success and empty no-op cases",
         QTest::keyClick(lw.window.get(), Qt::Key_Z, Qt::ControlModifier);
 
         const auto entries = logs.snapshot();
-        REQUIRE(containsLog(entries, "ui.score", "undo-last empty"));
+        REQUIRE(containsLog(entries, "ui.score", "undo empty"));
     }
 }
 
