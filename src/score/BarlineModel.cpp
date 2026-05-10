@@ -24,7 +24,6 @@ std::optional<std::size_t> BarlineModel::add(std::int64_t sourceMs) {
         return static_cast<std::size_t>(it - barlines_.begin());
     }
     const auto inserted = barlines_.insert(it, sourceMs);
-    addHistory_.push_back(sourceMs);
     const auto index = static_cast<std::size_t>(inserted - barlines_.begin());
     emit changed();
     return index;
@@ -32,46 +31,14 @@ std::optional<std::size_t> BarlineModel::add(std::int64_t sourceMs) {
 
 void BarlineModel::removeAt(std::size_t index) {
     if (index >= barlines_.size()) return;
-    const auto removedMs = barlines_[index];
     barlines_.erase(barlines_.begin() + static_cast<std::ptrdiff_t>(index));
-
-    // Drop the matching entry from the LIFO so undoLastAdd() doesn't
-    // try to remove a value that's no longer in barlines_. Walk
-    // backwards so the most-recent occurrence is found first (and
-    // because the most-recent placement is the one most likely to be
-    // the entry the user is removing right now, by Del + Ctrl+Z).
-    for (std::size_t i = addHistory_.size(); i > 0; --i) {
-        if (addHistory_[i - 1] == removedMs) {
-            addHistory_.erase(
-                addHistory_.begin() + static_cast<std::ptrdiff_t>(i - 1));
-            break;
-        }
-    }
     emit changed();
 }
 
 void BarlineModel::clear() {
-    if (barlines_.empty() && addHistory_.empty()) return;
+    if (barlines_.empty()) return;
     barlines_.clear();
-    addHistory_.clear();
     emit changed();
-}
-
-bool BarlineModel::undoLastAdd() {
-    if (addHistory_.empty()) return false;
-    const auto ms = addHistory_.back();
-    addHistory_.pop_back();
-    const auto it = std::lower_bound(barlines_.begin(), barlines_.end(), ms);
-    if (it != barlines_.end() && *it == ms) {
-        barlines_.erase(it);
-        emit changed();
-        return true;
-    }
-    // Defensive: history said this ms was placed but it's not in
-    // barlines_ anymore. Should be unreachable thanks to removeAt's
-    // bookkeeping, but if it ever happens we still need to emit so
-    // observers aren't lied to about an unchanged state.
-    return false;
 }
 
 std::optional<std::size_t>

@@ -65,6 +65,21 @@ public:
                      std::int64_t endMs,
                      QString      name = {});
 
+    // Re-insert a loop that was previously deleted, restoring its
+    // original ID and name. Used by the unified undo path so a
+    // delete-undo round-trips ID-stable selection / armed-loop
+    // state. Returns true on success; false if `id` is already in
+    // use, not positive, or the range is invalid. nextId_ is bumped
+    // so future `add()` calls don't collide with the restored id.
+    //
+    // MEMO: deliberately a thin extension of add() — same insertion
+    // logic, just with a caller-supplied id and no auto-naming.
+    // Intended for the undo-of-delete path.
+    bool addWithId(std::int64_t id,
+                   std::int64_t startMs,
+                   std::int64_t endMs,
+                   QString      name);
+
     // Rename by ID. Empty name accepted (UI may need a transient
     // empty edit). Returns true if the loop existed.
     bool rename(std::int64_t id, QString name);
@@ -75,14 +90,11 @@ public:
                   std::int64_t newStartMs,
                   std::int64_t newEndMs);
 
-    // Remove a loop by ID. Drops the entry from addHistory_.
+    // Remove a loop by ID. Returns true if anything was removed.
     bool remove(std::int64_t id);
 
     // Reset everything; emit changed() unless already empty.
     void clear();
-
-    // Remove the most-recently-added loop still present (LIFO).
-    bool undoLastAdd();
 
     // ID → sorted index. Used by widgets to translate ID-based
     // selection into the index they need for paint loops.
@@ -98,9 +110,6 @@ private:
     // Sorted ascending by startMs. Ties broken by ID (older first)
     // so the order is fully deterministic.
     std::vector<Loop> loops_;
-
-    // LIFO of IDs in placement order; kept consistent with loops_.
-    std::vector<std::int64_t> addHistory_;
 
     // MEMO: monotonic counters reset only by clear(). See
     // MarkerModel.h for the same pattern + rationale.

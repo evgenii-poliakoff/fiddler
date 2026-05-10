@@ -320,68 +320,56 @@ TEST_CASE("LoopModel: clear empties loops + history + counters",
     REQUIRE(spy2.count() == 0);
 }
 
+// MEMO: per-model undoLastAdd was removed when MainWindow took over
+// undo with a unified tagged-variant LIFO (#20). Integration tests
+// for the new flow live in test_main_window.cpp; addWithId is
+// covered just below since that's the model-level seam undo uses.
+
 // ---------------------------------------------------------------------------
-// undoLastAdd — LIFO of placements
+// addWithId — used by undo-of-delete to restore the original id+name
 // ---------------------------------------------------------------------------
 
-TEST_CASE("LoopModel: undoLastAdd peels in placement order",
-          "[loop-model]") {
-    // MEMO: this is what makes Ctrl+Z mean "remove the most-recently-
-    // created loop", regardless of where it sorted in the loops_
-    // vector. (When we wire combined-Ctrl+Z in MainWindow we'll
-    // dispatch on the placement-history kind; this is the per-model
-    // building block.)
-    qtApp();
-    LoopModel m;
-
-    m.add(2000, 2500);    // sorted index 0 at this point
-    m.add(500,  1000);    // becomes sorted index 0; pushed last to LIFO
-    m.add(1500, 1800);    // sorted index 1 now
-
-    REQUIRE(ranges(m.loops()) == std::vector<std::pair<std::int64_t, std::int64_t>>{
-        {500, 1000}, {1500, 1800}, {2000, 2500}
-    });
-
-    REQUIRE(m.undoLastAdd());                // removes the (1500,1800) loop
-    REQUIRE(ranges(m.loops()) == std::vector<std::pair<std::int64_t, std::int64_t>>{
-        {500, 1000}, {2000, 2500}
-    });
-
-    REQUIRE(m.undoLastAdd());                // removes the (500,1000) loop
-    REQUIRE(ranges(m.loops()) == std::vector<std::pair<std::int64_t, std::int64_t>>{
-        {2000, 2500}
-    });
-
-    REQUIRE(m.undoLastAdd());                // removes the (2000,2500) loop
-    REQUIRE(m.empty());
-
-    REQUIRE_FALSE(m.undoLastAdd());          // empty LIFO → false
-}
-
-TEST_CASE("LoopModel: remove of latest entry keeps undoLastAdd in sync",
+TEST_CASE("LoopModel: addWithId restores a previously-deleted loop",
           "[loop-model]") {
     qtApp();
     LoopModel m;
-    const auto id1 = m.add(1000, 2000);
-    const auto id2 = m.add(3000, 4000);
-    const auto id3 = m.add(5000, 6000);
-
-    REQUIRE(m.remove(id3));                  // most-recent gone via Del
-
-    REQUIRE(m.undoLastAdd());                // peels id2, not id3
+    const auto id1 = m.add(1000, 2000, "First");
+    const auto id2 = m.add(3000, 4000, "Second");
+    REQUIRE(m.remove(id1));
     REQUIRE(m.size() == 1);
-    REQUIRE(m.loops()[0].id == id1);
+
+    REQUIRE(m.addWithId(id1, 1000, 2000, "First"));
+    REQUIRE(m.size() == 2);
+    REQUIRE(m.indexOf(id1).has_value());
+    const auto idx = *m.indexOf(id1);
+    REQUIRE(m.loops()[idx].id == id1);
+    REQUIRE(m.loops()[idx].name == "First");
     (void)id2;
 }
 
-TEST_CASE("LoopModel: clear drains the placement LIFO",
+TEST_CASE("LoopModel: addWithId rejects an id already in use",
           "[loop-model]") {
     qtApp();
     LoopModel m;
-    m.add(1000, 2000);
-    m.add(3000, 4000);
-    m.clear();
-    REQUIRE_FALSE(m.undoLastAdd());
+    const auto id = m.add(1000, 2000, "A");
+    REQUIRE_FALSE(m.addWithId(id, 3000, 4000, "B"));
+}
+
+TEST_CASE("LoopModel: addWithId rejects an inverted range",
+          "[loop-model]") {
+    qtApp();
+    LoopModel m;
+    REQUIRE_FALSE(m.addWithId(50, 2000, 1000, "bad"));
+    REQUIRE_FALSE(m.addWithId(50, 1000, 1000, "degenerate"));
+}
+
+TEST_CASE("LoopModel: addWithId bumps nextId_ to avoid future collisions",
+          "[loop-model]") {
+    qtApp();
+    LoopModel m;
+    REQUIRE(m.addWithId(50, 1000, 2000, "Restored"));
+    const auto fresh = m.add(3000, 4000);
+    REQUIRE(fresh > 50);
 }
 
 // ---------------------------------------------------------------------------

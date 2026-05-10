@@ -18,12 +18,15 @@
 #include "ui/WaveformWidget.h"
 #include "wav_fixture.h"
 
+#include <QCheckBox>
 #include <QComboBox>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QAction>
 #include <QSettings>
 #include <QSlider>
+#include <QSpinBox>
 #include <QString>
 #include <QTest>
 #include <QTreeWidget>
@@ -2452,4 +2455,323 @@ TEST_CASE("MainWindow: cancelPendingWrap flips the play button label to Play",
     loaded.window->setPrerollEnabled(false);
     REQUIRE_FALSE(loaded.window->wrapPending());
     REQUIRE(playBtn->text() == "Play");
+}
+
+// ---------------------------------------------------------------------------
+// Unified Ctrl+Z (#20) — covers placements, drags, dock edits,
+// renames, and deletes through one LIFO. The cross-kind placement
+// case lives in the older "combined Ctrl+Z LIFO" test above; this
+// block adds the non-placement kinds the unified history brought in.
+// Each test fires the gesture's signal directly to keep the setup
+// small — the production wiring is exercised end-to-end when the
+// signal lands on MainWindow's slot.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a marker drag",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    // Simulate a drag: move the marker in the model (live-update
+    // path) then fire the commit signal carrying the pre-drag ms.
+    REQUIRE(const_cast<fiddler::score::MarkerModel&>(window->markerModel())
+                .setPosition(markerId, 2500));
+    emit waveform->markerDragCommitted(markerId, 1500, 2500);
+
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 2500);
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1500);
+    REQUIRE(window->markerModel().markers()[0].id == markerId);   // id stable
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a loop edge drag",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto loaded = makeWindowWithLoop(/*start=*/500, /*end=*/1500);
+    auto* waveform =
+        loaded.window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(waveform);
+
+    // Simulate dragging the right edge from 1500 → 1900.
+    REQUIRE(const_cast<fiddler::score::LoopModel&>(loaded.window->loopModel())
+                .setRange(loaded.loopId, 500, 1900));
+    emit waveform->loopDragCommitted(loaded.loopId,
+                                     /*isStart=*/false,
+                                     /*fromMs=*/1500,
+                                     /*toMs=*/1900);
+    REQUIRE(loaded.window->loopModel().loops()[0].endMs == 1900);
+
+    QTest::keyClick(loaded.window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(loaded.window->loopModel().loops()[0].startMs == 500);
+    REQUIRE(loaded.window->loopModel().loops()[0].endMs   == 1500);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a marker rename via the dock",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+    const auto autoName = window->markerModel().markers()[0].name;
+
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock);
+    emit dock->markerRenameRequested(markerId, "Hard turn");
+    REQUIRE(window->markerModel().markers()[0].name == "Hard turn");
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().markers()[0].name == autoName);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a dock spinbox position edit",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    emit dock->markerPositionEditRequested(markerId, 3000);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 3000);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1500);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a marker delete and restores id+name",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId   = window->markerModel().markers()[0].id;
+    const auto markerName = window->markerModel().markers()[0].name;
+
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->markerModel().empty());
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().size() == 1);
+    REQUIRE(window->markerModel().markers()[0].id       == markerId);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1500);
+    REQUIRE(window->markerModel().markers()[0].name     == markerName);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a loop delete and restores id+name+range",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto loaded   = makeWindowWithLoop(500, 1500);
+    const auto id = loaded.loopId;
+    const auto loopName = loaded.window->loopModel().loops()[0].name;
+
+    // Select then Del via window-level shortcut.
+    auto* waveform =
+        loaded.window->findChild<WaveformWidget*>("waveformWidget");
+    waveform->setSelectedLoopId(id);
+    QTest::keyClick(loaded.window.get(), Qt::Key_Delete);
+    REQUIRE(loaded.window->loopModel().empty());
+
+    QTest::keyClick(loaded.window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(loaded.window->loopModel().size() == 1);
+    REQUIRE(loaded.window->loopModel().loops()[0].id      == id);
+    REQUIRE(loaded.window->loopModel().loops()[0].startMs == 500);
+    REQUIRE(loaded.window->loopModel().loops()[0].endMs   == 1500);
+    REQUIRE(loaded.window->loopModel().loops()[0].name    == loopName);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a barline delete",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* slider = window->findChild<QSlider*>("positionSlider");
+    slider->setValue(2000);
+    emit slider->sliderMoved(2000);
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->barlineModel().size() == 1);
+
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->barlineModel().empty());
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->barlineModel().size() == 1);
+    REQUIRE(window->barlineModel().barlines()[0] == 2000);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z works even when a dock spinbox has focus",
+          "[main-window][gui][integration][undo]") {
+    // MEMO: regression for the smoke-found 3.2 bug. QSpinBox /
+    // QLineEdit accept Qt::ShortcutOverride for Ctrl+Z by default
+    // to claim the key for their own text-undo, which hid our
+    // window-level undo whenever focus was on a dock input. The
+    // app-wide eventFilter rejects that override so Ctrl+Z always
+    // routes to MainWindow::onUndo.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    REQUIRE(dock);
+    emit dock->markerPositionEditRequested(markerId, 3000);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 3000);
+
+    // Send Ctrl+Z directly to the dock's marker-position spinbox's
+    // INNER QLineEdit. That's the widget that receives keystrokes
+    // while the user is typing into a spinbox; it's the one that
+    // claims Ctrl+Z for text-undo unless we filter at this exact
+    // level (filtering only the spinbox shell would miss it).
+    auto* posBox = dock->findChild<QSpinBox*>("markerPositionBox");
+    REQUIRE(posBox);
+    auto* innerEdit = posBox->findChild<QLineEdit*>();
+    REQUIRE(innerEdit);
+    QTest::keyClick(innerEdit, Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1500);
+
+    window->close();
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a pre-roll spinbox edit",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+
+    auto* prerollBox = window->findChild<QSpinBox*>("prerollBox");
+    REQUIRE(prerollBox);
+    const int initial = prerollBox->value();
+
+    // Simulate the user typing a new value + pressing Enter.
+    prerollBox->setValue(initial + 200);
+    emit prerollBox->editingFinished();
+    REQUIRE(prerollBox->value() == initial + 200);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(prerollBox->value() == initial);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses pre-roll edit while focus is in the spinbox",
+          "[main-window][gui][integration][undo]") {
+    // MEMO: regression for the smoke-found 7 bug. The transport-row
+    // spinbox wraps a QLineEdit that grabs Qt::ShortcutOverride for
+    // Ctrl+Z. Per-widget filter must be installed on the inner
+    // QLineEdit (not just the QSpinBox shell) for the document-
+    // level undo to win when focus is on the inner widget.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+
+    auto* prerollBox = window->findChild<QSpinBox*>("prerollBox");
+    REQUIRE(prerollBox);
+    const int initial = prerollBox->value();
+
+    prerollBox->setValue(initial + 200);
+    emit prerollBox->editingFinished();
+    REQUIRE(prerollBox->value() == initial + 200);
+
+    // Send Ctrl+Z directly to the inner QLineEdit — that's the
+    // widget that receives keystrokes while the user is typing
+    // into a spinbox. Without the inner-widget filter installed
+    // alongside the spinbox-level one, the line edit's text-undo
+    // claims the key and our document undo never fires.
+    auto* innerEdit = prerollBox->findChild<QLineEdit*>();
+    REQUIRE(innerEdit);
+    QTest::keyClick(innerEdit, Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(prerollBox->value() == initial);
+
+    window->close();
+}
+
+TEST_CASE("MainWindow: Ctrl+Z reverses a pre-roll checkbox toggle",
+          "[main-window][gui][integration][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+
+    auto* prerollEnabledBox =
+        window->findChild<QCheckBox*>("prerollEnabledBox");
+    REQUIRE(prerollEnabledBox);
+    const bool initial = prerollEnabledBox->isChecked();
+
+    // Simulate the user clicking the checkbox.
+    prerollEnabledBox->click();
+    REQUIRE(prerollEnabledBox->isChecked() == !initial);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(prerollEnabledBox->isChecked() == initial);
+}
+
+TEST_CASE("MainWindow: undo of an Add does not push a Delete entry "
+          "(applyingUndo_ guard)",
+          "[main-window][gui][integration][undo]") {
+    // MEMO: pins the applyingUndo_ flag's contract — without it,
+    // the undo dispatch's own model->remove call would push a
+    // DeleteMarker entry, and the *next* Ctrl+Z would re-add the
+    // marker (unwanted free redo). The flag suppresses the push;
+    // the second Ctrl+Z must be a no-op.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->markerModel().size() == 1);
+
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().empty());
+
+    // Second Ctrl+Z: the history is empty (no DeleteMarker entry was
+    // pushed during the dispatch). No-op, not a redo.
+    QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
+    REQUIRE(window->markerModel().empty());
 }

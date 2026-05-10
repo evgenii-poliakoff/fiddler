@@ -8,6 +8,7 @@
 #include <QFormLayout>
 #include <QHeaderView>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
@@ -121,6 +122,7 @@ void ProjectViewerDock::buildUi() {
 
         markerNameEdit_ = new QLineEdit(page);
         markerNameEdit_->setObjectName("markerNameEdit");
+        markerNameEdit_->installEventFilter(this);
         connect(markerNameEdit_, &QLineEdit::editingFinished,
                 this,            &ProjectViewerDock::onMarkerNameEdited);
         form->addRow(tr("Name:"), markerNameEdit_);
@@ -129,6 +131,15 @@ void ProjectViewerDock::buildUi() {
         markerPositionBox_->setObjectName("markerPositionBox");
         markerPositionBox_->setRange(0, INT_MAX);
         markerPositionBox_->setSuffix(tr(" ms"));
+        // MEMO: filter the spinbox AND its inner QLineEdit. QSpinBox
+        // wraps a QLineEdit for text entry; the inner widget is the
+        // focus widget while the user is typing and receives the
+        // Ctrl+Z ShortcutOverride directly. Filtering only the
+        // spinbox would miss those.
+        markerPositionBox_->installEventFilter(this);
+        if (auto* inner = markerPositionBox_->findChild<QLineEdit*>()) {
+            inner->installEventFilter(this);
+        }
         // MEMO: bind to editingFinished (Enter or focus-loss) — NOT
         // valueChanged. valueChanged fires after every keystroke,
         // and that round-trips through the model
@@ -157,6 +168,7 @@ void ProjectViewerDock::buildUi() {
 
         loopNameEdit_ = new QLineEdit(page);
         loopNameEdit_->setObjectName("loopNameEdit");
+        loopNameEdit_->installEventFilter(this);
         connect(loopNameEdit_, &QLineEdit::editingFinished,
                 this,          &ProjectViewerDock::onLoopNameEdited);
         form->addRow(tr("Name:"), loopNameEdit_);
@@ -165,6 +177,10 @@ void ProjectViewerDock::buildUi() {
         loopStartBox_->setObjectName("loopStartBox");
         loopStartBox_->setRange(0, INT_MAX);
         loopStartBox_->setSuffix(tr(" ms"));
+        loopStartBox_->installEventFilter(this);
+        if (auto* inner = loopStartBox_->findChild<QLineEdit*>()) {
+            inner->installEventFilter(this);
+        }
         connect(loopStartBox_, &QSpinBox::editingFinished,
                 this, &ProjectViewerDock::onLoopStartEdited);
         form->addRow(tr("Start:"), loopStartBox_);
@@ -173,6 +189,10 @@ void ProjectViewerDock::buildUi() {
         loopEndBox_->setObjectName("loopEndBox");
         loopEndBox_->setRange(1, INT_MAX);    // end > start; 1 is the floor
         loopEndBox_->setSuffix(tr(" ms"));
+        loopEndBox_->installEventFilter(this);
+        if (auto* inner = loopEndBox_->findChild<QLineEdit*>()) {
+            inner->installEventFilter(this);
+        }
         connect(loopEndBox_, &QSpinBox::editingFinished,
                 this, &ProjectViewerDock::onLoopEndEdited);
         form->addRow(tr("End:"), loopEndBox_);
@@ -646,7 +666,12 @@ void ProjectViewerDock::onTreeItemDoubleClicked(
 void ProjectViewerDock::onMarkerNameEdited() {
     if (updatingPropertyPage_) return;
     if (!selectedMarkerId_ || !markerModel_) return;
-    markerModel_->rename(*selectedMarkerId_, markerNameEdit_->text());
+    // MEMO: emit instead of calling markerModel_->rename directly so
+    // MainWindow can capture the pre-edit name for the undo history
+    // before applying. Dock keeps its model pointers for *reads*
+    // (populating the property page); writes route through signals.
+    emit markerRenameRequested(
+        *selectedMarkerId_, markerNameEdit_->text());
     // Tree text refreshes via onMarkerModelChanged → rebuildMarkerSection.
 }
 
@@ -657,7 +682,7 @@ void ProjectViewerDock::onMarkerPositionEdited() {
     // directly from the spinbox. By the time this fires the user
     // has finished editing (Enter / focus-loss), so the value is
     // settled.
-    markerModel_->setPosition(
+    emit markerPositionEditRequested(
         *selectedMarkerId_,
         static_cast<std::int64_t>(markerPositionBox_->value()));
 }
@@ -665,7 +690,7 @@ void ProjectViewerDock::onMarkerPositionEdited() {
 void ProjectViewerDock::onLoopNameEdited() {
     if (updatingPropertyPage_) return;
     if (!selectedLoopId_ || !loopModel_) return;
-    loopModel_->rename(*selectedLoopId_, loopNameEdit_->text());
+    emit loopRenameRequested(*selectedLoopId_, loopNameEdit_->text());
 }
 
 void ProjectViewerDock::onLoopStartEdited() {
@@ -679,7 +704,7 @@ void ProjectViewerDock::onLoopStartEdited() {
     // already prevent newStart >= currentEnd; defensively re-check
     // anyway in case the bounds ever drift.
     if (newStart >= l.endMs) return;
-    loopModel_->setRange(*selectedLoopId_, newStart, l.endMs);
+    emit loopRangeEditRequested(*selectedLoopId_, newStart, l.endMs);
 }
 
 void ProjectViewerDock::onLoopEndEdited() {
@@ -690,7 +715,7 @@ void ProjectViewerDock::onLoopEndEdited() {
     const auto& l = loopModel_->loops()[*idx];
     const std::int64_t newEnd = loopEndBox_->value();
     if (newEnd <= l.startMs) return;
-    loopModel_->setRange(*selectedLoopId_, l.startMs, newEnd);
+    emit loopRangeEditRequested(*selectedLoopId_, l.startMs, newEnd);
 }
 
 void ProjectViewerDock::onLoopArmedToggled(bool checked) {
@@ -705,6 +730,21 @@ void ProjectViewerDock::onLoopArmedToggled(bool checked) {
 // ---- input forwarding ---------------------------------------------------
 
 bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
+    // MEMO: reject Qt::ShortcutOverride for Ctrl+Z on every input
+    // we install on (the property-page spinboxes / line edits).
+    // QSpinBox / QLineEdit otherwise claim the key for their own
+    // text-undo, which hides MainWindow's document-level undo
+    // whenever the user has just typed into a dock field. With
+    // this rejection the keypress falls through to the
+    // application's QShortcut machinery.
+    if (event->type() == QEvent::ShortcutOverride) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->matches(QKeySequence::Undo)) {
+            event->ignore();
+            return true;
+        }
+    }
+
     const bool isTreeViewport =
         (tree_ && watched == tree_->viewport());
     if (watched == tree_ || isTreeViewport) {

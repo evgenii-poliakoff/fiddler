@@ -174,76 +174,10 @@ TEST_CASE("BarlineModel: clear empties barlines, preserves time signature",
     REQUIRE(spy.count() == 1);
 }
 
-// ---------------------------------------------------------------------------
-// undoLastAdd — LIFO, not sorted-last
-// ---------------------------------------------------------------------------
-
-TEST_CASE("BarlineModel: undoLastAdd removes the most-recently-added entry",
-          "[barline-model]") {
-    qtApp();
-    BarlineModel m;
-
-    // Add in non-monotonic order; undo should peel from the end of the
-    // *placement* history, not the end of the sorted vector.
-    m.add(2000);
-    m.add(500);     // sorted-prepend, but most-recently added
-    m.add(1500);
-
-    REQUIRE(toVec(m.barlines()) == std::vector<std::int64_t>{500, 1500, 2000});
-
-    REQUIRE(m.undoLastAdd());                            // removes 1500
-    REQUIRE(toVec(m.barlines()) == std::vector<std::int64_t>{500, 2000});
-
-    REQUIRE(m.undoLastAdd());                            // removes 500
-    REQUIRE(toVec(m.barlines()) == std::vector<std::int64_t>{2000});
-
-    REQUIRE(m.undoLastAdd());                            // removes 2000
-    REQUIRE(m.empty());
-
-    // Stack drained — no further undo possible.
-    REQUIRE_FALSE(m.undoLastAdd());
-}
-
-TEST_CASE("BarlineModel: undoLastAdd on empty returns false, no emit",
-          "[barline-model]") {
-    qtApp();
-    BarlineModel m;
-    QSignalSpy spy(&m, &BarlineModel::changed);
-    REQUIRE_FALSE(m.undoLastAdd());
-    REQUIRE(spy.count() == 0);
-}
-
-TEST_CASE("BarlineModel: removeAt also drops entry from add-history",
-          "[barline-model]") {
-    qtApp();
-    BarlineModel m;
-    m.add(1000);
-    m.add(2000);
-    m.add(3000);
-
-    // Remove the most-recently-added by index. Subsequent undo should
-    // now peel the *previous* most-recent (2000), not 3000 again.
-    m.removeAt(2);                                       // erases 3000
-    REQUIRE(toVec(m.barlines()) == std::vector<std::int64_t>{1000, 2000});
-
-    REQUIRE(m.undoLastAdd());                            // peels 2000
-    REQUIRE(toVec(m.barlines()) == std::vector<std::int64_t>{1000});
-
-    REQUIRE(m.undoLastAdd());                            // peels 1000
-    REQUIRE(m.empty());
-
-    REQUIRE_FALSE(m.undoLastAdd());
-}
-
-TEST_CASE("BarlineModel: clear also drains add-history",
-          "[barline-model]") {
-    qtApp();
-    BarlineModel m;
-    m.add(100);
-    m.add(200);
-    m.clear();
-    REQUIRE_FALSE(m.undoLastAdd());
-}
+// MEMO: per-model undoLastAdd was removed when MainWindow took over
+// undo with a unified tagged-variant LIFO (#20). The matching
+// integration tests now live in test_main_window.cpp; the model's
+// only undo affordance is `removeAt` itself, exercised above.
 
 // ---------------------------------------------------------------------------
 // nearest — used by click-to-select hit-testing

@@ -1,5 +1,9 @@
 #include "ui/MainWindow.h"
 
+#include <algorithm>
+#include <type_traits>
+#include <variant>
+
 #include "audio/Decoder.h"
 #include "audio/Player.h"
 #include "audio/WaveformOverview.h"
@@ -13,6 +17,8 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QKeyEvent>
+#include <QLineEdit>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -196,12 +202,12 @@ MainWindow::MainWindow(QWidget* parent)
     connect(createLoopShortcut_, &QShortcut::activated,
             this, &MainWindow::onCreateLoop);
 
-    // Ctrl+Z: peel the most-recently-placed artifact, regardless
-    // of kind. Dispatched via the combined placementHistory_ LIFO.
+    // Ctrl+Z: reverse the most recent user-driven mutation,
+    // regardless of kind. Dispatched via the unified undoHistory_.
     undoShortcut_ = new QShortcut(QKeySequence::Undo, this);
     undoShortcut_->setContext(Qt::WindowShortcut);
     connect(undoShortcut_, &QShortcut::activated,
-            this, &MainWindow::onUndoLastPlacement);
+            this, &MainWindow::onUndo);
 
     // Del: remove the currently-selected artifact (barline or
     // marker — selection is mutually exclusive between the two).
@@ -312,6 +318,15 @@ void MainWindow::buildCentralWidget() {
     prerollBox_->setEnabled(prerollEnabled_);
     connect(prerollBox_, &QSpinBox::editingFinished,
             this, &MainWindow::onPrerollChanged);
+    // MEMO: see eventFilter() — installed on BOTH the spinbox and
+    // its inner QLineEdit. QSpinBox wraps a QLineEdit for text
+    // entry; when the user is typing, the inner widget is the
+    // focus widget and receives ShortcutOverride directly.
+    // Filtering only the spinbox would miss those events.
+    prerollBox_->installEventFilter(this);
+    if (auto* innerEdit = prerollBox_->findChild<QLineEdit*>()) {
+        innerEdit->installEventFilter(this);
+    }
     transport->addWidget(prerollBox_);
     transport->addStretch();
     layout->addLayout(transport);
@@ -353,6 +368,7 @@ void MainWindow::buildCentralWidget() {
             this, [this](std::int64_t id,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
+                pushMarkerDragCommit(id, fromMs, toMs);
                 FLOG_DEBUG("ui.score",
                     "marker-drag id={} from={} to={} via=waveform",
                     id, fromMs, toMs);
@@ -361,6 +377,7 @@ void MainWindow::buildCentralWidget() {
             this, [this](std::int64_t id, bool isStart,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
+                pushLoopDragCommit(id, isStart, fromMs, toMs);
                 FLOG_DEBUG("ui.score",
                     "loop-drag id={} edge={} from={} to={} via=waveform",
                     id, isStart ? "start" : "end", fromMs, toMs);
@@ -400,6 +417,7 @@ void MainWindow::buildCentralWidget() {
             this, [this](std::int64_t id,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
+                pushMarkerDragCommit(id, fromMs, toMs);
                 FLOG_DEBUG("ui.score",
                     "marker-drag id={} from={} to={} via=staff",
                     id, fromMs, toMs);
@@ -408,6 +426,7 @@ void MainWindow::buildCentralWidget() {
             this, [this](std::int64_t id, bool isStart,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
+                pushLoopDragCommit(id, isStart, fromMs, toMs);
                 FLOG_DEBUG("ui.score",
                     "loop-drag id={} edge={} from={} to={} via=staff",
                     id, isStart ? "start" : "end", fromMs, toMs);
@@ -491,6 +510,22 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopAnchorClearRequested,
             this, &MainWindow::onDockLoopAnchorClearRequested);
+
+    // Property-page edits — captured here (rather than in the dock)
+    // so the pre-edit snapshot can land in the undo history before
+    // the model takes the new value.
+    connect(projectViewerDock_,
+            &ProjectViewerDock::markerRenameRequested,
+            this, &MainWindow::onDockMarkerRenameRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::markerPositionEditRequested,
+            this, &MainWindow::onDockMarkerPositionEditRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopRenameRequested,
+            this, &MainWindow::onDockLoopRenameRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::loopRangeEditRequested,
+            this, &MainWindow::onDockLoopRangeEditRequested);
 
     // ---- View menu ------------------------------------------------------
     // MEMO: built here (not in buildMenus) because it needs the
@@ -576,7 +611,7 @@ bool MainWindow::loadFile(const QString& path) {
     barlineModel_->clear();
     markerModel_->clear();
     loopModel_->clear();
-    placementHistory_.clear();
+    undoHistory_.clear();
 
     // Disarm any previously-armed loop. loopModel_->clear() above
     // would have invalidated armedLoopId_ via onLoopModelChanged
@@ -834,10 +869,11 @@ void MainWindow::onTapBarline() {
     }
 
     if (actuallyAdded) {
-        // Push to the combined LIFO so Ctrl+Z can peel this back as
-        // the most-recent placement, regardless of any markers
-        // placed in between.
-        placementHistory_.push_back(PlacementKind::Barline);
+        // Push to the unified LIFO so Ctrl+Z can reverse this
+        // placement regardless of what's been done since.
+        if (!applyingUndo_) {
+            undoHistory_.emplace_back(undo::AddBarline{pos});
+        }
         FLOG_DEBUG("ui.score",
                    "tap-place ms={} index={} size={} sel={}",
                    pos, *inserted, barlineModel_->size(), *inserted);
@@ -877,49 +913,93 @@ void MainWindow::onTapMarker() {
     // tap-place barline: makes "tap M, press Del" symmetric.
     if (waveform_) waveform_->setSelectedMarkerId(id);
 
-    placementHistory_.push_back(PlacementKind::Marker);
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::AddMarker{id});
+    }
     FLOG_DEBUG("ui.score",
                "tap-marker ms={} id={} size={}",
                pos, id, markerModel_->size());
 }
 
-void MainWindow::onUndoLastPlacement() {
-    // Ctrl+Z — peel the most-recently-placed artifact regardless
-    // of kind. We may have to skip stale entries: if the user
-    // manually deleted an artifact via Del, its placementHistory_
-    // entry stays put, so undoLastAdd on the relevant model can
-    // return false. In that case we keep peeling until something
-    // gets removed or the history drains.
-    while (!placementHistory_.empty()) {
-        const auto kind = placementHistory_.back();
-        placementHistory_.pop_back();
-        bool removed = false;
-        const char* kindStr = "?";
-        switch (kind) {
-        case PlacementKind::Barline:
-            removed = barlineModel_->undoLastAdd();
-            kindStr = "barline";
-            break;
-        case PlacementKind::Marker:
-            removed = markerModel_->undoLastAdd();
-            kindStr = "marker";
-            break;
-        case PlacementKind::Loop:
-            removed = loopModel_->undoLastAdd();
-            kindStr = "loop";
-            break;
-        }
-        if (removed) {
-            FLOG_DEBUG("ui.score",
-                       "undo-last kind={} bar-size={} marker-size={} loop-size={}",
-                       kindStr,
-                       barlineModel_->size(), markerModel_->size(),
-                       loopModel_->size());
-            return;
-        }
-        // else: stale entry, keep peeling.
+void MainWindow::onUndo() {
+    // Ctrl+Z — reverse the most recent user-driven mutation.
+    // Unlike the old placement-only path, every push site (tap,
+    // create-loop, drag commit, dock edit, delete) records its
+    // own UndoEntry, so the dispatch is total: pop the back and
+    // visit the variant. Under this design there is no "stale
+    // entry" case — deletes are themselves entries that re-add.
+    if (undoHistory_.empty()) {
+        FLOG_DEBUG("ui.score", "undo empty (no-op)");
+        return;
     }
-    FLOG_DEBUG("ui.score", "undo-last empty (no-op)");
+    const auto entry = undoHistory_.back();
+    undoHistory_.pop_back();
+
+    // applyingUndo_ guards every push site so the model mutations
+    // we issue here don't push their own entries (which would
+    // amount to "redo on next Ctrl+Z" — out of scope per #20).
+    applyingUndo_ = true;
+    const char* kind = "?";
+    std::visit([&](const auto& e) {
+        using E = std::decay_t<decltype(e)>;
+        if constexpr (std::is_same_v<E, undo::AddBarline>) {
+            // Reverse a placement by removing the barline at the
+            // recorded ms. The model is keyed by sourceMs so we
+            // look the index up just-in-time — barlines may have
+            // shifted in the sorted vector if other ones were
+            // added after this one.
+            const auto it = std::lower_bound(
+                barlineModel_->barlines().begin(),
+                barlineModel_->barlines().end(),
+                e.sourceMs);
+            if (it != barlineModel_->barlines().end() && *it == e.sourceMs) {
+                const auto idx = static_cast<std::size_t>(
+                    it - barlineModel_->barlines().begin());
+                barlineModel_->removeAt(idx);
+            }
+            kind = "add-barline";
+        } else if constexpr (std::is_same_v<E, undo::AddMarker>) {
+            markerModel_->remove(e.id);
+            kind = "add-marker";
+        } else if constexpr (std::is_same_v<E, undo::AddLoop>) {
+            loopModel_->remove(e.id);
+            kind = "add-loop";
+        } else if constexpr (std::is_same_v<E, undo::EditMarkerPos>) {
+            markerModel_->setPosition(e.id, e.prevSourceMs);
+            kind = "edit-marker-pos";
+        } else if constexpr (std::is_same_v<E, undo::EditLoopRange>) {
+            loopModel_->setRange(e.id, e.prevStartMs, e.prevEndMs);
+            kind = "edit-loop-range";
+        } else if constexpr (std::is_same_v<E, undo::RenameMarker>) {
+            markerModel_->rename(e.id, e.prevName);
+            kind = "rename-marker";
+        } else if constexpr (std::is_same_v<E, undo::RenameLoop>) {
+            loopModel_->rename(e.id, e.prevName);
+            kind = "rename-loop";
+        } else if constexpr (std::is_same_v<E, undo::DeleteBarline>) {
+            barlineModel_->add(e.sourceMs);
+            kind = "delete-barline";
+        } else if constexpr (std::is_same_v<E, undo::DeleteMarker>) {
+            markerModel_->addWithId(e.id, e.sourceMs, e.name);
+            kind = "delete-marker";
+        } else if constexpr (std::is_same_v<E, undo::DeleteLoop>) {
+            loopModel_->addWithId(e.id, e.startMs, e.endMs, e.name);
+            kind = "delete-loop";
+        } else if constexpr (std::is_same_v<E, undo::EditPrerollMs>) {
+            setPrerollMs(e.prevMs);
+            kind = "edit-preroll-ms";
+        } else if constexpr (std::is_same_v<E, undo::EditPrerollEnabled>) {
+            setPrerollEnabled(e.prevEnabled);
+            kind = "edit-preroll-enabled";
+        }
+    }, entry);
+    applyingUndo_ = false;
+
+    FLOG_DEBUG("ui.score",
+               "undo kind={} bar-size={} marker-size={} loop-size={}",
+               kind,
+               barlineModel_->size(), markerModel_->size(),
+               loopModel_->size());
 }
 
 void MainWindow::onCreateLoop() {
@@ -955,7 +1035,9 @@ void MainWindow::onCreateLoop() {
                    startMs, endMs);
         return;
     }
-    placementHistory_.push_back(PlacementKind::Loop);
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::AddLoop{id});
+    }
 
     // Clear the secondary anchor so the gesture is "spent" and a
     // fresh L press needs a fresh Ctrl+click.
@@ -1405,30 +1487,146 @@ void MainWindow::onBarlineDeleteRequested(std::size_t index) {
     // Either widget can fire this (via its Del-key handler) when it
     // has focus. Both route through the same slot — the model is
     // the single source of truth, and its `changed()` signal will
-    // repaint both views.
+    // repaint both views. Snapshot the sourceMs BEFORE the remove
+    // so undo can re-add the same barline at the same position.
+    if (index >= barlineModel_->size()) return;
+    const auto sourceMs = barlineModel_->barlines()[index];
     barlineModel_->removeAt(index);
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::DeleteBarline{sourceMs});
+    }
     FLOG_DEBUG("ui.score", "delete index={} via=widget-key size={}",
                index, barlineModel_->size());
 }
 
 void MainWindow::onMarkerDeleteRequested(std::int64_t id) {
     // Same shape as onBarlineDeleteRequested but keyed by the
-    // marker's stable ID. Fires from the score widgets' Del
-    // handlers OR the dock's tree-row Del filter (in standalone
-    // contexts; in MainWindow context the window-level Del
-    // shortcut takes precedence).
+    // marker's stable ID. Snapshot the marker's full state
+    // before removing it so Ctrl+Z can re-add it with the same
+    // id and name (via MarkerModel::addWithId).
+    const auto idx = markerModel_->indexOf(id);
+    if (!idx) return;
+    const auto& m = markerModel_->markers()[*idx];
+    const auto sourceMs = m.sourceMs;
+    const auto name     = m.name;
     markerModel_->remove(id);
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(
+            undo::DeleteMarker{id, sourceMs, name});
+    }
     FLOG_DEBUG("ui.score", "delete-marker id={} via=widget-key size={}",
                id, markerModel_->size());
 }
 
 void MainWindow::onLoopDeleteRequested(std::int64_t id) {
     // Fired by the dock when the user presses Del on a loop row.
-    // (Score widgets don't yet have a loop-Del handler — loops are
-    // dock-driven.)
+    // Snapshot startMs/endMs/name pre-delete so undo restores the
+    // exact loop with its original id (selection, armed-state
+    // and dock highlight all key off id).
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    const auto startMs = l.startMs;
+    const auto endMs   = l.endMs;
+    const auto name    = l.name;
     loopModel_->remove(id);
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(
+            undo::DeleteLoop{id, startMs, endMs, name});
+    }
     FLOG_DEBUG("ui.score", "delete-loop id={} via=dock-key size={}",
                id, loopModel_->size());
+}
+
+void MainWindow::pushMarkerDragCommit(std::int64_t id,
+                                      std::int64_t fromMs,
+                                      std::int64_t toMs) {
+    // No-op when we're applying an undo. Also bail when the drag
+    // was a zero-distance no-op so Ctrl+Z doesn't pop a phantom
+    // entry that does nothing observable.
+    if (applyingUndo_) return;
+    if (fromMs == toMs)  return;
+    undoHistory_.emplace_back(undo::EditMarkerPos{id, fromMs});
+}
+
+void MainWindow::pushLoopDragCommit(std::int64_t id,
+                                    bool         isStart,
+                                    std::int64_t fromMs,
+                                    std::int64_t toMs) {
+    if (applyingUndo_) return;
+    if (fromMs == toMs)  return;
+    // Reconstruct the full pre-drag range from the post-drag model
+    // state and the signal's edge identification. The unchanged
+    // edge is whichever the signal *didn't* carry; read it from
+    // the model now.
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    const std::int64_t prevStart = isStart ? fromMs : l.startMs;
+    const std::int64_t prevEnd   = isStart ? l.endMs : fromMs;
+    undoHistory_.emplace_back(undo::EditLoopRange{id, prevStart, prevEnd});
+}
+
+void MainWindow::onDockMarkerRenameRequested(std::int64_t id,
+                                              QString      name) {
+    const auto idx = markerModel_->indexOf(id);
+    if (!idx) return;
+    const auto prevName = markerModel_->markers()[*idx].name;
+    if (prevName == name) return;   // no-op edit, no history push
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::RenameMarker{id, prevName});
+    }
+    markerModel_->rename(id, std::move(name));
+    FLOG_DEBUG("ui.score",
+               "rename-marker id={} via=dock-name", id);
+}
+
+void MainWindow::onDockMarkerPositionEditRequested(std::int64_t id,
+                                                   std::int64_t newMs) {
+    const auto idx = markerModel_->indexOf(id);
+    if (!idx) return;
+    const auto prevMs = markerModel_->markers()[*idx].sourceMs;
+    if (prevMs == newMs) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::EditMarkerPos{id, prevMs});
+    }
+    markerModel_->setPosition(id, newMs);
+    FLOG_DEBUG("ui.score",
+               "edit-marker-pos id={} from={} to={} via=dock-spinbox",
+               id, prevMs, newMs);
+}
+
+void MainWindow::onDockLoopRenameRequested(std::int64_t id,
+                                           QString      name) {
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto prevName = loopModel_->loops()[*idx].name;
+    if (prevName == name) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::RenameLoop{id, prevName});
+    }
+    loopModel_->rename(id, std::move(name));
+    FLOG_DEBUG("ui.score",
+               "rename-loop id={} via=dock-name", id);
+}
+
+void MainWindow::onDockLoopRangeEditRequested(std::int64_t id,
+                                              std::int64_t newStartMs,
+                                              std::int64_t newEndMs) {
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    const auto prevStartMs = l.startMs;
+    const auto prevEndMs   = l.endMs;
+    if (prevStartMs == newStartMs && prevEndMs == newEndMs) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(
+            undo::EditLoopRange{id, prevStartMs, prevEndMs});
+    }
+    loopModel_->setRange(id, newStartMs, newEndMs);
+    FLOG_DEBUG("ui.score",
+               "edit-loop-range id={} from=[{},{}] to=[{},{}] via=dock-spinbox",
+               id, prevStartMs, prevEndMs, newStartMs, newEndMs);
 }
 
 void MainWindow::onMarkerDragRequested(std::int64_t id,
@@ -1461,22 +1659,28 @@ void MainWindow::onDeleteSelectedArtifact() {
     // across barlines / markers / loops, so we check each in turn
     // and dispatch to whichever has a value. With no selection at
     // all this is a quiet no-op.
+    //
+    // MEMO: route through onBarlineDeleteRequested /
+    // onMarkerDeleteRequested / onLoopDeleteRequested rather than
+    // calling models directly, so the undo snapshot lives in one
+    // place per kind. The widget-key Del paths land on those same
+    // slots; this is just a different gesture entry point.
     if (!waveform_) return;
     if (const auto bar = waveform_->selectedBarline()) {
         const auto idx = *bar;
-        barlineModel_->removeAt(idx);
+        onBarlineDeleteRequested(idx);
         FLOG_DEBUG("ui.score",
                    "delete index={} via=window-shortcut size={}",
                    idx, barlineModel_->size());
     } else if (const auto mid = waveform_->selectedMarkerId()) {
         const auto id = *mid;
-        markerModel_->remove(id);
+        onMarkerDeleteRequested(id);
         FLOG_DEBUG("ui.score",
                    "delete-marker id={} via=window-shortcut size={}",
                    id, markerModel_->size());
     } else if (const auto lid = waveform_->selectedLoopId()) {
         const auto id = *lid;
-        loopModel_->remove(id);
+        onLoopDeleteRequested(id);
         FLOG_DEBUG("ui.score",
                    "delete-loop id={} via=window-shortcut size={}",
                    id, loopModel_->size());
@@ -1592,6 +1796,27 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     QMainWindow::closeEvent(event);
 }
 
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // Force window-level Ctrl+Z to win even when focus is in a
+    // QSpinBox / QLineEdit. By default Qt's text-edit widgets
+    // accept Qt::ShortcutOverride for the standard editing
+    // shortcuts (cut/copy/paste/undo/redo) so they can run their
+    // own per-character text-undo. For Fiddler the document-level
+    // undo (placement, drag, edit, rename, delete) is what the
+    // user means by Ctrl+Z; per-character text-undo inside a
+    // dock spinbox is a niche behaviour that just hides the
+    // gesture. Reject the override here so the keypress falls
+    // through to QShortcut.
+    if (event->type() == QEvent::ShortcutOverride) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->matches(QKeySequence::Undo)) {
+            event->ignore();
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::saveLayout() const {
     // MEMO: keys are namespaced under "mainwindow/" so future
     // panels / tool windows can share the same QSettings file
@@ -1684,11 +1909,25 @@ void MainWindow::setPrerollEnabled(bool enabled) {
 
 void MainWindow::onPrerollChanged() {
     // editingFinished — the spinbox just committed a new value.
+    // Push the previous value onto the undo history so Ctrl+Z
+    // reverses the edit. Skip when applyingUndo_ (so the dispatch's
+    // own setPrerollMs doesn't push) or when the value didn't
+    // actually change (no-op edits aren't worth a history slot).
     if (!prerollBox_) return;
-    setPrerollMs(prerollBox_->value());
+    const int newMs = prerollBox_->value();
+    if (newMs == prerollMs_) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::EditPrerollMs{prerollMs_});
+    }
+    setPrerollMs(newMs);
 }
 
 void MainWindow::onPrerollEnabledToggled(bool enabled) {
+    if (enabled == prerollEnabled_) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(
+            undo::EditPrerollEnabled{prerollEnabled_});
+    }
     setPrerollEnabled(enabled);
 }
 

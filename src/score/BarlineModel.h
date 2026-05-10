@@ -21,11 +21,12 @@
 //      and for step 7's MusicXML / ABC export. It never constrains or
 //      generates barline positions.
 //
-//   3. The model exposes a small undo-last-add affordance so the
-//      tap-to-place workflow can shed an accidental tap with a
-//      single Ctrl+Z. This is a degenerate undo (LIFO of placements
-//      only); a full QUndoStack is deferred until a real use forces
-//      it (Rule 8).
+//   3. Undo lives in MainWindow — a tagged-variant LIFO covering
+//      every kind of mutation across all three score models. The
+//      models themselves expose only their direct mutators (add,
+//      removeAt, clear); reversing those is MainWindow's job, with
+//      the previous state captured inline at each push site. See
+//      `src/ui/UndoEntry.h`.
 
 #pragma once
 
@@ -74,17 +75,11 @@ public:
     std::optional<std::size_t> add(std::int64_t sourceMs);
 
     // Remove the barline at `index`. Bounds-checked: out-of-range
-    // calls are silently ignored. The corresponding entry is also
-    // dropped from the add-history so undoLastAdd() stays honest.
+    // calls are silently ignored.
     void removeAt(std::size_t index);
 
     // Remove all barlines. Time signature is preserved.
     void clear();
-
-    // Remove the most-recently-added barline still present in the
-    // model (LIFO order, ignoring sorted position). Returns true if
-    // anything was removed.
-    bool undoLastAdd();
 
     // Index of the barline closest to sourceMs within toleranceMs,
     // or std::nullopt if none. Used by widgets for click-to-select
@@ -100,9 +95,6 @@ private:
     TimeSignature             timeSig_{};
     // Stored sorted ascending so widgets can scan in display order.
     std::vector<std::int64_t> barlines_;
-    // LIFO of placement timestamps still present in `barlines_`,
-    // for undoLastAdd(). Kept consistent with removeAt() / clear().
-    std::vector<std::int64_t> addHistory_;
 };
 
 } // namespace fiddler::score
