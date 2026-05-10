@@ -364,23 +364,21 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onMarkerDragRequested);
     connect(waveform_, &WaveformWidget::loopDragRequested,
             this, &MainWindow::onLoopDragRequested);
+    connect(waveform_, &WaveformWidget::dragStarted,
+            this, &MainWindow::onDragStarted);
+    connect(waveform_, &WaveformWidget::dragEnded,
+            this, &MainWindow::onDragEnded);
     connect(waveform_, &WaveformWidget::markerDragCommitted,
             this, [this](std::int64_t id,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
-                pushMarkerDragCommit(id, fromMs, toMs);
-                FLOG_DEBUG("ui.score",
-                    "marker-drag id={} from={} to={} via=waveform",
-                    id, fromMs, toMs);
+                commitMarkerDrag(id, fromMs, toMs, "waveform");
             });
     connect(waveform_, &WaveformWidget::loopDragCommitted,
             this, [this](std::int64_t id, bool isStart,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
-                pushLoopDragCommit(id, isStart, fromMs, toMs);
-                FLOG_DEBUG("ui.score",
-                    "loop-drag id={} edge={} from={} to={} via=waveform",
-                    id, isStart ? "start" : "end", fromMs, toMs);
+                commitLoopDrag(id, isStart, fromMs, toMs, "waveform");
             });
     layout->addWidget(waveform_, /*stretch=*/1);
 
@@ -413,23 +411,21 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onMarkerDragRequested);
     connect(staff_, &StaffWidget::loopDragRequested,
             this, &MainWindow::onLoopDragRequested);
+    connect(staff_, &StaffWidget::dragStarted,
+            this, &MainWindow::onDragStarted);
+    connect(staff_, &StaffWidget::dragEnded,
+            this, &MainWindow::onDragEnded);
     connect(staff_, &StaffWidget::markerDragCommitted,
             this, [this](std::int64_t id,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
-                pushMarkerDragCommit(id, fromMs, toMs);
-                FLOG_DEBUG("ui.score",
-                    "marker-drag id={} from={} to={} via=staff",
-                    id, fromMs, toMs);
+                commitMarkerDrag(id, fromMs, toMs, "staff");
             });
     connect(staff_, &StaffWidget::loopDragCommitted,
             this, [this](std::int64_t id, bool isStart,
                          std::int64_t fromMs,
                          std::int64_t toMs) {
-                pushLoopDragCommit(id, isStart, fromMs, toMs);
-                FLOG_DEBUG("ui.score",
-                    "loop-drag id={} edge={} from={} to={} via=staff",
-                    id, isStart ? "start" : "end", fromMs, toMs);
+                commitLoopDrag(id, isStart, fromMs, toMs, "staff");
             });
     layout->addWidget(staff_);
 
@@ -1538,33 +1534,62 @@ void MainWindow::onLoopDeleteRequested(std::int64_t id) {
                id, loopModel_->size());
 }
 
-void MainWindow::pushMarkerDragCommit(std::int64_t id,
-                                      std::int64_t fromMs,
-                                      std::int64_t toMs) {
-    // No-op when we're applying an undo. Also bail when the drag
-    // was a zero-distance no-op so Ctrl+Z doesn't pop a phantom
-    // entry that does nothing observable.
-    if (applyingUndo_) return;
-    if (fromMs == toMs)  return;
-    undoHistory_.emplace_back(undo::EditMarkerPos{id, fromMs});
+void MainWindow::commitMarkerDrag(std::int64_t id,
+                                  std::int64_t fromMs,
+                                  std::int64_t toMs,
+                                  const char*  via) {
+    // Zero-distance drag — release at the press point. Treat as a
+    // click: nothing to commit, nothing to undo, just clear the
+    // ghost in case the source widget set one before the threshold
+    // was crossed (it shouldn't have, but be defensive).
+    if (fromMs == toMs) {
+        if (waveform_) waveform_->clearDragGhost();
+        if (staff_)    staff_->clearDragGhost();
+        return;
+    }
+    if (!markerModel_) return;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(undo::EditMarkerPos{id, fromMs});
+    }
+    markerModel_->setPosition(id, toMs);
+    // Source widget cleared its own ghost in mouseRelease; clear
+    // the sister so it stops painting from the now-stale ghost
+    // (its paint should return to the model's just-updated value).
+    if (waveform_) waveform_->clearDragGhost();
+    if (staff_)    staff_->clearDragGhost();
+    FLOG_DEBUG("ui.score",
+               "marker-drag id={} from={} to={} via={}",
+               id, fromMs, toMs, via);
 }
 
-void MainWindow::pushLoopDragCommit(std::int64_t id,
-                                    bool         isStart,
-                                    std::int64_t fromMs,
-                                    std::int64_t toMs) {
-    if (applyingUndo_) return;
-    if (fromMs == toMs)  return;
-    // Reconstruct the full pre-drag range from the post-drag model
-    // state and the signal's edge identification. The unchanged
-    // edge is whichever the signal *didn't* carry; read it from
-    // the model now.
+void MainWindow::commitLoopDrag(std::int64_t id,
+                                bool         isStart,
+                                std::int64_t fromMs,
+                                std::int64_t toMs,
+                                const char*  via) {
+    if (fromMs == toMs) {
+        if (waveform_) waveform_->clearDragGhost();
+        if (staff_)    staff_->clearDragGhost();
+        return;
+    }
+    if (!loopModel_) return;
     const auto idx = loopModel_->indexOf(id);
     if (!idx) return;
     const auto& l = loopModel_->loops()[*idx];
-    const std::int64_t prevStart = isStart ? fromMs : l.startMs;
-    const std::int64_t prevEnd   = isStart ? l.endMs : fromMs;
-    undoHistory_.emplace_back(undo::EditLoopRange{id, prevStart, prevEnd});
+    // The model's still at the pre-drag values; the unchanged edge
+    // is whatever the signal didn't claim was being dragged.
+    const std::int64_t newStart = isStart ? toMs   : l.startMs;
+    const std::int64_t newEnd   = isStart ? l.endMs : toMs;
+    if (!applyingUndo_) {
+        undoHistory_.emplace_back(
+            undo::EditLoopRange{id, l.startMs, l.endMs});
+    }
+    loopModel_->setRange(id, newStart, newEnd);
+    if (waveform_) waveform_->clearDragGhost();
+    if (staff_)    staff_->clearDragGhost();
+    FLOG_DEBUG("ui.score",
+               "loop-drag id={} edge={} from={} to={} via={}",
+               id, isStart ? "start" : "end", fromMs, toMs, via);
 }
 
 void MainWindow::onDockMarkerRenameRequested(std::int64_t id,
@@ -1629,29 +1654,53 @@ void MainWindow::onDockLoopRangeEditRequested(std::int64_t id,
                id, prevStartMs, prevEndMs, newStartMs, newEndMs);
 }
 
+void MainWindow::onDragStarted() {
+    // MEMO[#22]: pause the playback-position poll so its slider
+    // and tempo-label repaints don't compete with mouse-move
+    // events while the user is dragging. Resumed by onDragEnded.
+    dragInFlight_ = true;
+    if (positionTimer_) positionTimer_->stop();
+}
+
+void MainWindow::onDragEnded() {
+    dragInFlight_ = false;
+    if (positionTimer_ && player_) positionTimer_->start();
+}
+
 void MainWindow::onMarkerDragRequested(std::int64_t id,
                                        std::int64_t newMs) {
-    // Live drag (issue #11). Fires per mouse-move while the user is
-    // dragging a marker tick on either score widget. We just push
-    // the new position into the model — every connected view +
-    // the dock's property page repaints automatically through the
-    // model's changed() signal. No log here: the per-move rate
-    // would flood the event log; the widget emits a separate
-    // *DragCommitted signal on release that we DO log.
-    if (!markerModel_) return;
-    markerModel_->setPosition(id, newMs);
+    // Live drag forwarding (#22). Pre-#22 this slot wrote into
+    // the model on every mouse-move, which re-sorted the markers
+    // vector and rebuilt the dock tree per move — heavy enough
+    // to starve the GUI thread under typical drag speeds. Now
+    // the widget paints from a local DragGhost; this slot just
+    // mirrors the ghost to the sister score widget so the tick
+    // glides on both surfaces. The single model write happens
+    // on release via markerDragCommitted.
+    if (waveform_) waveform_->setMarkerDragGhost(id, newMs);
+    if (staff_)    staff_->setMarkerDragGhost(id, newMs);
 }
 
 void MainWindow::onLoopDragRequested(std::int64_t id,
                                      std::int64_t newStartMs,
                                      std::int64_t newEndMs) {
-    // Live drag for a loop boundary. setRange validates the
-    // start < end invariant and rejects invalid ranges; the widget
-    // already filters those out before emitting, but the model is
-    // the authoritative gate. No log per move (see
-    // onMarkerDragRequested).
+    // Live drag forwarding (#22). Same pattern as
+    // onMarkerDragRequested — mirror the moving edge's ghost to
+    // both widgets so the band glides on both. The source widget
+    // already updated its own ghost in mouseMove; the
+    // setLoopDragGhost call there is idempotent. The single
+    // setRange happens on release.
     if (!loopModel_) return;
-    loopModel_->setRange(id, newStartMs, newEndMs);
+    const auto idx = loopModel_->indexOf(id);
+    if (!idx) return;
+    const auto& l = loopModel_->loops()[*idx];
+    // Whichever edge differs from the model's current value is
+    // the one the user is dragging. The widget always emits the
+    // partner edge unchanged, so this comparison is unambiguous.
+    const bool isStart = (newStartMs != l.startMs);
+    const std::int64_t ghostMs = isStart ? newStartMs : newEndMs;
+    if (waveform_) waveform_->setLoopDragGhost(id, isStart, ghostMs);
+    if (staff_)    staff_->setLoopDragGhost(id, isStart, ghostMs);
 }
 
 void MainWindow::onDeleteSelectedArtifact() {

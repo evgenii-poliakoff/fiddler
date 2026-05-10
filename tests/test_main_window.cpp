@@ -2467,6 +2467,97 @@ TEST_CASE("MainWindow: cancelPendingWrap flips the play button label to Play",
 // signal lands on MainWindow's slot.
 // ---------------------------------------------------------------------------
 
+TEST_CASE("MainWindow: live drag does not write the model — commit does (#22)",
+          "[main-window][gui][integration][drag-smooth]") {
+    // MEMO[#22]: pre-22, every mouse-move during a drag fired
+    // markerModel_->setPosition, which re-sorted the markers
+    // vector and rebuilt the dock tree. That per-move chain
+    // starved the GUI thread and made the drag step visibly. The
+    // unified ghost flow defers the write to release; this test
+    // pins the contract.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    QSignalSpy modelSpy(&window->markerModel(),
+                        &fiddler::score::MarkerModel::changed);
+    modelSpy.clear();
+
+    // Three live-drag emissions: model must NOT change.
+    emit waveform->markerDragRequested(markerId, 1600);
+    emit waveform->markerDragRequested(markerId, 1700);
+    emit waveform->markerDragRequested(markerId, 1800);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1500);
+    REQUIRE(modelSpy.count() == 0);
+
+    // Commit: model writes exactly once.
+    emit waveform->markerDragCommitted(markerId, 1500, 1800);
+    REQUIRE(window->markerModel().markers()[0].sourceMs == 1800);
+    REQUIRE(modelSpy.count() == 1);
+}
+
+TEST_CASE("MainWindow: live drag mirrors ghost to the sister widget (#22)",
+          "[main-window][gui][integration][drag-smooth]") {
+    // The user is touching ONE score widget; the other should
+    // show the dragged tick at the live ghost ms too. MainWindow
+    // forwards markerDragRequested → setMarkerDragGhost on both
+    // widgets; the test verifies the staff sees the ghost when
+    // the waveform is the source.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto markerId = window->markerModel().markers()[0].id;
+
+    REQUIRE_FALSE(staff->dragGhostMs(markerId).has_value());
+    emit waveform->markerDragRequested(markerId, 2000);
+    REQUIRE(staff->dragGhostMs(markerId) == 2000);
+    REQUIRE(waveform->dragGhostMs(markerId) == 2000);   // source mirrored too
+
+    // Commit clears the ghost.
+    emit waveform->markerDragCommitted(markerId, 1500, 2000);
+    REQUIRE_FALSE(staff->dragGhostMs(markerId).has_value());
+    REQUIRE_FALSE(waveform->dragGhostMs(markerId).has_value());
+}
+
+TEST_CASE("MainWindow: position-poll pauses during a drag (#22)",
+          "[main-window][gui][integration][drag-smooth]") {
+    // Pre-22 the 50 ms playback-position poll competed with mouse
+    // moves under load. The poll now stops on dragStarted and
+    // resumes on dragEnded.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    REQUIRE_FALSE(window->dragInFlight());
+
+    emit waveform->dragStarted();
+    REQUIRE(window->dragInFlight());
+
+    emit waveform->dragEnded();
+    REQUIRE_FALSE(window->dragInFlight());
+}
+
 TEST_CASE("MainWindow: Ctrl+Z reverses a marker drag",
           "[main-window][gui][integration][undo]") {
     qtApp();
@@ -2482,10 +2573,10 @@ TEST_CASE("MainWindow: Ctrl+Z reverses a marker drag",
     seekAndTapMarker(*window, 1500);
     const auto markerId = window->markerModel().markers()[0].id;
 
-    // Simulate a drag: move the marker in the model (live-update
-    // path) then fire the commit signal carrying the pre-drag ms.
-    REQUIRE(const_cast<fiddler::score::MarkerModel&>(window->markerModel())
-                .setPosition(markerId, 2500));
+    // Simulate a drag: under the unified ghost flow (#22) the
+    // commit handler is the ONE place that writes the model. The
+    // test fires the commit signal with the from→to pair; the
+    // handler does the setPosition.
     emit waveform->markerDragCommitted(markerId, 1500, 2500);
 
     REQUIRE(window->markerModel().markers()[0].sourceMs == 2500);
@@ -2502,9 +2593,9 @@ TEST_CASE("MainWindow: Ctrl+Z reverses a loop edge drag",
         loaded.window->findChild<WaveformWidget*>("waveformWidget");
     REQUIRE(waveform);
 
-    // Simulate dragging the right edge from 1500 → 1900.
-    REQUIRE(const_cast<fiddler::score::LoopModel&>(loaded.window->loopModel())
-                .setRange(loaded.loopId, 500, 1900));
+    // Simulate dragging the right edge from 1500 → 1900. Under the
+    // unified ghost flow (#22), commitLoopDrag is the ONE place
+    // that writes the model — the test must NOT pre-move the model.
     emit waveform->loopDragCommitted(loaded.loopId,
                                      /*isStart=*/false,
                                      /*fromMs=*/1500,

@@ -53,6 +53,11 @@ public:
     // through to the player.
     [[nodiscard]] const audio::Player& player() const noexcept { return *player_; }
 
+    // Test seam (#22) — true while a drag is in flight on either
+    // score widget. Used by tests to verify that the playback-
+    // position poll pauses during the drag.
+    [[nodiscard]] bool dragInFlight() const noexcept { return dragInFlight_; }
+
     // Test seams for the wrap-pause state machine (issue #13).
     // Production code never calls enterWrapPauseForTest — the real
     // entry is updatePosition's wrap branch. Exposed so integration
@@ -251,6 +256,12 @@ private slots:
                                std::int64_t newStartMs,
                                std::int64_t newEndMs);
 
+    // Drag-bracket slots (#22). Pause the playback-position poll
+    // for the duration of a drag so its 50 ms repaints don't add
+    // to the per-move workload. The poll resumes on dragEnded.
+    void onDragStarted();
+    void onDragEnded();
+
     // The window-level 'Del' shortcut: removes the currently-selected
     // artifact (barline OR marker) regardless of which child widget
     // has focus. Selection is mutually exclusive between the two
@@ -258,18 +269,27 @@ private slots:
     void onDeleteSelectedArtifact();
 
 private:
-    // Push a drag-commit's pre-drag snapshot onto the undo history.
-    // Called from the markerDragCommitted / loopDragCommitted slot
-    // lambdas after the model has already taken the new value —
-    // the signal carries fromMs (pre-drag) which we use as the
-    // previous-value to restore on Ctrl+Z.
-    void pushMarkerDragCommit(std::int64_t id,
-                              std::int64_t fromMs,
-                              std::int64_t toMs);
-    void pushLoopDragCommit  (std::int64_t id,
-                              bool         isStart,
-                              std::int64_t fromMs,
-                              std::int64_t toMs);
+    // Apply a drag commit to the model — called from the
+    // markerDragCommitted / loopDragCommitted slot lambdas. Under
+    // the unified ghost flow (#22) the model is unchanged
+    // mid-drag, so this is the ONE place that writes for the
+    // entire drag: it pushes the pre-drag snapshot onto the undo
+    // history (so Ctrl+Z reverses), then runs setPosition /
+    // setRange, then clears the sister widget's ghost so paint
+    // returns to the model's value.
+    //
+    // `via` is the widget tag for the log line ("waveform" /
+    // "staff") since the source-widget identity is lost by the
+    // time we get here.
+    void commitMarkerDrag(std::int64_t id,
+                          std::int64_t fromMs,
+                          std::int64_t toMs,
+                          const char*  via);
+    void commitLoopDrag  (std::int64_t id,
+                          bool         isStart,
+                          std::int64_t fromMs,
+                          std::int64_t toMs,
+                          const char*  via);
 
     void buildMenus();
     void buildCentralWidget();
@@ -296,6 +316,11 @@ private:
     QSpinBox*       prerollBox_       = nullptr;
     QCheckBox*      prerollEnabledBox_ = nullptr;
     QTimer*         positionTimer_    = nullptr;
+
+    // True while either score widget is mid-drag. The position-
+    // poll timer pauses while this is set so its slider/label
+    // repaints don't add to the per-move workload — see #22.
+    bool            dragInFlight_     = false;
     WaveformWidget* waveform_       = nullptr;
     StaffWidget*    staff_          = nullptr;
     QComboBox*      tuneTypeCombo_  = nullptr;

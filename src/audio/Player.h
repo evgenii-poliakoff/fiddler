@@ -115,6 +115,21 @@ private:
     // ~2 s of source time, then re-converges.
     std::atomic<std::int64_t>  anchorSourceMs_{0};
     std::atomic<std::int64_t>  anchorOutFrames_{0};
+
+    // Pending-seek slot (#22). The GUI thread writes; the decoder
+    // thread reads at the top of each iteration. -1 sentinel means
+    // "no pending seek". Multiple GUI seeks in flight collapse to
+    // the latest — exactly what we want during a drag, where the
+    // user produces dozens of intermediate positions but only the
+    // final one matters.
+    //
+    // MEMO: pre-#22 Player::seek took the heavy mutex_ on the GUI
+    // thread, blocking it for ~140 ms while the decoder thread
+    // finished an FFmpeg read + ring write. Drag at 60 Hz on the
+    // GUI side stalled hard. Deferring the actual decoder.seek +
+    // stretcher.reset to the decoder thread keeps the GUI free.
+    static constexpr std::int64_t kNoPendingSeek = -1;
+    std::atomic<std::int64_t>  pendingSeekMs_{kNoPendingSeek};
 };
 
 } // namespace fiddler::audio

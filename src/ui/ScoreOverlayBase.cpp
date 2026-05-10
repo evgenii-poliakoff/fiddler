@@ -447,6 +447,14 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
             return;
         }
         dragActive_ = true;
+        // MEMO[#22]: ghost is initialised at the artifact's
+        // press-time position, then updated per move. Paint code
+        // (effectiveMarkerMs / effectiveLoopRange) consults the
+        // ghost instead of the model so the dragged tick glides
+        // without the model→dock→repaint round-trip per move.
+        dragGhost_ = DragGhost{ dragKind_, dragId_, dragOriginalMs_ };
+        lastSeekMs_.reset();   // fresh squelch state per drag
+        emit dragStarted();
     }
 
     const auto cursorMs = xToMs(event->pos().x());
@@ -456,14 +464,25 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
     // drag has nothing to commit to — drop quietly.
     if (dragKind_ == DragKind::Marker) {
         if (!markerModel_ || !markerModel_->indexOf(dragId_)) {
-            dragKind_ = DragKind::None;
+            dragKind_   = DragKind::None;
+            dragActive_ = false;
+            dragGhost_.reset();
+            emit dragEnded();
             event->accept();
             return;
         }
+        if (dragGhost_) dragGhost_->ms = cursorMs;
         emit markerDragRequested(dragId_, cursorMs);
         // Cursor follows the marker live so the user visually
-        // tracks where the marker is going.
-        emit seekRequested(cursorMs);
+        // tracks where the marker is going. Squelch identical
+        // values — Qt can deliver mouse-moves in same-pixel bursts
+        // under load, and a duplicate seek is wasted player work
+        // plus log noise.
+        if (!lastSeekMs_ || *lastSeekMs_ != cursorMs) {
+            lastSeekMs_ = cursorMs;
+            emit seekRequested(cursorMs);
+        }
+        update();
         event->accept();
         return;
     }
@@ -474,7 +493,10 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
     if (!loopModel_) { event->accept(); return; }
     const auto idx = loopModel_->indexOf(dragId_);
     if (!idx) {
-        dragKind_ = DragKind::None;
+        dragKind_   = DragKind::None;
+        dragActive_ = false;
+        dragGhost_.reset();
+        emit dragEnded();
         event->accept();
         return;
     }
@@ -497,14 +519,17 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
             event->accept();
             return;
         }
+        if (dragGhost_) dragGhost_->ms = snappedMs;
         emit loopDragRequested(dragId_, snappedMs, loop.endMs);
     } else { // LoopEnd
         if (snappedMs <= loop.startMs) {
             event->accept();
             return;
         }
+        if (dragGhost_) dragGhost_->ms = snappedMs;
         emit loopDragRequested(dragId_, loop.startMs, snappedMs);
     }
+    update();
     event->accept();
 }
 
@@ -517,34 +542,102 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
     }
 
     if (dragActive_) {
-        // Read the artifact's final ms from the model — that's the
-        // post-snap, post-clamp value (every successful move emitted
-        // a request that MainWindow committed). `dragOriginalMs_`
-        // gives us the from-side of the from→to log line.
+        // MEMO[#22]: read the artifact's final ms from the GHOST,
+        // not the model. Under the unified ghost flow the model
+        // is unchanged mid-drag — MainWindow commits exactly once
+        // here, on release, so the model's value would still
+        // reflect the press-time position when this slot reads it.
+        // `dragOriginalMs_` provides the from-side of the
+        // from→to log line and the snapshot for undo.
+        const auto toMs = dragGhost_ ? dragGhost_->ms : dragOriginalMs_;
         if (dragKind_ == DragKind::Marker
-            && markerModel_)
+            && markerModel_
+            && markerModel_->indexOf(dragId_).has_value())
         {
-            if (const auto idx = markerModel_->indexOf(dragId_)) {
-                const auto toMs =
-                    markerModel_->markers()[*idx].sourceMs;
-                emit markerDragCommitted(dragId_, dragOriginalMs_, toMs);
-            }
-        } else if (loopModel_) {
-            if (const auto idx = loopModel_->indexOf(dragId_)) {
-                const auto& loop = loopModel_->loops()[*idx];
-                const bool isStart = (dragKind_ == DragKind::LoopStart);
-                const auto toMs = isStart ? loop.startMs : loop.endMs;
-                emit loopDragCommitted(dragId_, isStart,
-                                       dragOriginalMs_, toMs);
-            }
+            emit markerDragCommitted(dragId_, dragOriginalMs_, toMs);
+        } else if ((dragKind_ == DragKind::LoopStart
+                    || dragKind_ == DragKind::LoopEnd)
+                   && loopModel_
+                   && loopModel_->indexOf(dragId_).has_value()) {
+            const bool isStart = (dragKind_ == DragKind::LoopStart);
+            emit loopDragCommitted(dragId_, isStart,
+                                   dragOriginalMs_, toMs);
         }
     }
 
+    const bool wasActive = dragActive_;
     dragKind_       = DragKind::None;
     dragActive_     = false;
     dragId_         = 0;
     dragOriginalMs_ = 0;
+    dragGhost_.reset();
+    lastSeekMs_.reset();
+    if (wasActive) {
+        emit dragEnded();
+        update();   // repaint without ghost — final position from model
+    }
     event->accept();
+}
+
+// ---- drag-ghost mirror slots (issue #22) --------------------------------
+
+void ScoreOverlayBase::setMarkerDragGhost(std::int64_t id,
+                                          std::int64_t ms) {
+    dragGhost_ = DragGhost{ DragKind::Marker, id, ms };
+    update();
+}
+
+void ScoreOverlayBase::setLoopDragGhost(std::int64_t id,
+                                        bool isStart,
+                                        std::int64_t ms) {
+    dragGhost_ = DragGhost{
+        isStart ? DragKind::LoopStart : DragKind::LoopEnd, id, ms };
+    update();
+}
+
+void ScoreOverlayBase::clearDragGhost() {
+    if (!dragGhost_) return;
+    dragGhost_.reset();
+    update();
+}
+
+// ---- test seam ----------------------------------------------------------
+
+std::optional<std::int64_t>
+ScoreOverlayBase::dragGhostMs(std::int64_t id) const noexcept {
+    if (!dragGhost_) return std::nullopt;
+    if (dragGhost_->id != id) return std::nullopt;
+    return dragGhost_->ms;
+}
+
+// ---- effective-ms helpers (paint code) ----------------------------------
+
+std::int64_t
+ScoreOverlayBase::effectiveMarkerMs(std::int64_t id,
+                                    std::int64_t modelMs) const noexcept
+{
+    if (dragGhost_
+        && dragGhost_->kind == DragKind::Marker
+        && dragGhost_->id == id) {
+        return dragGhost_->ms;
+    }
+    return modelMs;
+}
+
+std::pair<std::int64_t, std::int64_t>
+ScoreOverlayBase::effectiveLoopRange(std::int64_t id,
+                                     std::int64_t modelStartMs,
+                                     std::int64_t modelEndMs) const noexcept
+{
+    if (dragGhost_ && dragGhost_->id == id) {
+        if (dragGhost_->kind == DragKind::LoopStart) {
+            return { dragGhost_->ms, modelEndMs };
+        }
+        if (dragGhost_->kind == DragKind::LoopEnd) {
+            return { modelStartMs, dragGhost_->ms };
+        }
+    }
+    return { modelStartMs, modelEndMs };
 }
 
 std::optional<ScoreOverlayBase::LoopEdgeHit>
