@@ -290,6 +290,10 @@ void MainWindow::buildCentralWidget() {
     // MEMO: editingFinished, not valueChanged — see the marker
     // Position spinbox for the leading-zero rationale.
     auto* prerollLabel = new QLabel(tr("Pre-roll:"), central);
+    // MEMO: object name so tools/screenshots can find the label
+    // when framing the "Pre-roll:" group as one region (label +
+    // checkbox + spinbox). No behavioural effect at runtime.
+    prerollLabel->setObjectName("prerollLabel");
     transport->addWidget(prerollLabel);
     prerollEnabledBox_ = new QCheckBox(central);
     prerollEnabledBox_->setObjectName("prerollEnabledBox");
@@ -429,6 +433,7 @@ void MainWindow::buildCentralWidget() {
 
     auto* tempoRow = new QHBoxLayout();
     tempoLabel_ = new QLabel(tr("Tempo: 100%"), central);
+    tempoLabel_->setObjectName("tempoLabel");
     tempoSlider_ = new QSlider(Qt::Horizontal, central);
     tempoSlider_->setObjectName("tempoSlider");
     tempoSlider_->setRange(25, 100);

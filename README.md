@@ -56,11 +56,21 @@ sudo apt install -y \
 
 ## Build
 
+All routine operations are wrapped in `./scripts/*.sh`. Humans, CI, and
+Claude/agents use the same scripts so invocations don't drift across
+contexts.
+
 ```bash
+./scripts/install-deps.sh        # apt deps (Ubuntu 24.04)
 ./scripts/bootstrap.sh           # configure + build in ./build
-./build/src/fiddler              # run
-ctest --test-dir build --output-on-failure   # tests
+./build/src/fiddler              # run the app
+./scripts/test.sh                # run ctest
+./scripts/screenshots.sh         # regenerate docs/img/*.png from the running app
 ```
+
+Each script accepts `BUILD_DIR=<dir>` / `BUILD_TYPE=<Debug|Release>` env
+overrides. `test.sh` and `screenshots.sh` forward extra args through
+(`./scripts/test.sh -R 'WaveformWidget'`).
 
 Or manually:
 
