@@ -355,11 +355,10 @@ sections later. Layout is two-pane vertical:
 └─────────────────────────────────┘
 ```
 
-**`Qt::RightDockWidgetArea`** by convention — DaVinci Resolve,
-Final Cut, Adobe Audition, GarageBand all put their inspector /
-project panel on the right. Browsers (track lists, file libraries)
-go on the left in DAWs; this dock is more inspector than browser,
-so right is the right call.
+**`Qt::RightDockWidgetArea`** by convention — modern editors and
+DAWs commonly put their inspector / project panel on the right.
+Browsers (track lists, file libraries) go on the left; this dock
+is more inspector than browser, so right is the right call.
 
 **Selection mirrored three ways.** Clicking a marker row in the
 dock emits `markerSelectionChanged(id)`; MainWindow forwards to
@@ -623,10 +622,10 @@ first use, so the suite is self-contained and doesn't depend on the
 
 ### Score format (later, steps 6–7)
 
-Save as **MusicXML** for portability with MuseScore, Finale, Sibelius.
-Also export **ABC notation** — it's the lingua franca of the Irish trad
-community (thesession.org), and many users will paste tunes back and
-forth as ABC.
+Save as **MusicXML** for portability with notation editors that
+consume the format. Also export **ABC notation** — it's the
+lingua franca of the Irish trad community (thesession.org), and
+many users will paste tunes back and forth as ABC.
 
 ## Engineering rules (non-negotiable)
 
