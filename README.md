@@ -7,6 +7,14 @@ the tune onto a synchronised musical staff — clicking a bar in the staff
 seeks the audio, scrubbing the audio moves the staff cursor. Place a note
 on the staff to hear a reference tone for pitch-matching.
 
+![The Fiddler main window — a recording open with markers, barlines, an armed practice loop, and the project viewer dock on the right.](docs/img/manual-overview.png)
+
+## User manual
+
+The [**user manual**](docs/user-manual.md) walks through opening audio,
+slowing it down, marking phrases, building practice loops, and using
+the pre-roll countdown. Start there if you're new to Fiddler.
+
 **Status:** step 5.5 part B done — open audio, play with pitch-
 preserving tempo control 25–100 %, see and seek through a
 synchronised waveform, place barlines and named markers on a staff
