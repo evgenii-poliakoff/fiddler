@@ -583,6 +583,285 @@ work):
   needs tighter wrap, the hook would move into the audio-callback
   path.
 
+### Zoom + viewport (#49)
+
+The score widgets support horizontal zoom and pan via a viewport
+owned by `ScoreOverlayBase`. The base stores
+`viewportStartMs_` / `viewportEndMs_`; subclasses only supply
+their `durationMs()`. `xToMs` / `msToX` are non-virtual on the
+base and read the viewport — so the whole rendering chain
+(peaks, ticks, flags, bands, cursor, drag ghosts, hit-tests,
+snap radius via `pixelsToMs`) zooms in lockstep with no
+per-subclass work.
+
+`MainWindow` is the single source of truth for the viewport
+across both widgets: `applyViewport(start, end)` calls
+`setViewport` on the waveform and the staff in lockstep and
+updates the horizontal scrollbar without re-triggering itself
+(a `suppressViewportScrollBarSignals_` guard breaks the
+feedback loop).
+
+**Gestures** (`ScoreOverlayBase::wheelEvent`):
+
+- **Ctrl + wheel** zooms by √2 per notch, anchored on the
+  cached *zoom-anchor guide* pixel — not on the wheel event's
+  `qreal position()`. Sub-pixel offsets compound across wheel
+  notches; anchoring on the same int pixel the user sees as
+  the guide line makes the visual reference equal to the math
+  reference, so the targeted feature stays under the guide
+  forever.
+- **Shift + wheel** pans by ~10 % of the visible span per
+  notch and emits `userScrolled` so MainWindow can flip the
+  Follow Playback toggle off (matching Audacity / Ableton /
+  Audition convention — any manual scroll pauses follow).
+- **Ctrl + `=` / `-` / `0`** are MainWindow `QAction`s
+  (keyboard shortcuts) anchored on the playback cursor when
+  in-viewport, or viewport center when the playhead is
+  off-screen.
+
+**Zoom-anchor guide** (the dashed amber vertical line under
+Ctrl) is updated from two sources: `mouseMoveEvent` while the
+mouse is moving with Ctrl held, AND a `QApplication`-level
+event filter that catches Ctrl press / release globally —
+without that filter the guide wouldn't appear until the user
+moved the mouse, because Qt routes key events through focus
+not through hover.
+
+**Follow Playback** is an Ableton-style toggle on MainWindow
+(`View > Follow Playback`, default on). The page-flip in
+`updatePosition` only fires when the playhead has actually
+*moved* between ticks (`curMs != lastFollowPosMs_`) — without
+this guard, a Ctrl + wheel zoom that pushes the viewport away
+from a stationary playhead would be undone on the very next
+50 ms tick. `applyViewport` re-anchors `lastFollowPosMs_` to
+the current player position so the next tick sees zero
+motion. The flip lands the playhead 20 % from the left edge
+of the new viewport so dock-jumped artifacts have visible
+lead-in.
+
+`startPlayback()` is the single point that re-engages Follow on
+every transport start (Play button, dock double-click on
+marker / loop, etc.), so an accidental nudge of the scrollbar
+doesn't leave Follow stuck off — the natural "I'm pressing
+Play again" gesture restores it.
+
+**Off-screen artifacts** rely on `msToX` returning unclamped
+values (an artifact whose ms is before the viewport returns a
+negative x; after the viewport returns x >= width). Every
+paint site has an `if (x < 0 || x >= width()) continue` bounds
+check that culls them. The one exception is `ms ==
+durationMs()` — the exact right-edge case lands at x = w on
+integer math and gets nudged to w - 1 so the last column still
+paints.
+
+`WaveformOverview`'s bucket count is `kOverviewBuckets =
+32 768` (up from the pre-#49 4 096) — keeps the painted
+waveform clean at any practical zoom, at 512 KB of cost. A
+proper multi-resolution pyramid for extreme zoom is filed as
+#50.
+
+### User-manual screenshot automation (`tools/screenshots/`)
+
+The user manual's `docs/img/*.png` figures are produced by
+`fiddler-screenshots`, a small C++ binary that constructs a real
+`MainWindow` under offscreen Qt, drives it through a sequence of
+declarative actions, and writes a PNG of the requested region.
+
+#### YAML manifest + action registry
+
+**Declarative scene manifest** at
+`tools/screenshots/scenes.yaml` — one block per figure:
+
+```yaml
+- id: manual-zoom-view
+  output: manual-zoom-view.png
+  capture:
+    region: [waveformWidget, staffWidget, viewportScrollBar, positionSlider]
+  setup:
+    - load-fixture
+    - tap-barlines-at: 800,1000,1200,1400,1600
+    - zoom-to-range: 700,1700
+  margin: { horizontal: 8, vertical: 8 }
+```
+
+**Setup-action registry** in `tools/screenshots/scene_actions.cpp`
+maps YAML action names to lambdas (`load-fixture`, `seek-ms`,
+`tap-barlines-at`, `tap-markers-at`, `select-marker`,
+`select-loop`, `build-loop-marker-pair`, `show-popup`,
+`enter-countdown`, `zoom-to-range`, …). The dispatch is a single
+`QHash<QString, ActionFn>` lookup keyed on the YAML action name.
+Unknown action → `std::runtime_error` with the action name; main
+catches and exits 1. Argument parsing (single int, comma-split
+list, etc.) is pushed into each action so it owns its own error
+messages.
+
+Adding a new gesture is one new action; adding a new figure is a
+YAML edit only. Manifest path + output directory are baked at
+CMake configure time; `--output` / `--manifest` CLI flags
+override for local experimentation.
+
+#### Qt bootstrap (offscreen, isolated settings)
+
+The tool sets `QT_QPA_PLATFORM=offscreen` and calls
+`QStandardPaths::setTestModeEnabled(true)` BEFORE constructing
+the `QApplication` (`main.cpp:31–35`):
+
+- Offscreen platform plugin lets the tool render on a headless
+  CI runner without a display server. Same plugin the test suite
+  uses; same constraints (no native popups, no real audio
+  device).
+- Test-mode `QStandardPaths` redirects `QSettings` into a
+  per-process scratch directory. Without this, the tool would
+  read the developer's saved window layout, dock position,
+  pre-roll preferences, etc. — every run on a different machine
+  would produce different PNGs.
+
+#### Window construction: show, settle, query, resize, flush
+
+`scene_runner.cpp:169–189` builds the MainWindow with a specific
+sequence:
+
+1. `window.show()`.
+2. `flushEvents()` to let the initial layout settle.
+3. Query `window.sizeHint()` — *after* the show pass, because Qt
+   doesn't include the right-edge dock's contribution to size
+   hint until layout has run at least once.
+4. Explicitly `setVisible(true)` on the dock and add its width to
+   the natural size so the dock is always part of the captured
+   window (the user closing it in QSettings would otherwise
+   leak through — but test-mode settings already block that;
+   this is belt-and-braces).
+5. `window.resize(...)` to the chosen natural size and flush
+   again.
+
+Without this dance, hero shots silently render at the
+underwide-without-dock size.
+
+#### `flushEvents`: the wait-for-paint primitive
+
+`scene_runner.cpp:163–167`:
+
+```cpp
+void flushEvents() {
+    for (int i = 0; i < 4; ++i) {
+        QApplication::processEvents(QEventLoop::AllEvents, 16);
+    }
+}
+```
+
+Called between every setup action and immediately before
+capture. Each setup action (`load-fixture`, `seek-ms`,
+`show-popup`, ...) queues paint + layout events but doesn't
+execute them; without the flush, captured pixels are
+mid-transition. Four passes × 16 ms is empirically enough for
+the heaviest scene (waveform + staff + transport row + dock
+combined) to settle. Single longer pass is NOT a substitute —
+some Qt internal events post other events that only get
+processed on a subsequent pass.
+
+#### Region capture: union of `objectName` rects
+
+`scene_runner.cpp:75–91` — given a YAML region list of
+`objectName`s:
+
+1. `window.findChild<QWidget*>(name)` for each. Missing name →
+   pushed onto `outMissing`.
+2. For each found widget: `widget->mapTo(&window, QPoint(0, 0))`
+   to convert local widget coords into top-level window coords.
+   Without `mapTo`, deeply nested widgets (dock children, layout
+   inside a property page) would project at the wrong offset.
+3. Union the rectangles.
+4. If `outMissing` is non-empty: print every missing name to
+   stderr and fail the scene with exit code 1.
+
+The fail-loud rule is load-bearing — silently omitting a missing
+widget from the union produces a wrong-but-plausible PNG that
+passes CI and ships into the manual. Forcing the failure pushes
+the manifest author to fix typos immediately.
+
+#### Element capture: parent-background composition
+
+`scene_runner.cpp:113–128` — for `capture: element: <objName>`:
+
+1. `widget->grab()` produces the widget's own pixmap.
+2. The pad colour is sampled from the parent widget at position
+   `(-1, -1)` relative to the target — one pixel outside the
+   widget's top-left. This colour is then used to fill the
+   margin around the grabbed pixmap. Without sampling, the pad
+   would be a default grey that visually disconnects the figure
+   from the surrounding chrome.
+3. Margin defaults to the style metric `LayoutDefaultSpacing`;
+   YAML `margin: { horizontal: H, vertical: V }` overrides per
+   axis.
+
+#### Popup capture: combo + dropdown stacked
+
+`scene_runner.cpp:135–159` — for `capture: popup: <comboObjName>`:
+
+1. The closed combo cell is grabbed via `combo->grab()`.
+2. The open popup itself is the QFrame found via
+   `combo->view()->parentWidget()`. Grabbed independently.
+3. The two pixmaps are composited vertically with a 1-px gap on
+   the combo's parent background.
+
+The two grabs are independent because Qt's combo popup is a
+top-level QFrame, not a child of `MainWindow` — it can't be part
+of a window-coords region union. The matching `show-popup`
+action in the action registry calls `combo->showPopup()` so the
+QFrame is realised before the runner tries to grab it; missing
+`show-popup` in the YAML setup → "popup not visible" stderr
+error and exit 1.
+
+#### DPI scaling: device-pixel-ratio, not painter scaling
+
+`scene_runner.cpp:59–68` — `grabAtScale(widget, rect, scale)`:
+
+```cpp
+QPixmap px(rect.width() * scale, rect.height() * scale);
+px.setDevicePixelRatio(scale);
+px.fill(Qt::transparent);
+QPainter painter(&px);
+widget->render(&painter, QPoint(), QRegion(rect));
+```
+
+The painter is NOT scaled. The pixmap's device-pixel-ratio
+makes painter coordinates stay logical; `widget->render` writes
+into the pixmap at higher device-pixel density automatically.
+`painter.scale(scale, scale)` would double-scale (logical ×
+device) and crop the output to the top-left quadrant. Default
+`dpiScale` is 2.0 (retina-ready); YAML `dpi-scale:` overrides
+per scene.
+
+#### Synthetic fixture: deterministic envelope-modulated sine
+
+`screenshot_fixture.cpp` generates an 8-second 44.1 kHz stereo
+16-bit PCM WAV at `$TMPDIR/fiddler-screenshots/fixture-8s.wav`.
+The signal is a 220 Hz carrier with four 2-second phrases, each
+shaped by an attack-decay envelope (sine raised to the 1.5
+power) — produces visible amplitude variation in the waveform
+overview so screenshots illustrate the shape of the data, not a
+flat band. Generation is purely deterministic (no RNG); the
+fixture has no external dependencies.
+
+#### Determinism (the load-bearing property)
+
+The tool does *not* explicitly normalise palettes, force colour
+formats, or pin PNG compression levels. Determinism comes from:
+
+- Test-mode `QSettings` (no per-machine layout leakage).
+- Offscreen platform plugin (no compositor variation).
+- Deterministic fixture WAV (no RNG, no decoded-source drift).
+- Deterministic action sequence (every gesture in the YAML
+  produces the same widget state on every run).
+- Qt's `QPixmap::save(path, "PNG")` is deterministic for
+  identical pixel data and pixmap format.
+
+Together these give byte-identical PNGs across runs, which is
+what makes the `./scripts/screenshots.sh && git status` audit
+gesture work. Anything that breaks determinism (a new RNG-driven
+action, a non-offscreen platform, a fixture change) breaks the
+audit — keep these constraints in mind when extending the tool.
+
 ### Logging: spdlog (behind a facade)
 
 The application code never includes spdlog headers directly. All log
