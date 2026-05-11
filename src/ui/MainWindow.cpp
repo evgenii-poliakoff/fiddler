@@ -851,6 +851,15 @@ void MainWindow::onSeek(int positionMs) {
     // tick doesn't see a fake "natural crossing" of endMs from a
     // user-initiated jump. See issue #13 + wrapShouldFire().
     previousPosMs_ = positionMs;
+
+    // MEMO[#40]: drive the playback cursor inline so it follows the
+    // user's seek at mouse-move rate (~60 Hz) instead of waiting for
+    // the 50 ms position timer. Without this, dragging a marker or
+    // waveform-clicking shows a stale cursor for up to 50 ms — which
+    // looks like a frozen red line during fast drags. Cheap: both
+    // setters just store an int and queue a paint.
+    if (waveform_) waveform_->setPositionMs(positionMs);
+    if (staff_)    staff_->setPositionMs(positionMs);
 }
 
 void MainWindow::onTempoChanged(int percent) {
@@ -1688,16 +1697,18 @@ void MainWindow::onDockLoopRangeEditRequested(std::int64_t id,
 }
 
 void MainWindow::onDragStarted() {
-    // MEMO[#22]: pause the playback-position poll so its slider
-    // and tempo-label repaints don't compete with mouse-move
-    // events while the user is dragging. Resumed by onDragEnded.
+    // MEMO[#40]: pre-#40 we stopped the 50 ms position poll here
+    // because Player::seek() blocked the GUI for ~140 ms on the
+    // shared mutex, and the poll firing during a drag stole mouse
+    // events. With the lock-free pipeline seeks are microseconds —
+    // the poll is free to keep running, and we *need* it running
+    // so the red playback cursor follows the drag. The flag is
+    // still observable (tests, future drag-aware logic).
     dragInFlight_ = true;
-    if (positionTimer_) positionTimer_->stop();
 }
 
 void MainWindow::onDragEnded() {
     dragInFlight_ = false;
-    if (positionTimer_ && player_) positionTimer_->start();
 }
 
 void MainWindow::onMarkerDragRequested(std::int64_t id,

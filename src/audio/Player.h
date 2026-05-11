@@ -20,7 +20,6 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <thread>
 
 // Forward-declare PortAudio types so the header doesn't pull <portaudio.h>.
@@ -85,14 +84,25 @@ private:
     PaStream*                  stream_ = nullptr;
 
     // True once we've sent a final flush to the stretcher at EOF.
-    // Protected by mutex_; reset on seek / load / unload.
+    // Touched only by the decoder thread; reset on seek / load /
+    // unload while the decoder thread is not running.
     bool                       eofFlushed_ = false;
 
-    // Protects decoder_ and ring_ against concurrent access by the
-    // decoder thread and the GUI thread (during seek). The PortAudio
-    // callback NEVER takes this mutex — it stays lock-free via the
-    // ring buffer's atomic read/write positions.
-    mutable std::mutex         mutex_;
+    // MEMO[#40]: pre-#40 a std::mutex protected decoder_, stretcher_,
+    // and ring_ from concurrent GUI / decoder-thread access. The
+    // GUI side hit ~140 ms blocks waiting on it during seeks while
+    // the decoder finished an FFmpeg read. The lock-free pipeline
+    // replaces that with:
+    //   - decoder_ / stretcher_ are exclusively owned by the decoder
+    //     thread during its lifetime. The GUI thread touches them
+    //     only in load() / unload(), where thread-start / thread-
+    //     join provide the happens-before edges.
+    //   - GUI / callback observe the audio format through atomics
+    //     (sampleRate_, channels_, durationMs_) set once in load().
+    //   - Seek is purely atomic publish (pendingSeekMs_); the
+    //     decoder thread handles decoder.seek + stretcher.reset
+    //     and then RingBuffer::publishDiscard() makes the callback
+    //     silence the stale samples without Pa_Stop / Pa_Start.
 
     std::thread                decoderThread_;
     std::atomic<bool>          decoderRunning_{false};
@@ -122,14 +132,17 @@ private:
     // the latest — exactly what we want during a drag, where the
     // user produces dozens of intermediate positions but only the
     // final one matters.
-    //
-    // MEMO: pre-#22 Player::seek took the heavy mutex_ on the GUI
-    // thread, blocking it for ~140 ms while the decoder thread
-    // finished an FFmpeg read + ring write. Drag at 60 Hz on the
-    // GUI side stalled hard. Deferring the actual decoder.seek +
-    // stretcher.reset to the decoder thread keeps the GUI free.
     static constexpr std::int64_t kNoPendingSeek = -1;
     std::atomic<std::int64_t>  pendingSeekMs_{kNoPendingSeek};
+
+    // Audio format cached as atomics so the GUI thread and the
+    // audio callback can read them without touching decoder_. Set
+    // once in load() before the decoder thread starts; cleared in
+    // unload() after the thread joins. While the decoder thread is
+    // running these are read-only.
+    std::atomic<int>           sampleRate_{0};
+    std::atomic<int>           channels_{0};
+    std::atomic<std::int64_t>  durationMs_{0};
 };
 
 } // namespace fiddler::audio
