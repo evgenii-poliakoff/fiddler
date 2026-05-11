@@ -667,6 +667,8 @@ The user manual's `docs/img/*.png` figures are produced by
 `MainWindow` under offscreen Qt, drives it through a sequence of
 declarative actions, and writes a PNG of the requested region.
 
+#### YAML manifest + action registry
+
 **Declarative scene manifest** at
 `tools/screenshots/scenes.yaml` — one block per figure:
 
@@ -686,31 +688,179 @@ declarative actions, and writes a PNG of the requested region.
 maps YAML action names to lambdas (`load-fixture`, `seek-ms`,
 `tap-barlines-at`, `tap-markers-at`, `select-marker`,
 `select-loop`, `build-loop-marker-pair`, `show-popup`,
-`enter-countdown`, `zoom-to-range`, …). Adding a new gesture is
-one new action; adding a new figure is a YAML edit only.
+`enter-countdown`, `zoom-to-range`, …). The dispatch is a single
+`QHash<QString, ActionFn>` lookup keyed on the YAML action name.
+Unknown action → `std::runtime_error` with the action name; main
+catches and exits 1. Argument parsing (single int, comma-split
+list, etc.) is pushed into each action so it owns its own error
+messages.
 
-**Capture kinds**: `window` (full hero shot), `region` (bounding
-box over a list of `objectName`s, unioned), `element` (one widget
-padded with margin), `popup` (closed combo cell + its open
-dropdown, stacked vertically). Region capture *fails loud* if any
-named widget doesn't resolve — a wrong-but-plausible PNG is the
-worst failure mode.
+Adding a new gesture is one new action; adding a new figure is a
+YAML edit only. Manifest path + output directory are baked at
+CMake configure time; `--output` / `--manifest` CLI flags
+override for local experimentation.
 
-**Determinism is the load-bearing property**: same source + same
-manifest + same fixture produces byte-identical PNGs across runs.
-This makes "are the manual's screenshots in sync with shipped
-behaviour?" a one-command check: `./scripts/screenshots.sh && git
-status`. If the working tree is clean, the manual is up to date.
+#### Qt bootstrap (offscreen, isolated settings)
 
-**Synthetic fixture**: the tool generates a small WAV at startup
-into a temp path, so the binary has no external dependencies and
-the bucket-aggregation paint outputs the same peaks every run.
+The tool sets `QT_QPA_PLATFORM=offscreen` and calls
+`QStandardPaths::setTestModeEnabled(true)` BEFORE constructing
+the `QApplication` (`main.cpp:31–35`):
 
-Output dir + manifest path are baked at CMake configure time;
-`--output` / `--manifest` CLI flags override for local
-experimentation. The canonical entry point is
-`./scripts/screenshots.sh` (one invocation across humans, CI, and
-the agent).
+- Offscreen platform plugin lets the tool render on a headless
+  CI runner without a display server. Same plugin the test suite
+  uses; same constraints (no native popups, no real audio
+  device).
+- Test-mode `QStandardPaths` redirects `QSettings` into a
+  per-process scratch directory. Without this, the tool would
+  read the developer's saved window layout, dock position,
+  pre-roll preferences, etc. — every run on a different machine
+  would produce different PNGs.
+
+#### Window construction: show, settle, query, resize, flush
+
+`scene_runner.cpp:169–189` builds the MainWindow with a specific
+sequence:
+
+1. `window.show()`.
+2. `flushEvents()` to let the initial layout settle.
+3. Query `window.sizeHint()` — *after* the show pass, because Qt
+   doesn't include the right-edge dock's contribution to size
+   hint until layout has run at least once.
+4. Explicitly `setVisible(true)` on the dock and add its width to
+   the natural size so the dock is always part of the captured
+   window (the user closing it in QSettings would otherwise
+   leak through — but test-mode settings already block that;
+   this is belt-and-braces).
+5. `window.resize(...)` to the chosen natural size and flush
+   again.
+
+Without this dance, hero shots silently render at the
+underwide-without-dock size.
+
+#### `flushEvents`: the wait-for-paint primitive
+
+`scene_runner.cpp:163–167`:
+
+```cpp
+void flushEvents() {
+    for (int i = 0; i < 4; ++i) {
+        QApplication::processEvents(QEventLoop::AllEvents, 16);
+    }
+}
+```
+
+Called between every setup action and immediately before
+capture. Each setup action (`load-fixture`, `seek-ms`,
+`show-popup`, ...) queues paint + layout events but doesn't
+execute them; without the flush, captured pixels are
+mid-transition. Four passes × 16 ms is empirically enough for
+the heaviest scene (waveform + staff + transport row + dock
+combined) to settle. Single longer pass is NOT a substitute —
+some Qt internal events post other events that only get
+processed on a subsequent pass.
+
+#### Region capture: union of `objectName` rects
+
+`scene_runner.cpp:75–91` — given a YAML region list of
+`objectName`s:
+
+1. `window.findChild<QWidget*>(name)` for each. Missing name →
+   pushed onto `outMissing`.
+2. For each found widget: `widget->mapTo(&window, QPoint(0, 0))`
+   to convert local widget coords into top-level window coords.
+   Without `mapTo`, deeply nested widgets (dock children, layout
+   inside a property page) would project at the wrong offset.
+3. Union the rectangles.
+4. If `outMissing` is non-empty: print every missing name to
+   stderr and fail the scene with exit code 1.
+
+The fail-loud rule is load-bearing — silently omitting a missing
+widget from the union produces a wrong-but-plausible PNG that
+passes CI and ships into the manual. Forcing the failure pushes
+the manifest author to fix typos immediately.
+
+#### Element capture: parent-background composition
+
+`scene_runner.cpp:113–128` — for `capture: element: <objName>`:
+
+1. `widget->grab()` produces the widget's own pixmap.
+2. The pad colour is sampled from the parent widget at position
+   `(-1, -1)` relative to the target — one pixel outside the
+   widget's top-left. This colour is then used to fill the
+   margin around the grabbed pixmap. Without sampling, the pad
+   would be a default grey that visually disconnects the figure
+   from the surrounding chrome.
+3. Margin defaults to the style metric `LayoutDefaultSpacing`;
+   YAML `margin: { horizontal: H, vertical: V }` overrides per
+   axis.
+
+#### Popup capture: combo + dropdown stacked
+
+`scene_runner.cpp:135–159` — for `capture: popup: <comboObjName>`:
+
+1. The closed combo cell is grabbed via `combo->grab()`.
+2. The open popup itself is the QFrame found via
+   `combo->view()->parentWidget()`. Grabbed independently.
+3. The two pixmaps are composited vertically with a 1-px gap on
+   the combo's parent background.
+
+The two grabs are independent because Qt's combo popup is a
+top-level QFrame, not a child of `MainWindow` — it can't be part
+of a window-coords region union. The matching `show-popup`
+action in the action registry calls `combo->showPopup()` so the
+QFrame is realised before the runner tries to grab it; missing
+`show-popup` in the YAML setup → "popup not visible" stderr
+error and exit 1.
+
+#### DPI scaling: device-pixel-ratio, not painter scaling
+
+`scene_runner.cpp:59–68` — `grabAtScale(widget, rect, scale)`:
+
+```cpp
+QPixmap px(rect.width() * scale, rect.height() * scale);
+px.setDevicePixelRatio(scale);
+px.fill(Qt::transparent);
+QPainter painter(&px);
+widget->render(&painter, QPoint(), QRegion(rect));
+```
+
+The painter is NOT scaled. The pixmap's device-pixel-ratio
+makes painter coordinates stay logical; `widget->render` writes
+into the pixmap at higher device-pixel density automatically.
+`painter.scale(scale, scale)` would double-scale (logical ×
+device) and crop the output to the top-left quadrant. Default
+`dpiScale` is 2.0 (retina-ready); YAML `dpi-scale:` overrides
+per scene.
+
+#### Synthetic fixture: deterministic envelope-modulated sine
+
+`screenshot_fixture.cpp` generates an 8-second 44.1 kHz stereo
+16-bit PCM WAV at `$TMPDIR/fiddler-screenshots/fixture-8s.wav`.
+The signal is a 220 Hz carrier with four 2-second phrases, each
+shaped by an attack-decay envelope (sine raised to the 1.5
+power) — produces visible amplitude variation in the waveform
+overview so screenshots illustrate the shape of the data, not a
+flat band. Generation is purely deterministic (no RNG); the
+fixture has no external dependencies.
+
+#### Determinism (the load-bearing property)
+
+The tool does *not* explicitly normalise palettes, force colour
+formats, or pin PNG compression levels. Determinism comes from:
+
+- Test-mode `QSettings` (no per-machine layout leakage).
+- Offscreen platform plugin (no compositor variation).
+- Deterministic fixture WAV (no RNG, no decoded-source drift).
+- Deterministic action sequence (every gesture in the YAML
+  produces the same widget state on every run).
+- Qt's `QPixmap::save(path, "PNG")` is deterministic for
+  identical pixel data and pixmap format.
+
+Together these give byte-identical PNGs across runs, which is
+what makes the `./scripts/screenshots.sh && git status` audit
+gesture work. Anything that breaks determinism (a new RNG-driven
+action, a non-offscreen platform, a fixture change) breaks the
+audit — keep these constraints in mind when extending the tool.
 
 ### Logging: spdlog (behind a facade)
 
