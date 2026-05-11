@@ -64,25 +64,8 @@ bool WaveformWidget::hasContent() const noexcept {
     return overview_ != nullptr;
 }
 
-std::int64_t WaveformWidget::xToMs(int x) const noexcept {
-    if (!overview_) return 0;
-    const int w = width();
-    if (w <= 0) return 0;
-    const std::int64_t durationMs = overview_->duration().count();
-    if (durationMs <= 0) return 0;
-    const std::int64_t ms =
-        static_cast<std::int64_t>(x) * durationMs / w;
-    return std::clamp<std::int64_t>(ms, 0, durationMs);
-}
-
-int WaveformWidget::msToX(std::int64_t ms) const noexcept {
-    if (!overview_) return 0;
-    const int w = width();
-    if (w <= 0) return 0;
-    const std::int64_t durationMs = overview_->duration().count();
-    if (durationMs <= 0) return 0;
-    const std::int64_t x = ms * static_cast<std::int64_t>(w) / durationMs;
-    return static_cast<int>(std::clamp<std::int64_t>(x, 0, w - 1));
+std::int64_t WaveformWidget::durationMs() const noexcept {
+    return overview_ ? overview_->duration().count() : 0;
 }
 
 QSize WaveformWidget::sizeHint() const        { return QSize(800, 120); }
@@ -368,6 +351,10 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+
+    // Zoom-anchor guide (#49) — painted last so it sits on top of
+    // every other overlay. No-op when Ctrl isn't held.
+    paintZoomAnchorGuide(painter);
 }
 
 } // namespace fiddler::ui

@@ -70,21 +70,6 @@ bool StaffWidget::hasContent() const noexcept {
 
 // ---- coordinate transforms ----------------------------------------------
 
-std::int64_t StaffWidget::xToMs(int x) const noexcept {
-    if (durationMs_ <= 0 || width() <= 0) return 0;
-    // 64-bit math throughout: long files and high-resolution widgets
-    // would otherwise overflow a 32-bit multiply.
-    const std::int64_t ms =
-        static_cast<std::int64_t>(x) * durationMs_ / width();
-    return std::clamp<std::int64_t>(ms, 0, durationMs_);
-}
-
-int StaffWidget::msToX(std::int64_t ms) const noexcept {
-    if (durationMs_ <= 0 || width() <= 0) return 0;
-    const std::int64_t x = ms * static_cast<std::int64_t>(width()) / durationMs_;
-    return static_cast<int>(std::clamp<std::int64_t>(x, 0, width() - 1));
-}
-
 QSize StaffWidget::sizeHint()        const { return QSize(800, 100); }
 QSize StaffWidget::minimumSizeHint() const { return QSize(120,  60); }
 
@@ -122,6 +107,9 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     // canonical comment.
     paintCursor(painter);
     paintSecondaryAnchor(painter);
+    // Zoom-anchor guide (#49) — painted last so it sits on top of
+    // every other overlay. No-op when Ctrl isn't held.
+    paintZoomAnchorGuide(painter);
     (void)kStaffBottomMarginPx;   // reserved for step 6 ledger lines
 }
 

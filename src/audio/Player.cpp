@@ -157,6 +157,13 @@ void Player::stop() {
     // reset + ring discard happen on the decoder thread via the
     // pendingSeekMs_ channel — same path as a normal seek, lock-free.
     // We also reset framesPlayed so position() reads 0 immediately.
+    //
+    // MEMO[#52 considered-and-rejected]: briefly tried "Stop
+    // preserves position" (Audacity / Logic / GarageBand
+    // convention). The change made Stop functionally identical
+    // to Pause — Stop became redundant. Reverted; Stop's job is
+    // "halt + rewind to 0", Pause's is "halt at current
+    // position". The two gestures keep their distinct meaning.
     framesPlayed_.store(0);
     anchorSourceMs_.store(0);
     anchorOutFrames_.store(0);

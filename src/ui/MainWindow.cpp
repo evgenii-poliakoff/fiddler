@@ -12,6 +12,7 @@
 #include "score/MarkerModel.h"
 #include "score/Serialize.h"
 #include "ui/ProjectViewerDock.h"
+#include "ui/ScoreOverlayBase.h"
 #include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 #include "util/Log.h"
@@ -40,6 +41,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
 #include <QSignalBlocker>
@@ -52,6 +54,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -61,11 +64,21 @@ namespace fiddler::ui {
 namespace {
 
 // Bucket count is the overview's *internal* peak resolution. The
-// widget downsamples to its current pixel width on every paint, so a
-// fixed-and-generous 4096 covers any plausible window width without
-// rebuilding when the user resizes. 4096 buckets × 2 ch × 8 bytes ≈
-// 64 KB — trivial.
-constexpr std::size_t kOverviewBuckets = 4096;
+// widget downsamples to its current pixel width on every paint, so
+// a generous fixed count covers any plausible window width plus
+// any practical zoom level without rebuilding.
+//
+// 4096 (pre-#49) was sized for the fit-to-window pixel density and
+// turned visibly chunky at deeper zoom — each bucket spanning many
+// pixels of the painted column. 32768 keeps ≤ ~3 px / bucket even
+// at 1 % zoom on a wide widget. Memory: 32768 × 2 ch × 8 B = 512 KB,
+// still trivial.
+//
+// At extreme zoom (one-sample-per-pixel territory) we'd need a
+// proper multi-resolution / sample-level fallback — Audacity,
+// Logic, Ableton, Reaper all do this with on-disk peak pyramids.
+// Filed as follow-up; not needed for typical fiddle-practice zoom.
+constexpr std::size_t kOverviewBuckets = 32768;
 
 // Minimum source-time gap between same-kind tap-placements (#17).
 // A rapid double-tap of B / M produces two artifacts at nearly the
@@ -416,6 +429,12 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(waveform_, &WaveformWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    // Viewport / zoom (#49). Either widget can be the source of
+    // a zoom gesture; the slot syncs the partner and the scrollbar.
+    connect(waveform_, &ScoreOverlayBase::viewportChanged,
+            this, &MainWindow::onViewportChanged);
+    connect(waveform_, &ScoreOverlayBase::userScrolled,
+            this, [this]() { setFollowPlayback(false); });
     connect(waveform_, &WaveformWidget::markerDragRequested,
             this, &MainWindow::onMarkerDragRequested);
     connect(waveform_, &WaveformWidget::loopDragRequested,
@@ -463,6 +482,10 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(staff_, &StaffWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    connect(staff_, &ScoreOverlayBase::viewportChanged,
+            this, &MainWindow::onViewportChanged);
+    connect(staff_, &ScoreOverlayBase::userScrolled,
+            this, [this]() { setFollowPlayback(false); });
     connect(staff_, &StaffWidget::markerDragRequested,
             this, &MainWindow::onMarkerDragRequested);
     connect(staff_, &StaffWidget::loopDragRequested,
@@ -484,6 +507,29 @@ void MainWindow::buildCentralWidget() {
                 commitLoopDrag(id, isStart, fromMs, toMs, "staff");
             });
     layout->addWidget(staff_);
+
+    // Viewport scrollbar (#49). Visible only when the user has
+    // zoomed in (waveform_->isZoomed() == true); hidden otherwise
+    // so the layout doesn't sprout a permanent inert band. Maps
+    // [0, durationMs] in source time; the page-step matches the
+    // current viewport span.
+    viewportScrollBar_ = new QScrollBar(Qt::Horizontal, central);
+    viewportScrollBar_->setObjectName("viewportScrollBar");
+    viewportScrollBar_->setRange(0, 0);
+    viewportScrollBar_->setVisible(false);
+    connect(viewportScrollBar_, &QAbstractSlider::valueChanged,
+            this, [this](int newStartMs) {
+                if (suppressViewportScrollBarSignals_) return;
+                const auto span = waveform_ ? waveform_->viewportSpanMs() : 0;
+                if (span <= 0) return;
+                FLOG_DEBUG("ui.zoom",
+                           "scroll start={} ms span={} ms via=scrollbar",
+                           newStartMs, span);
+                applyViewport(newStartMs, newStartMs + span);
+                // Manual scroll during playback breaks follow.
+                setFollowPlayback(false);
+            });
+    layout->addWidget(viewportScrollBar_);
 
     positionSlider_ = new QSlider(Qt::Horizontal, central);
     positionSlider_->setObjectName("positionSlider");
@@ -595,6 +641,46 @@ void MainWindow::buildCentralWidget() {
     // walking the menu by index.
     toggleProjectViewer->setObjectName("toggleProjectViewerAction");
     viewMenu->addAction(toggleProjectViewer);
+
+    viewMenu->addSeparator();
+
+    // Zoom (#49). Ctrl+= / Ctrl+- / Ctrl+0 are the conventional
+    // bindings — Logic, Ableton, Audacity, Audition all agree.
+    auto* zoomInAct = new QAction(tr("Zoom &In"), this);
+    zoomInAct->setObjectName("zoomInAction");
+    zoomInAct->setShortcuts({ QKeySequence(QKeySequence::ZoomIn),
+                              QKeySequence(Qt::CTRL | Qt::Key_Equal) });
+    connect(zoomInAct, &QAction::triggered, this, &MainWindow::onZoomIn);
+    viewMenu->addAction(zoomInAct);
+
+    auto* zoomOutAct = new QAction(tr("Zoom &Out"), this);
+    zoomOutAct->setObjectName("zoomOutAction");
+    zoomOutAct->setShortcut(QKeySequence::ZoomOut);
+    connect(zoomOutAct, &QAction::triggered, this, &MainWindow::onZoomOut);
+    viewMenu->addAction(zoomOutAct);
+
+    auto* zoomFitAct = new QAction(tr("&Fit to Window"), this);
+    zoomFitAct->setObjectName("zoomFitAction");
+    zoomFitAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_0));
+    connect(zoomFitAct, &QAction::triggered, this, &MainWindow::onZoomFit);
+    viewMenu->addAction(zoomFitAct);
+
+    viewMenu->addSeparator();
+
+    // Follow Playback (#49). Default ON. The view auto-pages
+    // forward when the cursor reaches the right edge during
+    // playback; gets toggled OFF by any manual scroll.
+    followPlaybackAction_ = new QAction(tr("&Follow Playback"), this);
+    followPlaybackAction_->setObjectName("followPlaybackAction");
+    followPlaybackAction_->setCheckable(true);
+    followPlaybackAction_->setChecked(followPlayback_);
+    connect(followPlaybackAction_, &QAction::toggled,
+            this, [this](bool on) {
+                followPlayback_ = on;
+                FLOG_DEBUG("ui.zoom",
+                           "follow-playback set={} via=menu", on);
+            });
+    viewMenu->addAction(followPlaybackAction_);
 }
 
 void MainWindow::onOpenFile() {
@@ -807,6 +893,12 @@ bool MainWindow::loadFile(const QString& path) {
     staff_->setDurationMs(duration.count());
     staff_->setPositionMs(0);
 
+    // Reset the viewport on every fresh load — old zoom state from
+    // a previous file shouldn't carry over (#49). Also re-engages
+    // Follow Playback in case a prior manual scroll switched it off.
+    resetViewport();
+    setFollowPlayback(true);
+
     statusLabel_->setText(tr("Loaded: %1  (%2 ms)%3")
         .arg(path)
         .arg(duration.count())
@@ -934,6 +1026,9 @@ void MainWindow::onPlayPause() {
     // (issue #16) fires uniformly. When pre-roll is disabled or
     // 0 this is an immediate play; otherwise the user gets the
     // "ready, set, go" countdown before audio actually starts.
+    // The Ableton-style Follow Playback re-engage lives inside
+    // startPlayback so dock-double-click and Play-button alike
+    // re-engage it uniformly (#49 smoke).
     startPlayback();
     FLOG_DEBUG("ui.transport",
                "play from={} ms audio={} preroll={}",
@@ -998,6 +1093,126 @@ void MainWindow::onSeek(int positionMs) {
     // setters just store an int and queue a paint.
     if (waveform_) waveform_->setPositionMs(positionMs);
     if (staff_)    staff_->setPositionMs(positionMs);
+}
+
+// ---- zoom / viewport (#49) -----------------------------------------------
+
+void MainWindow::applyViewport(std::int64_t startMs, std::int64_t endMs) {
+    if (!waveform_ || !staff_) return;
+    // MEMO[#49 smoke]: re-anchor the follow-playback motion
+    // detector to the current playhead so the very next
+    // updatePosition tick sees "no motion" and skips its
+    // page-flip. Without this, the page-flip rule (only fire
+    // when the playhead moved since last tick) misfires after a
+    // viewport-changing gesture: if the viewport changes from
+    // applyViewport but no updatePosition tick has run since the
+    // last seek, the previous tick's lastFollowPosMs_ would be
+    // stale (the pre-seek value), and the next tick would see
+    // the seek as "motion" and immediately undo our viewport.
+    if (player_) {
+        lastFollowPosMs_ = player_->position().count();
+    }
+
+    // setViewport is idempotent; calling it on both widgets even
+    // when one has already absorbed the change is cheap (early-out
+    // on equal state). The scrollbar update has to be guarded
+    // because valueChanged would otherwise loop right back here.
+    waveform_->setViewport(startMs, endMs);
+    staff_->setViewport(startMs, endMs);
+
+    if (viewportScrollBar_) {
+        suppressViewportScrollBarSignals_ = true;
+        const auto dur  = waveform_->durationMs();
+        const auto span = waveform_->viewportSpanMs();
+        if (waveform_->isZoomed()) {
+            viewportScrollBar_->setRange(0, static_cast<int>(dur - span));
+            viewportScrollBar_->setPageStep(static_cast<int>(span));
+            viewportScrollBar_->setValue(
+                static_cast<int>(waveform_->viewportStartMs()));
+            viewportScrollBar_->setVisible(true);
+        } else {
+            viewportScrollBar_->setRange(0, 0);
+            viewportScrollBar_->setVisible(false);
+        }
+        suppressViewportScrollBarSignals_ = false;
+    }
+}
+
+void MainWindow::resetViewport() {
+    applyViewport(0, 0);
+}
+
+void MainWindow::onViewportChanged(std::int64_t startMs, std::int64_t endMs) {
+    // Mirror to the sister widget + scrollbar. applyViewport is
+    // re-entry-safe via setViewport's no-op-on-equal-state guard.
+    applyViewport(startMs, endMs);
+}
+
+void MainWindow::setFollowPlayback(bool follow) {
+    if (followPlayback_ == follow) return;
+    followPlayback_ = follow;
+    if (followPlaybackAction_) {
+        QSignalBlocker block(followPlaybackAction_);
+        followPlaybackAction_->setChecked(follow);
+    }
+    FLOG_DEBUG("ui.zoom",
+               "follow-playback set={} via=auto", follow);
+}
+
+void MainWindow::bringIntoView(std::int64_t targetMs) {
+    if (!waveform_ || !waveform_->isZoomed()) return;
+    const auto vStart = waveform_->viewportStartMs();
+    const auto vEnd   = waveform_->viewportEndMs();
+    const auto span   = vEnd - vStart;
+    const auto dur    = waveform_->durationMs();
+    if (span <= 0) return;
+
+    // Re-center only when the target is OUTSIDE the viewport — if
+    // it's already visible, leave the view alone (user might be
+    // looking at a specific framing).
+    if (targetMs >= vStart && targetMs < vEnd) return;
+
+    // Same 20 % lead-in the follow-playback page-flip uses (#49).
+    constexpr double kLeadInFraction = 0.20;
+    const auto leadIn =
+        static_cast<std::int64_t>(span * kLeadInFraction);
+    std::int64_t newStart = targetMs - leadIn;
+    std::int64_t newEnd   = newStart + span;
+    if (newStart < 0) {
+        newStart = 0;
+        newEnd   = span;
+    }
+    if (newEnd > dur) {
+        newEnd   = dur;
+        newStart = std::max<std::int64_t>(0, dur - span);
+    }
+    applyViewport(newStart, newEnd);
+}
+
+void MainWindow::onZoomIn() {
+    if (!waveform_ || waveform_->durationMs() <= 0) return;
+    // Anchor on the playback cursor when audio is loaded, else
+    // viewport center.
+    const std::int64_t cur =
+        player_ ? player_->position().count() : 0;
+    waveform_->zoomBy(1.0 / std::sqrt(2.0), cur);
+    FLOG_DEBUG("ui.zoom", "zoom-in start={} end={} via=key",
+               waveform_->viewportStartMs(), waveform_->viewportEndMs());
+}
+
+void MainWindow::onZoomOut() {
+    if (!waveform_ || waveform_->durationMs() <= 0) return;
+    const std::int64_t cur =
+        player_ ? player_->position().count() : 0;
+    waveform_->zoomBy(std::sqrt(2.0), cur);
+    FLOG_DEBUG("ui.zoom", "zoom-out start={} end={} via=key",
+               waveform_->viewportStartMs(), waveform_->viewportEndMs());
+}
+
+void MainWindow::onZoomFit() {
+    if (!waveform_ || waveform_->durationMs() <= 0) return;
+    resetViewport();
+    FLOG_DEBUG("ui.zoom", "zoom-fit via=key");
 }
 
 void MainWindow::onTempoChanged(int percent) {
@@ -1359,6 +1574,12 @@ void MainWindow::onMarkerActivated(std::int64_t id) {
     // MEMO: route through onSeek so the existing seek log fires
     // and the position slider updates via the timer chain.
     onSeek(ms);
+    // MEMO[#49 smoke]: dock activation is an explicit "navigate
+    // here" intent — bring the marker into the viewport unconditionally,
+    // independent of the Follow Playback toggle. The follow flag
+    // is for "should the view chase the playhead during playback",
+    // which is a different question.
+    bringIntoView(ms);
 
     if (player_->state() != audio::TransportState::Playing) {
         startPlayback();
@@ -1409,13 +1630,22 @@ void MainWindow::startPlayback() {
     // otherwise plays immediately. Fires uniformly whether or not
     // a loop is armed — issue #16 generalised this beyond the
     // armed-loop case so simply pressing Play (or activating a
-    // marker) also gives the player time to switch from mouse to
-    // instrument.
+    // marker / loop) also gives the player time to switch from
+    // mouse to instrument.
     //
     // MEMO: do NOT call from the wrap timer's lambda (timeout) —
     // that fires AFTER the wrap-pause that was the pre-roll for
     // the next iteration. Calling this would loop forever.
     if (!player_) return;
+
+    // MEMO[#49 smoke]: every user-initiated transport start
+    // re-engages Follow Playback (Ableton convention). Lives here
+    // — rather than at each call site — so Play button, dock
+    // double-click on a marker, and dock double-click on a loop
+    // all re-engage uniformly. The wrap-timer's resume path does
+    // NOT route through here (see MEMO above), so a natural
+    // between-iterations wrap doesn't touch Follow either way.
+    setFollowPlayback(true);
 
     const int effective = prerollMs();
     if (effective > 0) {
@@ -1488,6 +1718,10 @@ void MainWindow::onLoopActivated(std::int64_t id) {
     }
 
     onSeek(static_cast<int>(loop.startMs));
+    // MEMO[#49 smoke]: dock activation always brings the target
+    // into view, regardless of Follow Playback state — see
+    // onMarkerActivated for the same convention.
+    bringIntoView(loop.startMs);
     // Route through playArmedLoop so the pre-roll (issue #16) fires
     // before playback when prerollMs_ > 0. With pre-roll, double-
     // click means "jump, give me a moment to prepare, then play"
@@ -1932,6 +2166,55 @@ void MainWindow::updatePosition() {
     }
     if (staff_) {
         staff_->setPositionMs(pos.count());
+    }
+
+    // Follow Playback (#49) — page-flip the viewport when the
+    // playhead has wandered outside it. Fires only when the
+    // playhead actually MOVED since the previous tick; without
+    // that guard, a Ctrl+wheel zoom that pushed the viewport away
+    // from a stationary playhead would be undone on the very next
+    // 50 ms tick (the flip would yank the view back to the
+    // playhead, which is the bug the user spotted in smoke).
+    // Cheap: an int compare + at most one applyViewport call per
+    // tick.
+    const auto curMsForFollow = pos.count();
+    const bool playheadMoved  = (curMsForFollow != lastFollowPosMs_);
+    lastFollowPosMs_ = curMsForFollow;
+
+    if (followPlayback_ && waveform_ && waveform_->isZoomed()
+        && playheadMoved)
+    {
+        const auto curMs   = curMsForFollow;
+        const auto vStart  = waveform_->viewportStartMs();
+        const auto vEnd    = waveform_->viewportEndMs();
+        const auto span    = vEnd - vStart;
+        const auto dur     = waveform_->durationMs();
+        if (span > 0 && (curMs < vStart || curMs >= vEnd)) {
+            // MEMO[#49 smoke]: land the playhead 20 % from the
+            // LEFT edge of the new viewport — not flush against
+            // it. Flush-at-left worked for natural playback
+            // page-flips but turned out unfriendly when the jump
+            // was triggered by a double-click on a dock entry
+            // for an off-screen artifact: the artifact tick
+            // appeared right at the edge and read as "still off
+            // screen". 20 % gives a clear lead-in (the marker is
+            // visibly INSIDE the viewport) without sacrificing
+            // ahead-context for the natural-playback case.
+            constexpr double kLeadInFraction = 0.20;
+            const auto leadIn =
+                static_cast<std::int64_t>(span * kLeadInFraction);
+            std::int64_t newStart = curMs - leadIn;
+            std::int64_t newEnd   = newStart + span;
+            if (newStart < 0) {
+                newStart = 0;
+                newEnd   = span;
+            }
+            if (newEnd > dur) {
+                newEnd   = dur;
+                newStart = std::max<std::int64_t>(0, dur - span);
+            }
+            applyViewport(newStart, newEnd);
+        }
     }
 
     // Loop wrap-around — armed and we've crossed the loop's endMs.

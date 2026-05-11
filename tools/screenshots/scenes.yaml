@@ -30,6 +30,7 @@
 #   - preroll-enable / preroll-disable
 #   - set-tempo: <percent>
 #   - seek-ms: <ms>
+#   - zoom-to-range: <startMs,endMs>
 #   - tap-barlines-at: <ms,ms,...>
 #   - tap-markers-at: <ms,ms,...>
 #   - select-marker: <ordinal>
@@ -90,6 +91,26 @@
     - seek-ms: 3000
   margin:
     vertical: 4
+
+# ---- Chapter 4 — zoom and pan (#49) --------------------------------------
+# Show the central column zoomed in, with the horizontal scrollbar
+# visible between the staff and the position slider. The barlines
+# give the user a sense of how the time axis stretches under zoom.
+- id: manual-zoom-view
+  output: manual-zoom-view.png
+  capture:
+    region:
+      - waveformWidget
+      - staffWidget
+      - viewportScrollBar
+      - positionSlider
+  setup:
+    - load-fixture
+    - tap-barlines-at: 800,1000,1200,1400,1600
+    - zoom-to-range: 700,1700
+  margin:
+    horizontal: 8
+    vertical: 8
 
 # ---- Chapter 5 — barlines + tune type ------------------------------------
 

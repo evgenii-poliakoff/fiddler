@@ -36,6 +36,8 @@
 
 class QKeyEvent;
 class QMouseEvent;
+class QPainter;
+class QWheelEvent;
 
 namespace fiddler::score {
 class BarlineModel;
@@ -85,11 +87,58 @@ public:
     [[nodiscard]] std::optional<std::int64_t>
         primaryAnchorMs() const noexcept;
 
-    // Coord transforms — each subclass derives from its own data
-    // source. Pure virtual: ScoreOverlayBase has no concept of
-    // duration on its own.
-    [[nodiscard]] virtual std::int64_t xToMs(int x) const noexcept = 0;
-    [[nodiscard]] virtual int          msToX(std::int64_t ms) const noexcept = 0;
+    // Coord transforms. The math lives in the base class and uses
+    // the viewport range below; subclasses only have to supply the
+    // total source duration via `durationMs()`. With no viewport
+    // explicitly set the math falls back to "fit-to-window" — the
+    // pre-#49 behaviour exactly.
+    [[nodiscard]] std::int64_t xToMs(int x) const noexcept;
+    [[nodiscard]] int          msToX(std::int64_t ms) const noexcept;
+
+    // Source-time duration of the loaded content, in milliseconds.
+    // Returns 0 when nothing has been loaded yet. Each subclass
+    // sources this from its own data — the WaveformWidget reads
+    // `WaveformOverview::duration()`, the StaffWidget exposes a
+    // `setDurationMs` setter the GUI calls on every load.
+    [[nodiscard]] virtual std::int64_t durationMs() const noexcept = 0;
+
+    // ---- viewport / zoom (#49) ----------------------------------
+    //
+    // The viewport is the source-time range [start, end) the widget
+    // maps to its full pixel width. With viewport unset (start == 0
+    // && end == 0) or invalid (end <= start) the math falls back to
+    // "fit to window" — the entire source duration on the canvas.
+    //
+    // MainWindow owns the canonical pair and pushes it to both
+    // widgets in lockstep via setViewport. Direct callers (tests,
+    // future scroll automations) use it the same way.
+    //
+    // GUI-only state; the audio pipeline is completely untouched.
+    [[nodiscard]] std::int64_t viewportStartMs() const noexcept {
+        return viewportStartMs_;
+    }
+    [[nodiscard]] std::int64_t viewportEndMs() const noexcept {
+        return viewportEndMs_;
+    }
+    [[nodiscard]] std::int64_t viewportSpanMs() const noexcept {
+        return viewportEndMs_ > viewportStartMs_
+            ? viewportEndMs_ - viewportStartMs_ : 0;
+    }
+    // True iff a strictly-narrower-than-duration viewport is in
+    // effect. Used by MainWindow to show / hide the scrollbar.
+    [[nodiscard]] bool isZoomed() const noexcept;
+
+    // Multiply the viewport's span by `factor` keeping `anchorMs`
+    // pinned at the same pixel. factor < 1 zooms IN (smaller span),
+    // factor > 1 zooms OUT. Clamped at fit-to-window on the wide
+    // end and kMinViewportSpanMs on the narrow end. If the viewport
+    // wasn't set yet, the current "fit" range is used as the
+    // starting span. Emits viewportChanged when the range changes.
+    void zoomBy(double factor, std::int64_t anchorMs);
+
+    // Slide the viewport by `deltaMs` source-time. Clamped so the
+    // viewport stays inside [0, durationMs]. No-op when not zoomed.
+    void panBy(std::int64_t deltaMs);
 
     // Test seam (#22) — query the live drag-ghost ms for an
     // artifact, or nullopt if no ghost matches it. Used by
@@ -99,6 +148,12 @@ public:
         dragGhostMs(std::int64_t id) const noexcept;
 
 public slots:
+    // Update the visible source-time range. Clamps to [0, durationMs()]
+    // and enforces a minimum span (kMinViewportSpanMs) so the pixels-
+    // per-ms factor stays well-defined even at deep zoom. Falls back
+    // to fit-to-window when called with (0, 0) or any inverted pair.
+    // Emits viewportChanged on actual changes; cheap no-op otherwise.
+    void setViewport(std::int64_t startMs, std::int64_t endMs);
     void setPositionMs(std::int64_t ms);
     // MEMO: setting any one selection clears the others (cross-kind
     // mutual exclusion). All four setters share that contract.
@@ -119,6 +174,14 @@ public slots:
 
 signals:
     void seekRequested(std::int64_t ms);
+    // Fired after a setViewport call that actually changed the
+    // visible range. Used by MainWindow to keep the scrollbar in
+    // sync and to broadcast the new viewport to the sister widget.
+    void viewportChanged(std::int64_t startMs, std::int64_t endMs);
+    // Fired on Shift+wheel pan during playback — MainWindow uses
+    // this to flip the "Follow playback" toggle off so the manual
+    // scroll isn't immediately undone by the next position tick.
+    void userScrolled();
     void barlineSelectionChanged(std::optional<std::size_t> index);
     void markerSelectionChanged (std::optional<std::int64_t> id);
     void loopSelectionChanged   (std::optional<std::int64_t> id);
@@ -173,6 +236,20 @@ protected:
     void mouseMoveEvent   (QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void keyPressEvent    (QKeyEvent*   event) override;
+    void keyReleaseEvent  (QKeyEvent*   event) override;
+    void wheelEvent       (QWheelEvent* event) override;
+    void leaveEvent       (QEvent*      event) override;
+    // Application-wide filter so we catch Ctrl press / release
+    // regardless of which widget has keyboard focus — important
+    // because the user is typically hovering with the mouse, not
+    // clicked. Updates the zoom-anchor guide live.
+    bool eventFilter      (QObject* watched, QEvent* event) override;
+
+    // Paint the "zoom anchor" guide — a thin vertical line at the
+    // current mouse position when Ctrl is held over the widget.
+    // Subclasses' paintEvent call this at the end so the guide
+    // floats above all overlays. No-op when no Ctrl is held.
+    void paintZoomAnchorGuide(QPainter& painter) const;
 
     // Subclass declares "I have something loaded; clicks should be
     // processed". Without content the base treats clicks as
@@ -262,6 +339,27 @@ private:
     std::optional<std::int64_t>                selectedMarkerId_;
     std::optional<std::int64_t>                selectedLoopId_;
     std::optional<std::int64_t>                secondaryAnchorMs_;
+
+    // Viewport (#49). Both are stored in source-time milliseconds.
+    // Defaults of (0, 0) mean "fit to window" — the math falls back
+    // to mapping [0, durationMs()] across the full pixel width.
+    std::int64_t viewportStartMs_ = 0;
+    std::int64_t viewportEndMs_   = 0;
+
+    // Minimum span we'll accept from setViewport. Picked so that
+    // even on a wide widget (~2000 px) each pixel still spans at
+    // least ~25 µs of source time — fine-grained enough for sub-ms
+    // precision without the divisions in xToMs/msToX going degenerate.
+    static constexpr std::int64_t kMinViewportSpanMs = 50;
+
+    // Pixel-x of the mouse when Ctrl is held over the widget — the
+    // anchor that Ctrl+wheel will pivot around. Drawn as a thin
+    // vertical guide so the user can see WHERE the zoom will land
+    // before they spin the wheel. nullopt when Ctrl isn't held or
+    // the mouse is outside the widget. Updated from mouseMoveEvent;
+    // refreshed by enterEvent so a Ctrl-down-then-enter case
+    // doesn't miss it.
+    std::optional<int> zoomAnchorGuideX_;
 };
 
 } // namespace fiddler::ui

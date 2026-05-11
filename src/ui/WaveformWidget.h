@@ -39,11 +39,12 @@ public:
     [[nodiscard]] std::shared_ptr<const audio::WaveformOverview>
         overview() const noexcept { return overview_; }
 
-    // Coord transforms — overrides ScoreOverlayBase's pure virtuals.
-    // Both clamp to the widget's current bounds and the overview's
-    // duration; calling them when no overview is set returns 0.
-    [[nodiscard]] std::int64_t xToMs(int x) const noexcept override;
-    [[nodiscard]] int          msToX(std::int64_t ms) const noexcept override;
+    // Source-time duration in milliseconds — overrides
+    // ScoreOverlayBase's pure virtual. Read from the attached
+    // WaveformOverview; returns 0 when no overview is set. The
+    // base class's xToMs/msToX use this together with the viewport
+    // state to do the coord math.
+    [[nodiscard]] std::int64_t durationMs() const noexcept override;
 
     [[nodiscard]] QSize sizeHint() const override;
     [[nodiscard]] QSize minimumSizeHint() const override;

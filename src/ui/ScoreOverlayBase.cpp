@@ -5,10 +5,17 @@
 #include "score/MarkerModel.h"
 
 #include <QApplication>
+#include <QColor>
+#include <QCoreApplication>
+#include <QCursor>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QPainter>
+#include <QPen>
+#include <QWheelEvent>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 namespace fiddler::ui {
@@ -36,6 +43,18 @@ ScoreOverlayBase::ScoreOverlayBase(QWidget* parent) : QWidget(parent) {
     // StrongFocus so the widget can receive arrow / Esc / Del keys
     // after a click gives it focus.
     setFocusPolicy(Qt::StrongFocus);
+    // MEMO[#49]: mouse tracking enabled so we can paint the zoom
+    // anchor guide as the user hovers with Ctrl held — without
+    // tracking, mouseMoveEvent only fires while a button is down.
+    setMouseTracking(true);
+    // MEMO[#49 smoke]: install a global key-event filter so the
+    // zoom-anchor guide reacts to Ctrl press/release even when
+    // the widget doesn't have keyboard focus — which is the
+    // common case while the user is just hovering with the mouse
+    // (no click yet, focus is on some other widget).
+    if (auto* app = QCoreApplication::instance()) {
+        app->installEventFilter(this);
+    }
 }
 
 ScoreOverlayBase::~ScoreOverlayBase() = default;
@@ -114,11 +133,179 @@ ScoreOverlayBase::primaryAnchorMs() const noexcept {
 }
 
 std::int64_t ScoreOverlayBase::pixelsToMs(int px) const noexcept {
-    // MEMO: derive the pixel→ms scale by sampling xToMs at the
-    // origin and at `px`. Using the virtual lets a future
-    // zoom-aware subclass return a tighter ms-per-pixel value
-    // automatically.
+    // Pixel→ms scale by sampling xToMs at the origin and at `px`.
+    // Picks up the viewport zoom automatically: at deep zoom-in a
+    // given pixel count maps to a smaller ms span, so hit-tests
+    // tighten in lockstep with what the user sees.
     return xToMs(px) - xToMs(0);
+}
+
+// ---- viewport / coord transforms (#49) -----------------------------------
+
+namespace {
+
+// Returns the effective [start, end) range to use for coord
+// transforms — either the explicitly-set viewport or [0, duration]
+// when no viewport is active.
+struct EffectiveRange { std::int64_t start; std::int64_t end; };
+
+EffectiveRange effectiveRange(std::int64_t viewportStart,
+                              std::int64_t viewportEnd,
+                              std::int64_t duration) noexcept {
+    if (viewportEnd > viewportStart) {
+        return { viewportStart, viewportEnd };
+    }
+    return { 0, duration };
+}
+
+} // namespace
+
+std::int64_t ScoreOverlayBase::xToMs(int x) const noexcept {
+    const std::int64_t dur = durationMs();
+    const int w = width();
+    if (dur <= 0 || w <= 0) return 0;
+    const auto [vStart, vEnd] =
+        effectiveRange(viewportStartMs_, viewportEndMs_, dur);
+    const std::int64_t span = vEnd - vStart;
+    if (span <= 0) return 0;
+    const std::int64_t ms =
+        vStart + static_cast<std::int64_t>(x) * span / w;
+    return std::clamp<std::int64_t>(ms, 0, dur);
+}
+
+int ScoreOverlayBase::msToX(std::int64_t ms) const noexcept {
+    const std::int64_t dur = durationMs();
+    const int w = width();
+    if (dur <= 0 || w <= 0) return 0;
+    const auto [vStart, vEnd] =
+        effectiveRange(viewportStartMs_, viewportEndMs_, dur);
+    const std::int64_t span = vEnd - vStart;
+    if (span <= 0) return 0;
+    const std::int64_t x =
+        (ms - vStart) * static_cast<std::int64_t>(w) / span;
+    // MEMO[#49 smoke]: pre-fix this clamped to [0, w-1], so an
+    // off-screen artifact rendered against the leftmost or
+    // rightmost column instead of being culled. Every paint
+    // site already has an `if (x<0 || x>=width()) continue`
+    // bounds check that was being short-circuited by the clamp.
+    // We only nudge the exact right-edge case (ms == vEnd gives
+    // x == w on integer math) to w-1 so the rightmost column
+    // can still paint a marker landing exactly at the boundary.
+    if (x == w) return w - 1;
+    return static_cast<int>(x);
+}
+
+bool ScoreOverlayBase::isZoomed() const noexcept {
+    const std::int64_t dur = durationMs();
+    if (dur <= 0) return false;
+    const std::int64_t span = viewportSpanMs();
+    return span > 0 && span < dur;
+}
+
+void ScoreOverlayBase::setViewport(std::int64_t startMs, std::int64_t endMs) {
+    const std::int64_t dur = durationMs();
+
+    // (0, 0) — and any inverted / empty pair — clears the viewport
+    // back to fit-to-window. This is the convention MainWindow's
+    // Ctrl+0 uses.
+    if (endMs <= startMs) {
+        if (viewportStartMs_ == 0 && viewportEndMs_ == 0) return;
+        viewportStartMs_ = 0;
+        viewportEndMs_   = 0;
+        update();
+        emit viewportChanged(viewportStartMs_, viewportEndMs_);
+        return;
+    }
+
+    // Clamp the pair into [0, dur]. If duration isn't known yet
+    // (nothing loaded), pass the values through unclamped — the
+    // caller (MainWindow) won't drive zoom on an empty widget
+    // anyway.
+    std::int64_t s = startMs;
+    std::int64_t e = endMs;
+    if (dur > 0) {
+        s = std::clamp<std::int64_t>(s, 0, dur);
+        e = std::clamp<std::int64_t>(e, 0, dur);
+    }
+
+    // Enforce the minimum span by extending the END if there's
+    // headroom, otherwise the START. Without this, deep zoom-in
+    // could collapse the visible range to a single ms — useless
+    // for the user and pathological for the divisions above.
+    if (e - s < kMinViewportSpanMs) {
+        e = s + kMinViewportSpanMs;
+        if (dur > 0 && e > dur) {
+            e = dur;
+            s = std::max<std::int64_t>(0, e - kMinViewportSpanMs);
+        }
+    }
+
+    if (s == viewportStartMs_ && e == viewportEndMs_) return;
+    viewportStartMs_ = s;
+    viewportEndMs_   = e;
+    update();
+    emit viewportChanged(viewportStartMs_, viewportEndMs_);
+}
+
+void ScoreOverlayBase::zoomBy(double factor, std::int64_t anchorMs) {
+    const std::int64_t dur = durationMs();
+    if (dur <= 0 || factor <= 0.0) return;
+
+    // Current visible span: use the viewport when set, otherwise
+    // the full duration (fit-to-window). The anchor's pixel
+    // fraction within the span determines how the new range
+    // straddles `anchorMs`.
+    const std::int64_t curStart = viewportEndMs_ > viewportStartMs_
+        ? viewportStartMs_ : 0;
+    const std::int64_t curEnd   = viewportEndMs_ > viewportStartMs_
+        ? viewportEndMs_   : dur;
+    const std::int64_t curSpan  = curEnd - curStart;
+    if (curSpan <= 0) return;
+
+    const std::int64_t clampedAnchor =
+        std::clamp<std::int64_t>(anchorMs, curStart, curEnd);
+    const double anchorFrac = curSpan > 0
+        ? static_cast<double>(clampedAnchor - curStart) / curSpan
+        : 0.5;
+
+    // Compute the new span, clamped between kMinViewportSpanMs and
+    // the full duration. Zoom-out beyond fit-to-window is a no-op.
+    double newSpanF = static_cast<double>(curSpan) * factor;
+    if (newSpanF > static_cast<double>(dur)) {
+        // Caller asked to zoom further out than the duration —
+        // collapse to fit-to-window (the explicit "default" state).
+        setViewport(0, 0);
+        return;
+    }
+    if (newSpanF < static_cast<double>(kMinViewportSpanMs)) {
+        newSpanF = static_cast<double>(kMinViewportSpanMs);
+    }
+    const std::int64_t newSpan = static_cast<std::int64_t>(newSpanF);
+
+    // Place the new span so the anchor stays at the same pixel
+    // fraction across the widget. Clamp into [0, dur] without
+    // changing the span (slide left or right at the edges).
+    std::int64_t newStart = clampedAnchor -
+        static_cast<std::int64_t>(anchorFrac * newSpan);
+    std::int64_t newEnd   = newStart + newSpan;
+    if (newStart < 0) {
+        newStart = 0;
+        newEnd   = newSpan;
+    }
+    if (newEnd > dur) {
+        newEnd   = dur;
+        newStart = std::max<std::int64_t>(0, dur - newSpan);
+    }
+    setViewport(newStart, newEnd);
+}
+
+void ScoreOverlayBase::panBy(std::int64_t deltaMs) {
+    if (!isZoomed()) return;
+    const std::int64_t dur = durationMs();
+    const std::int64_t span = viewportSpanMs();
+    std::int64_t newStart = viewportStartMs_ + deltaMs;
+    newStart = std::clamp<std::int64_t>(newStart, 0, dur - span);
+    setViewport(newStart, newStart + span);
 }
 
 // ---- selection setters ---------------------------------------------------
@@ -427,9 +614,23 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
 }
 
 void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
-    // Mouse-tracking is off (the default) so this only fires while
-    // a button is pressed. We only react when a drag candidate was
-    // armed during mousePressEvent — otherwise pass through.
+    // MEMO[#49]: setMouseTracking(true) is on so this fires on
+    // unbuttoned motion too. Update the zoom-anchor guide whenever
+    // Ctrl is held; clear it otherwise. Cheap: just an optional<int>
+    // compare + at most one update() call.
+    const bool ctrlHeld =
+        QApplication::keyboardModifiers() & Qt::ControlModifier;
+    const std::optional<int> newGuide = (ctrlHeld && hasContent())
+        ? std::make_optional<int>(static_cast<int>(event->position().x()))
+        : std::nullopt;
+    if (newGuide != zoomAnchorGuideX_) {
+        zoomAnchorGuideX_ = newGuide;
+        update();
+    }
+
+    // We only react when a drag candidate was armed during
+    // mousePressEvent — otherwise pass through. (The base no longer
+    // depends on mouse-tracking being off for this check.)
     if (dragKind_ == DragKind::None || !hasContent()) {
         QWidget::mouseMoveEvent(event);
         return;
@@ -695,7 +896,151 @@ ScoreOverlayBase::findSnapAnchor(std::int64_t cursorMs) const noexcept {
         : std::nullopt;
 }
 
+void ScoreOverlayBase::leaveEvent(QEvent* event) {
+    if (zoomAnchorGuideX_.has_value()) {
+        zoomAnchorGuideX_.reset();
+        update();
+    }
+    QWidget::leaveEvent(event);
+}
+
+bool ScoreOverlayBase::eventFilter(QObject* /*watched*/, QEvent* event) {
+    // Watch global Ctrl press/release so the zoom-anchor guide
+    // appears immediately when the user presses Ctrl with the
+    // mouse already hovering inside the widget — no mouse motion
+    // and no focus required. Cheap: short-circuits unless the
+    // event is a Ctrl key event.
+    if (event->type() != QEvent::KeyPress
+        && event->type() != QEvent::KeyRelease) {
+        return false;
+    }
+    const auto* keyEvent = static_cast<QKeyEvent*>(event);
+    if (keyEvent->key() != Qt::Key_Control) return false;
+
+    const bool isPress = (event->type() == QEvent::KeyPress);
+    if (isPress) {
+        if (!underMouse() || !hasContent()) return false;
+        const int x = mapFromGlobal(QCursor::pos()).x();
+        if (x < 0 || x >= width()) return false;
+        if (zoomAnchorGuideX_ != x) {
+            zoomAnchorGuideX_ = x;
+            update();
+        }
+    } else if (zoomAnchorGuideX_.has_value()) {
+        zoomAnchorGuideX_.reset();
+        update();
+    }
+    return false;   // never consume; pass through to other widgets
+}
+
+void ScoreOverlayBase::keyReleaseEvent(QKeyEvent* event) {
+    // MEMO[#49 smoke]: pre-fix, the zoom-anchor guide only appeared
+    // after the user nudged the mouse — Ctrl pressed while the
+    // pointer was stationary inside the widget left the guide
+    // invisible. Update the guide on Ctrl release (and the press
+    // mirror lives in keyPressEvent below) so it tracks Ctrl
+    // independent of mouse motion.
+    if ((event->key() == Qt::Key_Control)
+        && zoomAnchorGuideX_.has_value())
+    {
+        zoomAnchorGuideX_.reset();
+        update();
+    }
+    QWidget::keyReleaseEvent(event);
+}
+
+void ScoreOverlayBase::paintZoomAnchorGuide(QPainter& painter) const {
+    if (!zoomAnchorGuideX_.has_value()) return;
+    const int x = *zoomAnchorGuideX_;
+    if (x < 0 || x >= width()) return;
+    // Faint amber line — distinct from the playback cursor (red),
+    // the secondary anchor (cyan), and the loop selection markers.
+    QPen guidePen(QColor(255, 175, 60, 180));
+    guidePen.setWidth(1);
+    guidePen.setStyle(Qt::DashLine);
+    painter.save();
+    painter.setPen(guidePen);
+    painter.drawLine(x, 0, x, height());
+    painter.restore();
+}
+
+void ScoreOverlayBase::wheelEvent(QWheelEvent* event) {
+    // Ctrl+wheel zooms; Shift+wheel pans; everything else falls
+    // through to QWidget so an outer QScrollArea (none today, but
+    // future-friendly) can handle vertical scroll without being
+    // hijacked.
+    const Qt::KeyboardModifiers mods = event->modifiers();
+    const QPoint  pixelDelta = event->pixelDelta();
+    const QPoint  angleDelta = event->angleDelta();
+
+    if (mods & Qt::ControlModifier) {
+        if (!hasContent()) { event->ignore(); return; }
+        // angleDelta is in eighths of a degree; one standard notch
+        // is 120 (15°). Zoom by √2 per notch — three notches gives
+        // ~2.8× change, fast enough to feel responsive without
+        // overshooting.
+        const int dy = angleDelta.y() != 0
+            ? angleDelta.y() : pixelDelta.y();
+        if (dy == 0) { event->ignore(); return; }
+        const double notches = static_cast<double>(dy) / 120.0;
+        // dy > 0 (wheel up) zooms IN -> factor < 1.
+        const double factor = std::pow(1.0 / std::sqrt(2.0), notches);
+        // MEMO[#49 smoke]: anchor on the GUIDE pixel, not the
+        // wheel event's qreal position(). The guide is what the
+        // user sees and aims; QWheelEvent::position() can sit a
+        // fraction of a pixel off the cached guide x, and the
+        // sub-pixel offset compounds every wheel notch — by the
+        // third step the targeted feature has visibly drifted off
+        // the guide. Anchoring directly on the cached guide pixel
+        // makes the visual reference equal to the math reference,
+        // so the feature stays under the guide forever.
+        const int anchorX = zoomAnchorGuideX_.has_value()
+            ? *zoomAnchorGuideX_
+            : static_cast<int>(event->position().x());
+        const std::int64_t anchorMs = xToMs(anchorX);
+        zoomBy(factor, anchorMs);
+        event->accept();
+        return;
+    }
+
+    if (mods & Qt::ShiftModifier) {
+        if (!isZoomed()) { event->ignore(); return; }
+        // Pan by ~10% of the visible span per notch. dy > 0 (wheel
+        // up) pans LEFT (toward earlier time), matching the
+        // direction convention of horizontal scroll on a trackpad.
+        const int dy = angleDelta.y() != 0
+            ? angleDelta.y() : pixelDelta.y();
+        if (dy == 0) { event->ignore(); return; }
+        const double notches = static_cast<double>(dy) / 120.0;
+        const std::int64_t step =
+            static_cast<std::int64_t>(viewportSpanMs() * 0.1 * notches);
+        panBy(-step);
+        emit userScrolled();
+        event->accept();
+        return;
+    }
+
+    event->ignore();
+}
+
 void ScoreOverlayBase::keyPressEvent(QKeyEvent* event) {
+    // MEMO[#49 smoke]: surface the zoom-anchor guide as soon as
+    // the user presses Ctrl with the mouse already inside the
+    // widget — pre-fix it only appeared on the next mouse move.
+    // mapFromGlobal(QCursor::pos()) gives the live pointer
+    // position even though no QMouseEvent fires for a stationary
+    // Ctrl-press.
+    if (event->key() == Qt::Key_Control && underMouse() && hasContent()) {
+        const int x = mapFromGlobal(QCursor::pos()).x();
+        if (x >= 0 && x < width()) {
+            const std::optional<int> newGuide = x;
+            if (newGuide != zoomAnchorGuideX_) {
+                zoomAnchorGuideX_ = newGuide;
+                update();
+            }
+        }
+    }
+
     // MEMO: arrow nav, Esc, and Del all operate on whichever
     // artifact kind is currently selected. A barline-selection
     // arrow moves between barlines; a marker-selection arrow moves

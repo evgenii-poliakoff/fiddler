@@ -122,6 +122,28 @@ void doSeekMs(ui::MainWindow& window, const QString& arg) {
     seekTo(window, ms);
 }
 
+// Zoom the waveform + staff to a source-time range. Argument:
+// "<startMs>,<endMs>". Used by the user-manual scene that shows
+// the zoomed-in viewport with the horizontal scrollbar visible.
+void doZoomToRange(ui::MainWindow& window, const QString& arg) {
+    const auto parts = arg.split(',', Qt::SkipEmptyParts);
+    if (parts.size() != 2) {
+        throw std::runtime_error(
+            "zoom-to-range: arg must be 'startMs,endMs' (got '" +
+            arg.toStdString() + "')");
+    }
+    bool okStart = false, okEnd = false;
+    const qint64 startMs = parts[0].toLongLong(&okStart);
+    const qint64 endMs   = parts[1].toLongLong(&okEnd);
+    if (!okStart || !okEnd) {
+        throw std::runtime_error(
+            "zoom-to-range: both args must be integer ms (got '" +
+            arg.toStdString() + "')");
+    }
+    window.applyViewport(startMs, endMs);
+    flushEvents();
+}
+
 // Place barlines at a comma-separated list of ms positions.
 // Each position seeks the player and presses B.
 void doTapBarlinesAt(ui::MainWindow& window, const QString& arg) {
@@ -249,6 +271,7 @@ const QHash<QString, ActionFn>& registry() {
         {"preroll-disable",         doPrerollDisable},
         {"set-tempo",               doSetTempo},
         {"seek-ms",                 doSeekMs},
+        {"zoom-to-range",           doZoomToRange},
         {"tap-barlines-at",         doTapBarlinesAt},
         {"tap-markers-at",          doTapMarkersAt},
         {"select-marker",           doSelectMarker},
