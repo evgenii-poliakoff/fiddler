@@ -22,6 +22,7 @@ class QSpinBox;
 class QSlider;
 class QLabel;
 class QMenu;
+class QScrollBar;
 class QShortcut;
 class QTimer;
 
@@ -69,6 +70,28 @@ public:
     // Read-only view of the persisted MRU list. Test seam.
     [[nodiscard]] QStringList recentFiles() const;
     void clearRecentFiles();
+
+    // Zoom / viewport (#49). Single point of truth for both
+    // score widgets — applyViewport sets the same range on the
+    // waveform and the staff and updates the scrollbar without
+    // re-emitting valueChanged. resetViewport returns to
+    // fit-to-window. setFollowPlayback flips the View menu
+    // checkbox and the internal flag; no-op if already in that
+    // state. Public so integration tests drive zoom the same way
+    // the menu / shortcuts do.
+    void applyViewport(std::int64_t startMs, std::int64_t endMs);
+    void resetViewport();
+    void setFollowPlayback(bool follow);
+    [[nodiscard]] bool followPlayback() const noexcept {
+        return followPlayback_;
+    }
+    // Ensure `targetMs` is comfortably inside the current viewport
+    // — used by dock activations and the playback-follow page-flip
+    // alike. Does nothing if not zoomed (everything is already
+    // visible) or if `targetMs` is already inside the viewport
+    // with enough margin. Bypasses the followPlayback flag: a
+    // dock double-click is "navigate here", not "follow playback".
+    void bringIntoView(std::int64_t targetMs);
 
     // Read-only access to the audio engine. Used by integration tests
     // to verify that UI events (clicks, slider moves) propagate
@@ -215,6 +238,12 @@ private:
     // calls openByPath. Slot so QMenu::aboutToShow can wire to it.
     static constexpr int kMaxRecentFiles = 10;
     void pushRecentFile(const QString& path);
+
+private slots:
+    void onViewportChanged(std::int64_t startMs, std::int64_t endMs);
+    void onZoomIn();
+    void onZoomOut();
+    void onZoomFit();
 
 private slots:
     void rebuildRecentFilesMenu();
@@ -401,6 +430,25 @@ private:
     QPushButton*    stopButton_     = nullptr;
     QSlider*        positionSlider_ = nullptr;
     QSlider*        tempoSlider_    = nullptr;
+
+    // Viewport / zoom (#49). The scrollbar lives between the staff
+    // and the position slider; visible only when zoomed. The
+    // suppress flag breaks the feedback loop when the scrollbar
+    // is the one updating the viewport (so its own valueChanged
+    // signal doesn't bounce back as another setViewport).
+    QScrollBar*     viewportScrollBar_ = nullptr;
+    bool            suppressViewportScrollBarSignals_ = false;
+    QAction*        followPlaybackAction_ = nullptr;
+    bool            followPlayback_ = true;
+
+    // Last playhead ms observed by the follow-playback page-flip.
+    // The flip fires only when the position has CHANGED since the
+    // previous tick — otherwise a Ctrl+wheel zoom that moves the
+    // viewport away from a stationary playhead would be undone on
+    // the very next 50 ms tick (the page-flip would yank the view
+    // back to wherever the playhead is sitting). Sentinel value
+    // -1 means "no observation yet".
+    std::int64_t    lastFollowPosMs_ = -1;
     QLabel*         tempoLabel_     = nullptr;
     QLabel*         statusLabel_    = nullptr;
     QSpinBox*       prerollBox_       = nullptr;

@@ -107,7 +107,7 @@ TEST_CASE("WaveformWidget: msToX maps endpoints and middle correctly",
     w.resize(1000, 100);
 
     REQUIRE(w.msToX(0)    == 0);
-    REQUIRE(w.msToX(2000) == 999);    // clamped to width-1
+    REQUIRE(w.msToX(2000) == 999);    // exact right edge → width - 1 (#49)
     const int xMid = w.msToX(1000);
     REQUIRE(xMid >= 490);
     REQUIRE(xMid <= 510);
@@ -130,17 +130,22 @@ TEST_CASE("WaveformWidget: xToMs / msToX round-trip across the width",
     }
 }
 
-TEST_CASE("WaveformWidget: out-of-range x clamps to file bounds",
+TEST_CASE("WaveformWidget: out-of-range x clamps; out-of-range ms passes through",
           "[waveform-widget][gui][coords]") {
     qtApp();
     WaveformWidget w;
     w.setOverview(makeOverview(/*seconds=*/3));
     w.resize(600, 80);
 
+    // xToMs clamps to [0, dur] so off-edge clicks resolve sanely.
     REQUIRE(w.xToMs(-100)  == 0);
     REQUIRE(w.xToMs(99999) == 3000);
-    REQUIRE(w.msToX(-500)  == 0);
-    REQUIRE(w.msToX(99999) == 599);
+    // msToX returns out-of-range x for out-of-range ms so paint
+    // code can cull off-screen artifacts (#49). The exact right
+    // edge (ms == dur) is nudged to width-1 so it still paints.
+    REQUIRE(w.msToX(-500)  <  0);
+    REQUIRE(w.msToX(99999) >  599);
+    REQUIRE(w.msToX(3000)  == 599);
 }
 
 // ---------------------------------------------------------------------------

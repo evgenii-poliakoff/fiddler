@@ -64,6 +64,24 @@ Click anywhere on the waveform to jump playback to that point. The position slid
 
 ![The position slider mid-track.](img/manual-position-slider.png)
 
+### Zoom and pan
+
+Hold **Ctrl** and scroll the mouse wheel over the waveform or the staff to zoom in on the time axis. The point under the cursor stays put; everything else fans out around it, so you can drop the cursor on the note you're chasing and zoom straight onto it. Hold **Shift** and scroll to pan the visible window left or right without changing the zoom.
+
+When you're zoomed in, a horizontal scrollbar appears between the staff and the position slider — drag it to scroll along the recording, or click the arrows to nudge.
+
+![The central column zoomed in on a passage, with the horizontal scrollbar visible.](img/manual-zoom-view.png)
+
+Keyboard equivalents:
+
+| Key | Action |
+|---|---|
+| **Ctrl++** | Zoom in around the playback cursor |
+| **Ctrl+-** | Zoom out around the playback cursor |
+| **Ctrl+0** | Fit the entire recording to the window |
+
+**View ▸ Follow Playback** keeps the visible window chasing the playback cursor: when playback reaches the right edge of the view, the window jumps forward by one page so the cursor lands at the left edge of fresh material. Follow is on by default. Scrolling manually — by dragging the scrollbar or with **Shift+wheel** — turns Follow off until you re-tick the menu item, so a deliberate scroll doesn't immediately bounce back to wherever playback happens to be.
+
 ## 5. Barlines
 
 A *barline* is a vertical line on the music staff that divides the recording into bars. You place barlines as you listen, by tapping a key in time with the music. Each barline is anchored to a source-time position; the staff renders them in order.
@@ -219,6 +237,11 @@ Note that the undo history resets when you load a project: **Ctrl+Z** does not r
 | **Ctrl+S** | Save the current project | anywhere |
 | **Ctrl+Shift+S** | Save the current project to a new path | anywhere |
 | **Ctrl+Z** | Undo the most recent edit (placement, drag, dock edit, rename, or delete) | anywhere |
+| **Ctrl++** | Zoom in around the playback cursor | anywhere |
+| **Ctrl+-** | Zoom out around the playback cursor | anywhere |
+| **Ctrl+0** | Fit the entire recording to the window | anywhere |
+| **Ctrl+wheel** | Zoom in / out around the mouse position | waveform, staff |
+| **Shift+wheel** | Pan the visible window horizontally | waveform, staff |
 | **F4** | Show / hide the project viewer dock | anywhere |
 | **Esc** | Clear the current selection | waveform, staff |
 | **← / →** | Step through artifacts of the same kind | waveform, staff |

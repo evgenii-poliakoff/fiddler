@@ -28,6 +28,7 @@
 #include <QFileInfo>
 #include <QLineEdit>
 #include <QMenu>
+#include <QScrollBar>
 #include <QTemporaryDir>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -3282,4 +3283,211 @@ TEST_CASE("MainWindow: Open Recent submenu reflects the MRU + Clear entry (#43)"
     // Triggering Clear empties the MRU.
     actions[3]->trigger();
     REQUIRE(window->recentFiles().isEmpty());
+}
+
+// ---------------------------------------------------------------------------
+// Zoom / viewport (#49)
+//
+// Drives the gestures and follow-playback state through the public seams
+// the user reaches via the View menu and the scrollbar. Audio playback
+// follow-page-flip is exercised by faking the playhead position via
+// the existing setPositionMs broadcast since real audio isn't reliable
+// under offscreen Qt.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Set up a window that has the fixture WAV loaded + waveform overview
+// ready. Boilerplate shared by all the zoom test cases.
+std::unique_ptr<MainWindow> makeLoadedWindow() {
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    (void)QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000);
+    return window;
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: applyViewport syncs waveform + staff + scrollbar (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* scroll   = window->findChild<QScrollBar*>("viewportScrollBar");
+    REQUIRE(waveform); REQUIRE(staff); REQUIRE(scroll);
+
+    REQUIRE_FALSE(scroll->isVisible());
+
+    window->applyViewport(500, 1000);
+
+    REQUIRE(waveform->viewportStartMs() == 500);
+    REQUIRE(waveform->viewportEndMs()   == 1000);
+    REQUIRE(staff->viewportStartMs()    == 500);
+    REQUIRE(staff->viewportEndMs()      == 1000);
+    REQUIRE(scroll->isVisible());
+    REQUIRE(scroll->value()    == 500);
+    REQUIRE(scroll->pageStep() == 500);
+}
+
+TEST_CASE("MainWindow: Ctrl+0 fit shortcut clears the viewport (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* scroll   = window->findChild<QScrollBar*>("viewportScrollBar");
+
+    window->applyViewport(500, 1000);
+    REQUIRE(waveform->isZoomed());
+
+    auto* fitAction = window->findChild<QAction*>("zoomFitAction");
+    REQUIRE(fitAction != nullptr);
+    fitAction->trigger();
+
+    REQUIRE_FALSE(waveform->isZoomed());
+    REQUIRE_FALSE(scroll->isVisible());
+}
+
+TEST_CASE("MainWindow: Ctrl+= / Ctrl+- shortcuts step zoom around playhead (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+
+    REQUIRE_FALSE(waveform->isZoomed());
+    auto* zoomIn = window->findChild<QAction*>("zoomInAction");
+    REQUIRE(zoomIn != nullptr);
+
+    zoomIn->trigger();
+    REQUIRE(waveform->isZoomed());
+    const auto spanAfter1 = waveform->viewportSpanMs();
+    zoomIn->trigger();
+    const auto spanAfter2 = waveform->viewportSpanMs();
+    REQUIRE(spanAfter2 < spanAfter1);
+
+    auto* zoomOut = window->findChild<QAction*>("zoomOutAction");
+    REQUIRE(zoomOut != nullptr);
+    zoomOut->trigger();
+    // Should grow back toward the previous level. Allow ±5 ms
+    // slack for integer truncation in span math.
+    REQUIRE(waveform->viewportSpanMs() > spanAfter2);
+    REQUIRE(std::abs(waveform->viewportSpanMs() - spanAfter1) <= 5);
+}
+
+TEST_CASE("MainWindow: loading a fresh file resets the viewport (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+
+    window->applyViewport(500, 1000);
+    REQUIRE(waveform->isZoomed());
+
+    // Reload the same file (loadFile path covers fresh loads too).
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    REQUIRE_FALSE(waveform->isZoomed());
+}
+
+TEST_CASE("MainWindow: dragging the scrollbar pans both widgets + clears Follow (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    auto* staff    = window->findChild<StaffWidget*>("staffWidget");
+    auto* scroll   = window->findChild<QScrollBar*>("viewportScrollBar");
+    auto* followAction =
+        window->findChild<QAction*>("followPlaybackAction");
+    REQUIRE(followAction); REQUIRE(followAction->isChecked());
+
+    // Zoom in so the scrollbar is meaningful.
+    window->applyViewport(0, 500);
+    REQUIRE(scroll->isVisible());
+
+    // Simulating user drag: setValue triggers valueChanged.
+    scroll->setValue(300);
+
+    REQUIRE(waveform->viewportStartMs() == 300);
+    REQUIRE(staff->viewportStartMs()    == 300);
+    // Manual scroll auto-pauses Follow Playback.
+    REQUIRE_FALSE(followAction->isChecked());
+}
+
+TEST_CASE("MainWindow: bringIntoView re-centres an off-screen marker even with Follow off (#49)",
+          "[main-window][gui][integration][zoom]") {
+    // Regression: dock double-click on an off-screen marker has
+    // to bring it into view regardless of Follow Playback state.
+    // Pre-fix, Follow was the gate, so a user who had turned
+    // Follow off (deliberately or via a small pan) saw the cursor
+    // jump but the viewport stay put — the marker remained
+    // off-screen.
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+
+    window->applyViewport(0, 500);
+    window->setFollowPlayback(false);    // Follow off — the bug case
+    REQUIRE(waveform->isZoomed());
+
+    window->bringIntoView(1500);          // far outside [0, 500]
+
+    REQUIRE(waveform->viewportStartMs() <= 1500);
+    REQUIRE(waveform->viewportEndMs()   >  1500);
+    // Lead-in: 20 % from left. Allow ±10 ms for integer math.
+    const auto leadIn = 1500 - waveform->viewportStartMs();
+    REQUIRE(leadIn >= 90);
+    REQUIRE(leadIn <= 110);
+}
+
+TEST_CASE("MainWindow: bringIntoView is a no-op when target is already inside (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+
+    window->applyViewport(500, 1000);
+    const auto startBefore = waveform->viewportStartMs();
+    const auto endBefore   = waveform->viewportEndMs();
+
+    window->bringIntoView(700);   // inside [500, 1000]
+    REQUIRE(waveform->viewportStartMs() == startBefore);
+    REQUIRE(waveform->viewportEndMs()   == endBefore);
+}
+
+TEST_CASE("MainWindow: page-flip during natural playback advances viewport (#49)",
+          "[main-window][gui][integration][zoom]") {
+    qtApp();
+    auto window = makeLoadedWindow();
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+
+    window->applyViewport(0, 500);
+    REQUIRE(waveform->viewportStartMs() == 0);
+    REQUIRE(waveform->viewportEndMs()   == 500);
+
+    // Force a playhead crossing. The offscreen test harness can't
+    // reliably run real audio, so we exercise the page-flip path
+    // via seek (which updatePosition observes on the next 50 ms
+    // tick). Page-flip lands the playhead with a 20 % lead-in
+    // from the left edge — so a seek to 600 should produce a
+    // viewport whose start is just BEFORE 600, not at 0/500.
+    auto* slider = window->findChild<QSlider*>("positionSlider");
+    REQUIRE(slider);
+    slider->setValue(600);
+    emit slider->sliderMoved(600);
+
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->viewportEndMs() > 500; }, 1000));
+    // Span preserved across the flip.
+    REQUIRE(waveform->viewportEndMs() - waveform->viewportStartMs() == 500);
+    // 20 % lead-in: playhead (600 ms) should sit ~100 ms after
+    // the new viewport start. Allow ±10 ms slack for integer
+    // truncation in the lead-in math.
+    const auto leadIn = 600 - waveform->viewportStartMs();
+    REQUIRE(leadIn >= 90);
+    REQUIRE(leadIn <= 110);
 }

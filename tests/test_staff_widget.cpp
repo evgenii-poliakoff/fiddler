@@ -128,10 +128,21 @@ TEST_CASE("StaffWidget: out-of-range x and ms clamp to file bounds",
     setUpWidget(w, makeModel(), /*durationMs=*/3000,
                 /*widthPx=*/600, /*heightPx=*/80);
 
+    // xToMs clamps to [0, dur] — values outside the widget map
+    // to the file's bounds (so a click off the left/right edge
+    // still resolves to a sane source-ms).
     REQUIRE(w.xToMs(-100)   == 0);
     REQUIRE(w.xToMs(99'999) == 3000);
-    REQUIRE(w.msToX(-500)   == 0);
-    REQUIRE(w.msToX(99'999) == 599);   // width - 1
+    // msToX deliberately does NOT clamp: it returns out-of-range
+    // values for out-of-range source-ms so paint code's
+    // `if (x<0 || x>=width()) continue` bounds check can cull
+    // off-screen artifacts (#49 follow-up — the prior clamp had
+    // off-screen markers drawing as a column stack at x=0).
+    // Only ms == durationMs is nudged to width-1 so the exact
+    // right edge still paints.
+    REQUIRE(w.msToX(-500)   <  0);
+    REQUIRE(w.msToX(99'999) >  599);
+    REQUIRE(w.msToX(3000)   == 599);   // exact right-edge nudge
 }
 
 // ---------------------------------------------------------------------------
@@ -802,4 +813,155 @@ TEST_CASE("StaffWidget: dragging a loop's left edge updates startMs",
     REQUIRE(args[1].toBool() == true);          // isStartEdge
     REQUIRE(loops->loops()[0].endMs == 2000);   // partner intact
     REQUIRE(std::abs(loops->loops()[0].startMs - 1300) < 5);
+}
+
+// ---------------------------------------------------------------------------
+// Viewport / zoom (#49)
+//
+// These tests pin the ScoreOverlayBase viewport contract via StaffWidget
+// because the base class isn't instantiable on its own. The same math
+// covers WaveformWidget (it lives in the base now).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("StaffWidget: default viewport maps full duration to widget width",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    REQUIRE_FALSE(w.isZoomed());
+    REQUIRE(w.viewportSpanMs() == 0);   // unset = fit-to-window
+
+    // 4000 ms across 800 px = 5 ms/px.
+    REQUIRE(w.xToMs(0)   == 0);
+    REQUIRE(w.xToMs(400) == 2000);
+    REQUIRE(w.msToX(2000) == 400);
+}
+
+TEST_CASE("StaffWidget: setting a viewport maps that range to the full width",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    QSignalSpy vpSpy(&w, &StaffWidget::viewportChanged);
+    w.setViewport(1000, 2000);     // 1-second window across 800 px
+
+    REQUIRE(vpSpy.count() == 1);
+    REQUIRE(w.isZoomed());
+    REQUIRE(w.viewportStartMs() == 1000);
+    REQUIRE(w.viewportEndMs()   == 2000);
+
+    // 1000 ms / 800 px = 1.25 ms/px.
+    REQUIRE(w.xToMs(0)   == 1000);
+    REQUIRE(w.xToMs(400) == 1500);
+    REQUIRE(w.msToX(1500) == 400);
+    // ms == viewportEnd lands at exact width — nudged to w-1
+    // so the right-edge column still paints. Anything strictly
+    // outside the viewport is returned unclamped so paint code
+    // can cull (#49 follow-up).
+    REQUIRE(w.msToX(2000) == 799);
+    REQUIRE(w.msToX(0)    <  0);     // off-screen left
+    REQUIRE(w.msToX(3000) >= 800);   // off-screen right
+}
+
+TEST_CASE("StaffWidget: setViewport clamps to duration and enforces min span",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    // Out-of-range pair gets clamped to [0, dur].
+    w.setViewport(-500, 5000);
+    REQUIRE(w.viewportStartMs() == 0);
+    REQUIRE(w.viewportEndMs()   == 4000);
+
+    // Sub-minimum span (kMinViewportSpanMs = 50) gets extended.
+    w.setViewport(1000, 1010);
+    REQUIRE(w.viewportEndMs() - w.viewportStartMs() >= 50);
+}
+
+TEST_CASE("StaffWidget: setViewport(0,0) restores fit-to-window",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    w.setViewport(500, 1500);
+    REQUIRE(w.isZoomed());
+
+    QSignalSpy vpSpy(&w, &StaffWidget::viewportChanged);
+    w.setViewport(0, 0);
+
+    REQUIRE(vpSpy.count() == 1);
+    REQUIRE_FALSE(w.isZoomed());
+    REQUIRE(w.xToMs(400) == 2000);  // back to full-range math
+}
+
+TEST_CASE("StaffWidget: zoomBy preserves the anchor's pixel position",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/10000, /*widthPx=*/1000);
+
+    // Pre-zoom, ms=2500 sits at x=250.
+    const std::int64_t anchorMs = 2500;
+    const int          anchorPx = w.msToX(anchorMs);
+    REQUIRE(anchorPx == 250);
+
+    // Zoom in 2×. Anchor should stay at (approximately) the same x.
+    w.zoomBy(0.5, anchorMs);
+    REQUIRE(w.isZoomed());
+
+    const int anchorPxAfter = w.msToX(anchorMs);
+    // ±1 px slack for integer truncation in span/anchor math.
+    REQUIRE(std::abs(anchorPxAfter - anchorPx) <= 1);
+}
+
+TEST_CASE("StaffWidget: zoomBy beyond fit collapses to fit-to-window",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    w.setViewport(1000, 2000);   // zoomed in
+    REQUIRE(w.isZoomed());
+
+    w.zoomBy(10.0, 1500);        // way past fit
+    REQUIRE_FALSE(w.isZoomed());
+    REQUIRE(w.viewportSpanMs() == 0);
+}
+
+TEST_CASE("StaffWidget: panBy slides the viewport, clamped to bounds",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    w.setViewport(1000, 2000);
+    w.panBy(300);
+    REQUIRE(w.viewportStartMs() == 1300);
+    REQUIRE(w.viewportEndMs()   == 2300);
+
+    // Clamped at the right edge — start stays inside [0, dur - span].
+    w.panBy(5000);
+    REQUIRE(w.viewportEndMs() == 4000);
+    REQUIRE(w.viewportStartMs() == 3000);
+
+    // Clamped at the left edge.
+    w.panBy(-10000);
+    REQUIRE(w.viewportStartMs() == 0);
+    REQUIRE(w.viewportEndMs()   == 1000);
+}
+
+TEST_CASE("StaffWidget: panBy is a no-op when not zoomed",
+          "[staff-widget][gui][coords][zoom]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    QSignalSpy vpSpy(&w, &StaffWidget::viewportChanged);
+    w.panBy(500);
+    REQUIRE(vpSpy.count() == 0);
+    REQUIRE_FALSE(w.isZoomed());
 }

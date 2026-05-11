@@ -46,13 +46,13 @@ public:
     // The source-time duration of the loaded file, in milliseconds.
     // Used as the right-hand bound of the source-time → x-pixel
     // mapping. Set to 0 (the default) when no file is loaded.
+    // Implements ScoreOverlayBase's pure virtual durationMs(); the
+    // base class's xToMs/msToX read it together with the viewport
+    // state to do the coord math.
     void setDurationMs(std::int64_t ms);
-    [[nodiscard]] std::int64_t durationMs() const noexcept { return durationMs_; }
-
-    // Coord transforms — overrides ScoreOverlayBase's pure virtuals.
-    // Both return 0 when no duration is set.
-    [[nodiscard]] std::int64_t xToMs(int x) const noexcept override;
-    [[nodiscard]] int          msToX(std::int64_t ms) const noexcept override;
+    [[nodiscard]] std::int64_t durationMs() const noexcept override {
+        return durationMs_;
+    }
 
     [[nodiscard]] QSize sizeHint() const override;
     [[nodiscard]] QSize minimumSizeHint() const override;
