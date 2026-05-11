@@ -24,7 +24,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QFile>
+#include <QFileInfo>
 #include <QLineEdit>
+#include <QMenu>
 #include <QTemporaryDir>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -3054,4 +3057,229 @@ TEST_CASE("MainWindow: project file format is JSON with version field (#26)",
 
     REQUIRE(root.value("markers").toArray().size() == 1);
     REQUIRE(root.value("markers").toArray()[0].toObject().value("sourceMs").toInt() == 1500);
+}
+
+// ---------------------------------------------------------------------------
+// Open Recent submenu (#43)
+//
+// QSettings is per-test-isolated via qtApp() (clears on every call) and
+// QStandardPaths::setTestModeEnabled redirects writes to a process-local
+// scratch dir — see qt_test_app.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Copy the fixture WAV to `dest` so tests that exercise the MRU's
+// multi-file behaviour can produce N distinct, openable audio paths
+// without inflating the suite's fixture corpus. Caller owns the
+// QTemporaryDir holding `dest`.
+void copyFixtureTo(const QString& dest) {
+    const QString src = QString::fromStdString(fixtureWav().string());
+    REQUIRE(QFile::copy(src, dest));
+}
+
+} // namespace
+
+TEST_CASE("MainWindow: openByPath prepends the path to recent files (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    REQUIRE(window->recentFiles().isEmpty());
+
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+    REQUIRE(window->openByPath(fixturePath));
+
+    const QStringList recent = window->recentFiles();
+    REQUIRE(recent.size() == 1);
+    REQUIRE(recent.first() == QFileInfo(fixturePath).absoluteFilePath());
+}
+
+TEST_CASE("MainWindow: opening the same file twice dedupes the MRU (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    const QString fixturePath =
+        QString::fromStdString(fixtureWav().string());
+
+    REQUIRE(window->openByPath(fixturePath));
+    REQUIRE(window->openByPath(fixturePath));
+
+    REQUIRE(window->recentFiles().size() == 1);
+}
+
+TEST_CASE("MainWindow: re-opening an older file moves it to the front (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString a = tmp.filePath("a.wav");
+    const QString b = tmp.filePath("b.wav");
+    copyFixtureTo(a);
+    copyFixtureTo(b);
+
+    auto window = std::make_unique<MainWindow>();
+    REQUIRE(window->openByPath(a));
+    REQUIRE(window->openByPath(b));
+    REQUIRE(window->openByPath(a));   // re-pick the oldest
+
+    const QStringList recent = window->recentFiles();
+    REQUIRE(recent.size() == 2);
+    REQUIRE(recent[0] == QFileInfo(a).absoluteFilePath());
+    REQUIRE(recent[1] == QFileInfo(b).absoluteFilePath());
+}
+
+TEST_CASE("MainWindow: MRU caps at 10 entries (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+
+    auto window = std::make_unique<MainWindow>();
+    // Open 11 distinct copies of the fixture; expect the oldest
+    // to fall off and a final size of exactly 10.
+    QStringList opened;
+    for (int i = 0; i < 11; ++i) {
+        const QString p = tmp.filePath(QStringLiteral("f%1.wav").arg(i));
+        copyFixtureTo(p);
+        opened << QFileInfo(p).absoluteFilePath();
+        REQUIRE(window->openByPath(p));
+    }
+    const QStringList recent = window->recentFiles();
+    REQUIRE(recent.size() == 10);
+    // Oldest (f0.wav) is gone; newest (f10.wav) is at the front.
+    REQUIRE(recent.first() == opened.last());
+    REQUIRE_FALSE(recent.contains(opened.first()));
+}
+
+TEST_CASE("MainWindow: openByPath dispatches .fdlp via openProject (#43)",
+          "[main-window][gui][integration][recent][project]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString projectPath = tmp.filePath("p.fdlp");
+
+    // Build a tiny project first.
+    {
+        auto window = std::make_unique<MainWindow>();
+        window->show();
+        (void)QTest::qWaitForWindowExposed(window.get());
+        REQUIRE(window->loadFile(
+            QString::fromStdString(fixtureWav().string())));
+        REQUIRE(window->saveProject(projectPath));
+    }
+
+    // Fresh window — open the project via openByPath; the .fdlp
+    // path should be the new MRU front (NOT the audio path that
+    // openProject also touches internally).
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->openByPath(projectPath));
+
+    const QStringList recent = window->recentFiles();
+    REQUIRE(recent.size() == 1);
+    REQUIRE(recent.first() == QFileInfo(projectPath).absoluteFilePath());
+    REQUIRE(recent.first().endsWith(".fdlp"));
+}
+
+TEST_CASE("MainWindow: openByPath on missing file returns false and prunes MRU (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString ghost = tmp.filePath("ghost.wav");
+    copyFixtureTo(ghost);
+
+    auto window = std::make_unique<MainWindow>();
+    REQUIRE(window->openByPath(ghost));
+    REQUIRE(window->recentFiles().size() == 1);
+
+    // Delete the file and try to re-pick it. Expect false return
+    // and the entry pruned from the MRU.
+    REQUIRE(QFile::remove(ghost));
+    REQUIRE_FALSE(window->openByPath(ghost));
+    REQUIRE(window->recentFiles().isEmpty());
+}
+
+TEST_CASE("MainWindow: clearRecentFiles empties the MRU (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    REQUIRE(window->openByPath(
+        QString::fromStdString(fixtureWav().string())));
+    REQUIRE(window->recentFiles().size() == 1);
+
+    window->clearRecentFiles();
+    REQUIRE(window->recentFiles().isEmpty());
+}
+
+TEST_CASE("MainWindow: pushing on an empty MRU flips the submenu live (#43)",
+          "[main-window][gui][integration][recent]") {
+    // Regression: pre-fix, the submenu started disabled and a
+    // disabled QMenu never fires aboutToShow — so first-session
+    // pushes were invisible until restart. Pin the fix that the
+    // submenu enables and populates immediately on a push, with
+    // no aboutToShow / hover required.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+
+    auto* recentMenuAction = window->findChild<QAction*>("openRecentMenu");
+    REQUIRE(recentMenuAction != nullptr);
+    auto* recentMenu = recentMenuAction->menu();
+    REQUIRE(recentMenu != nullptr);
+
+    REQUIRE_FALSE(recentMenuAction->isEnabled()); // empty → disabled
+
+    REQUIRE(window->openByPath(
+        QString::fromStdString(fixtureWav().string())));
+
+    // No emit aboutToShow here — the live rebuild on push is the
+    // contract under test.
+    REQUIRE(recentMenuAction->isEnabled());
+    const auto actions = recentMenu->actions();
+    REQUIRE(actions.size() == 3);   // 1 file + separator + Clear
+    REQUIRE_FALSE(actions[0]->isSeparator());
+    REQUIRE(actions[1]->isSeparator());
+    REQUIRE(actions[2]->objectName() == "clearRecentFilesAction");
+}
+
+TEST_CASE("MainWindow: Open Recent submenu reflects the MRU + Clear entry (#43)",
+          "[main-window][gui][integration][recent]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString a = tmp.filePath("alpha.wav");
+    const QString b = tmp.filePath("beta.wav");
+    copyFixtureTo(a);
+    copyFixtureTo(b);
+
+    auto window = std::make_unique<MainWindow>();
+    auto* recentMenuAction = window->findChild<QAction*>("openRecentMenu");
+    REQUIRE(recentMenuAction != nullptr);
+    auto* recentMenu = recentMenuAction->menu();
+    REQUIRE(recentMenu != nullptr);
+
+    // Empty state — submenu disabled, no entries.
+    REQUIRE_FALSE(recentMenuAction->isEnabled());
+
+    REQUIRE(window->openByPath(a));
+    REQUIRE(window->openByPath(b));
+
+    // Submenu is rebuilt on aboutToShow; force a rebuild the same
+    // way an actual menu pop would.
+    emit recentMenu->aboutToShow();
+
+    REQUIRE(recentMenuAction->isEnabled());
+    const auto actions = recentMenu->actions();
+    // 2 file entries + separator + Clear Recent Files == 4.
+    REQUIRE(actions.size() == 4);
+    REQUIRE(actions[0]->text() == "beta.wav");   // most recent first
+    REQUIRE(actions[1]->text() == "alpha.wav");
+    REQUIRE(actions[2]->isSeparator());
+    REQUIRE(actions[3]->objectName() == "clearRecentFilesAction");
+
+    // Triggering Clear empties the MRU.
+    actions[3]->trigger();
+    REQUIRE(window->recentFiles().isEmpty());
 }
