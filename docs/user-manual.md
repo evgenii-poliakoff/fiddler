@@ -24,6 +24,8 @@ This chapter walks through opening a recording, slowing it down, navigating the 
 
 6. **Double-click the marker's row in the dock.** Playback jumps back to the marker, ready for another listen.
 
+7. **Press Ctrl+S to save.** A dialog asks where to save the *Fiddler project* file — a `.fdlp` sidecar alongside the audio. Future opens of that `.fdlp` restore the session, marker and all.
+
 You now have the core navigation and bookmarking gestures. The chapters that follow add tempo control, barline tapping, practice loops, and the pre-roll countdown.
 
 ## 3. The main window
@@ -172,13 +174,27 @@ The dock on the right of the window lists every marker and loop in the recording
 
 Press **F4** to hide or show the dock. The dock's visibility persists across sessions, so a hidden dock stays hidden until you press **F4** again.
 
-## 9. Undo and reopen
+## 9. Saving, opening, and undo
+
+### Save and reopen
+
+A *Fiddler project* is the audio file path plus everything you've placed on top of it — barlines, markers, loops, the chosen tune type, and the pre-roll setting. Projects are saved as `.fdlp` files alongside the audio.
+
+- **File ▸ Save** (**Ctrl+S**) — saves the project. If the session hasn't been saved before, this opens the Save As dialog.
+- **File ▸ Save As…** (**Ctrl+Shift+S**) — picks a new path. Default suggestion is the audio file's name with a `.fdlp` extension.
+- **File ▸ Open…** (**Ctrl+O**) — opens an audio file *or* a `.fdlp` project. The file dialog filter shows both kinds.
+
+When a project is loaded, the window title shows its filename: *Fiddler — tune.fdlp*. An asterisk in front of the title — *\* Fiddler — tune.fdlp* — means the session has unsaved changes. Save with **Ctrl+S** to clear the asterisk.
+
+Note that closing the window with unsaved changes prompts you to save first; pick *Discard* to lose the changes, *Cancel* to keep the window open.
+
+### Undo
 
 Press **Ctrl+Z** to reverse the most recent edit. The undo history covers every kind of action across barlines, markers, and loops, in the order you took them: placements, drags, dock spinbox edits, renames, and deletes. Pre-roll changes — both the duration spinbox and the enable checkbox — are covered too. A deleted artifact returns with the same name and the same position it had before.
 
 Repeated **Ctrl+Z** presses walk back through the history one step at a time. When the history drains, further presses are quiet no-ops. Redo (**Ctrl+Shift+Z**) is on the roadmap.
 
-Note that Fiddler does not yet save its project state to disk: closing the window discards the placed barlines, markers, and loops. The window's geometry, dock visibility, and pre-roll settings do persist between sessions. Project save and reopen is on the roadmap.
+Note that the undo history resets when you load a project: **Ctrl+Z** does not reach across a Open call.
 
 ## 10. Keyboard shortcuts
 
@@ -193,6 +209,9 @@ Note that Fiddler does not yet save its project state to disk: closing the windo
 | **Drag** | Move a marker tick or a loop edge | waveform, staff |
 | **Double-click** | Jump and play a marker; jump, arm, and play a loop | dock |
 | **Delete** | Remove the selected artifact | anywhere |
+| **Ctrl+O** | Open an audio file or a Fiddler project | anywhere |
+| **Ctrl+S** | Save the current project | anywhere |
+| **Ctrl+Shift+S** | Save the current project to a new path | anywhere |
 | **Ctrl+Z** | Undo the most recent edit (placement, drag, dock edit, rename, or delete) | anywhere |
 | **F4** | Show / hide the project viewer dock | anywhere |
 | **Esc** | Clear the current selection | waveform, staff |
@@ -225,6 +244,8 @@ Note that the log captures gestures and state, not audio content. The recording 
 *Marker*. A labelled cue point in the recording. Tap **M** during playback to drop one at the playback position.
 
 *Pre-roll*. A short silence inserted before audio resumes, giving you time to ready the bow. Set the duration in the transport row's Pre-roll spinbox.
+
+*Project*. The audio file plus everything you've placed on top of it — barlines, markers, loops, tune type, pre-roll setting. Saved as a `.fdlp` sidecar next to the audio with **Ctrl+S**.
 
 *Tap to place*. Pressing **B** or **M** during playback to add a barline or marker at the current playback position. The primary placement gesture; clicks on the waveform or staff seek rather than place.
 

@@ -20,7 +20,12 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QLineEdit>
+#include <QTemporaryDir>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QAction>
@@ -2865,4 +2870,188 @@ TEST_CASE("MainWindow: undo of an Add does not push a Delete entry "
     // pushed during the dispatch). No-op, not a redo.
     QTest::keyClick(window.get(), Qt::Key_Z, Qt::ControlModifier);
     REQUIRE(window->markerModel().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Project save / load (#26)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: save+load round-trip preserves every model (#26)",
+          "[main-window][gui][integration][project]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString projectPath = tmp.filePath("session.fdlp");
+
+    // Set up a populated session: load audio, tap some artifacts,
+    // build a loop, edit pre-roll, pick a tune type.
+    std::int64_t markerId = 0;
+    std::int64_t loopId   = 0;
+    QString      audioPath;
+    {
+        auto window = std::make_unique<MainWindow>();
+        window->show();
+        (void)QTest::qWaitForWindowExposed(window.get());
+        REQUIRE(window->loadFile(
+            QString::fromStdString(fixtureWav().string())));
+        auto* waveform =
+            window->findChild<WaveformWidget*>("waveformWidget");
+        REQUIRE(QTest::qWaitFor(
+            [&]() { return waveform->overview() != nullptr; }, 5000));
+
+        // Fixture WAV is 2 s long — use positions well inside that
+        // range so the seeks don't get clamped by Player::position.
+        auto* slider = window->findChild<QSlider*>("positionSlider");
+        slider->setValue(500);
+        emit slider->sliderMoved(500);
+        QTest::keyClick(window.get(), Qt::Key_B);
+        seekAndTapMarker(*window, 800);
+        REQUIRE(window->markerModel().size() == 1);
+        markerId = window->markerModel().markers()[0].id;
+
+        // Build a loop from two markers.
+        seekAndTapMarker(*window, 1500);
+        REQUIRE(window->markerModel().size() == 2);
+        waveform->setSecondaryAnchorMs(800);
+        QTest::keyClick(window.get(), Qt::Key_L);
+        REQUIRE(window->loopModel().size() == 1);
+        loopId = window->loopModel().loops()[0].id;
+
+        // Rename for round-trip verification.
+        emit window->findChild<ProjectViewerDock*>("projectViewerDock")
+                ->markerRenameRequested(markerId, "Hard turn");
+        emit window->findChild<ProjectViewerDock*>("projectViewerDock")
+                ->loopRenameRequested(loopId, "Drill A");
+
+        REQUIRE(window->saveProject(projectPath));
+        audioPath = QString::fromStdString(fixtureWav().string());
+    }
+
+    // Fresh window, load the project, verify every model.
+    {
+        auto window = std::make_unique<MainWindow>();
+        window->show();
+        (void)QTest::qWaitForWindowExposed(window.get());
+        REQUIRE(window->openProject(projectPath));
+
+        REQUIRE(window->barlineModel().size() == 1);
+        REQUIRE(window->barlineModel().barlines()[0] == 500);
+
+        REQUIRE(window->markerModel().size() == 2);
+        // IDs survive the round-trip.
+        REQUIRE(window->markerModel().indexOf(markerId).has_value());
+        const auto idx = *window->markerModel().indexOf(markerId);
+        REQUIRE(window->markerModel().markers()[idx].sourceMs == 800);
+        REQUIRE(window->markerModel().markers()[idx].name == "Hard turn");
+
+        REQUIRE(window->loopModel().size() == 1);
+        REQUIRE(window->loopModel().loops()[0].id == loopId);
+        REQUIRE(window->loopModel().loops()[0].name == "Drill A");
+    }
+}
+
+TEST_CASE("MainWindow: dirty state flips on mutation, clears on save (#26)",
+          "[main-window][gui][integration][project]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString projectPath = tmp.filePath("dirty.fdlp");
+
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    REQUIRE_FALSE(window->windowTitle().startsWith("* "));
+
+    // Mutation → dirty.
+    QTest::keyClick(window.get(), Qt::Key_B);
+    REQUIRE(window->windowTitle().startsWith("* "));
+
+    // Save → clean. Title shows the basename without asterisk.
+    REQUIRE(window->saveProject(projectPath));
+    REQUIRE_FALSE(window->windowTitle().startsWith("* "));
+    REQUIRE(window->windowTitle().contains("dirty.fdlp"));
+
+    // Mutation again → dirty.
+    QTest::keyClick(window.get(), Qt::Key_M);
+    REQUIRE(window->windowTitle().startsWith("* "));
+}
+
+TEST_CASE("MainWindow: malformed .fdlp leaves current state intact (#26)",
+          "[main-window][gui][integration][project]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString badPath = tmp.filePath("broken.fdlp");
+
+    QFile f(badPath);
+    REQUIRE(f.open(QIODevice::WriteOnly));
+    f.write("{ this is not valid JSON");
+    f.close();
+
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    const auto preLoadMarkerCount = window->markerModel().size();
+
+    // openProject swallows the malformed JSON and returns false. The
+    // production code surfaces a QMessageBox, but in test mode that's
+    // a separate top-level window that doesn't block the test.
+    REQUIRE_FALSE(window->openProject(badPath));
+    // Models are untouched.
+    REQUIRE(window->markerModel().size() == preLoadMarkerCount);
+}
+
+TEST_CASE("MainWindow: project file format is JSON with version field (#26)",
+          "[main-window][gui][integration][project]") {
+    // Pins the serialisation contract — future readers (other tools,
+    // re-implementations) can depend on the shape.
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString path = tmp.filePath("shape.fdlp");
+
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 1500);
+    REQUIRE(window->saveProject(path));
+
+    QFile f(path);
+    REQUIRE(f.open(QIODevice::ReadOnly));
+    QJsonParseError err{};
+    const auto doc = QJsonDocument::fromJson(f.readAll(), &err);
+    f.close();
+    REQUIRE(err.error == QJsonParseError::NoError);
+    REQUIRE(doc.isObject());
+
+    const auto root = doc.object();
+    REQUIRE(root.value("version").toInt() == 1);
+    REQUIRE(root.contains("audioPath"));
+    REQUIRE(root.contains("timeSignature"));
+    REQUIRE(root.contains("preroll"));
+    REQUIRE(root.contains("barlines"));
+    REQUIRE(root.contains("markers"));
+    REQUIRE(root.contains("loops"));
+
+    REQUIRE(root.value("markers").toArray().size() == 1);
+    REQUIRE(root.value("markers").toArray()[0].toObject().value("sourceMs").toInt() == 1500);
 }
