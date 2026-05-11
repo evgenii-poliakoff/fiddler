@@ -660,6 +660,58 @@ waveform clean at any practical zoom, at 512 KB of cost. A
 proper multi-resolution pyramid for extreme zoom is filed as
 #50.
 
+### User-manual screenshot automation (`tools/screenshots/`)
+
+The user manual's `docs/img/*.png` figures are produced by
+`fiddler-screenshots`, a small C++ binary that constructs a real
+`MainWindow` under offscreen Qt, drives it through a sequence of
+declarative actions, and writes a PNG of the requested region.
+
+**Declarative scene manifest** at
+`tools/screenshots/scenes.yaml` — one block per figure:
+
+```yaml
+- id: manual-zoom-view
+  output: manual-zoom-view.png
+  capture:
+    region: [waveformWidget, staffWidget, viewportScrollBar, positionSlider]
+  setup:
+    - load-fixture
+    - tap-barlines-at: 800,1000,1200,1400,1600
+    - zoom-to-range: 700,1700
+  margin: { horizontal: 8, vertical: 8 }
+```
+
+**Setup-action registry** in `tools/screenshots/scene_actions.cpp`
+maps YAML action names to lambdas (`load-fixture`, `seek-ms`,
+`tap-barlines-at`, `tap-markers-at`, `select-marker`,
+`select-loop`, `build-loop-marker-pair`, `show-popup`,
+`enter-countdown`, `zoom-to-range`, …). Adding a new gesture is
+one new action; adding a new figure is a YAML edit only.
+
+**Capture kinds**: `window` (full hero shot), `region` (bounding
+box over a list of `objectName`s, unioned), `element` (one widget
+padded with margin), `popup` (closed combo cell + its open
+dropdown, stacked vertically). Region capture *fails loud* if any
+named widget doesn't resolve — a wrong-but-plausible PNG is the
+worst failure mode.
+
+**Determinism is the load-bearing property**: same source + same
+manifest + same fixture produces byte-identical PNGs across runs.
+This makes "are the manual's screenshots in sync with shipped
+behaviour?" a one-command check: `./scripts/screenshots.sh && git
+status`. If the working tree is clean, the manual is up to date.
+
+**Synthetic fixture**: the tool generates a small WAV at startup
+into a temp path, so the binary has no external dependencies and
+the bucket-aggregation paint outputs the same peaks every run.
+
+Output dir + manifest path are baked at CMake configure time;
+`--output` / `--manifest` CLI flags override for local
+experimentation. The canonical entry point is
+`./scripts/screenshots.sh` (one invocation across humans, CI, and
+the agent).
+
 ### Logging: spdlog (behind a facade)
 
 The application code never includes spdlog headers directly. All log
