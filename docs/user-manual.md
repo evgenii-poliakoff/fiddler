@@ -66,7 +66,7 @@ Click anywhere on the waveform to jump playback to that point. The position slid
 
 ### Zoom and pan
 
-Hold **Ctrl** and scroll the mouse wheel over the waveform or the staff to zoom in on the time axis. The point under the cursor stays put; everything else fans out around it, so you can drop the cursor on the note you're chasing and zoom straight onto it. Hold **Shift** and scroll to pan the visible window left or right without changing the zoom.
+Hold **Ctrl** and scroll the mouse wheel over the waveform or the staff to zoom in on the time axis. The point under the cursor stays put; everything else fans out around it, so you can drop the cursor on the note you're chasing and zoom straight onto it. A dashed amber line tracks the mouse while **Ctrl** is held — that line is exactly where the wheel will pivot. Hold **Shift** and scroll to pan the visible window left or right without changing the zoom.
 
 When you're zoomed in, a horizontal scrollbar appears between the staff and the position slider — drag it to scroll along the recording, or click the arrows to nudge.
 
@@ -80,7 +80,7 @@ Keyboard equivalents:
 | **Ctrl+-** | Zoom out around the playback cursor |
 | **Ctrl+0** | Fit the entire recording to the window |
 
-**View ▸ Follow Playback** keeps the visible window chasing the playback cursor: when playback reaches the right edge of the view, the window jumps forward by one page so the cursor lands at the left edge of fresh material. Follow is on by default. Scrolling manually — by dragging the scrollbar or with **Shift+wheel** — turns Follow off until you re-tick the menu item, so a deliberate scroll doesn't immediately bounce back to wherever playback happens to be.
+**View ▸ Follow Playback** keeps the visible window chasing the playback cursor: when playback reaches the right edge of the view, the window jumps forward so the cursor lands inside the new viewport with a small lead-in from the left edge — you see a moment of what just played plus most of what's coming up. Follow is on by default. Scrolling manually — by dragging the scrollbar or with **Shift+wheel** — turns Follow off so a deliberate scroll doesn't immediately bounce back. The next **Play** press, or a double-click on a marker or loop in the project viewer, re-engages Follow automatically, so an accidental nudge of the scrollbar doesn't leave Follow stuck off.
 
 ## 5. Barlines
 
