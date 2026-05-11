@@ -68,9 +68,14 @@ TEST_CASE("Stretcher passes audio through at ratio 1.0", "[stretcher]") {
     const auto output = drainAll(s, inputFrames * 2);
     const std::size_t outFrames = output.size() / kChannels;
 
-    // Allow ±10% slack for the engine's preroll / tail handling.
-    REQUIRE(outFrames >= inputFrames * 9 / 10);
-    REQUIRE(outFrames <= inputFrames * 11 / 10);
+    // ±15% slack: at ratio 1.0 the engine still emits a few thousand
+    // trailing frames on final=true (the lookahead window) on top of
+    // the real audio. The lower bound mostly catches a stalled engine.
+    // (Pre-#40 this was ±10%; post-#40 the start-delay is consumed at
+    // construction via primeRealtime(), which shifts where the slack
+    // lands — the tail stays, the preroll silence is gone.)
+    REQUIRE(outFrames >= inputFrames * 85 / 100);
+    REQUIRE(outFrames <= inputFrames * 115 / 100);
 
     // Peak amplitude survives the round-trip within ~3 dB.
     const double pIn  = peak(input);

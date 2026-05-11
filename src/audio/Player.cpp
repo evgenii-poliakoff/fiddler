@@ -30,6 +30,16 @@ bool Player::load(const std::filesystem::path& path) {
 
     const auto fmt = decoder_.outputFormat();
 
+    // Cache audio format as atomics so the GUI thread (position(),
+    // duration()) and the audio callback (channels for the
+    // samples-per-frame math) can read them without touching
+    // decoder_. Set BEFORE the decoder thread starts; cleared in
+    // unload() AFTER it joins. While the thread is running these
+    // are read-only.
+    sampleRate_.store(fmt.sampleRate);
+    channels_.store(fmt.channels);
+    durationMs_.store(decoder_.duration().count());
+
     // Two seconds of headroom: enough to absorb scheduler hiccups,
     // small enough to keep seek latency under ~100 ms.
     const std::size_t ringSize =
@@ -75,6 +85,7 @@ bool Player::load(const std::filesystem::path& path) {
     currentTempoRatio_.store(1.0);
     anchorSourceMs_.store(0);
     anchorOutFrames_.store(0);
+    pendingSeekMs_.store(kNoPendingSeek);
     state_.store(TransportState::Stopped);
 
     decoderRunning_.store(true, std::memory_order_release);
@@ -89,6 +100,9 @@ bool Player::load(const std::filesystem::path& path) {
 }
 
 void Player::unload() {
+    // Stop the decoder thread BEFORE touching decoder_/stretcher_/
+    // ring_, since it owns them while running. After join the GUI
+    // thread can mutate them freely.
     decoderRunning_.store(false, std::memory_order_release);
     if (decoderThread_.joinable()) decoderThread_.join();
 
@@ -103,14 +117,21 @@ void Player::unload() {
     eofFlushed_ = false;
     state_.store(TransportState::Stopped);
     framesPlayed_.store(0);
+    sampleRate_.store(0);
+    channels_.store(0);
+    durationMs_.store(0);
 }
 
 void Player::play() {
-    if (!stream_ || !decoder_.isOpen())               return;
+    if (!stream_)                                     return;
+    if (sampleRate_.load() <= 0)                      return;
     if (state_.load() == TransportState::Playing)     return;
 
-    // If we're sitting at EOF, restart from the beginning.
-    if (position() >= duration() && duration().count() > 0) {
+    // If we're sitting at EOF, restart from the beginning. Use the
+    // cached duration atomic — decoder_ might be mid-read on the
+    // decoder thread; we mustn't touch it from here.
+    const auto durMs = durationMs_.load();
+    if (durMs > 0 && position().count() >= durMs) {
         seek(0ms);
     }
 
@@ -131,71 +152,50 @@ void Player::pause() {
 
 void Player::stop() {
     if (stream_ && Pa_IsStreamActive(stream_) == 1) Pa_StopStream(stream_);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        decoder_.seek(0ms);
-        if (stretcher_) stretcher_->reset();
-        if (ring_) ring_->reset();
-        eofFlushed_ = false;
-        framesPlayed_.store(0);
-        anchorSourceMs_.store(0);
-        anchorOutFrames_.store(0);
-    }
+
+    // Reset position to zero. The actual decoder.seek(0) + stretcher
+    // reset + ring discard happen on the decoder thread via the
+    // pendingSeekMs_ channel — same path as a normal seek, lock-free.
+    // We also reset framesPlayed so position() reads 0 immediately.
+    framesPlayed_.store(0);
+    anchorSourceMs_.store(0);
+    anchorOutFrames_.store(0);
+    pendingSeekMs_.store(0);
+
     state_.store(TransportState::Stopped);
     FLOG_DEBUG("player", "stop");
 }
 
 void Player::seek(std::chrono::milliseconds position) {
-    if (!decoder_.isOpen()) return;
+    if (sampleRate_.load() <= 0) return;   // nothing loaded
 
     FLOG_DEBUG("player", "seek to {} ms", position.count());
 
-    // MEMO[#22]: non-blocking from the GUI's perspective. The
-    // decoder thread holds mutex_ during its FFmpeg read + ring
-    // write, which blocks ~140 ms when the ring is being filled.
-    // Pre-#22 Player::seek acquired that mutex on the GUI thread
-    // and stalled at typical drag speeds. Now we just publish the
-    // pending position and update the anchor; the decoder thread
-    // does decoder_.seek + stretcher_->reset + ring_->reset at
-    // the top of its next iteration.
-    //
-    // Pa_Stop/Start stays on the GUI side for now — those are
-    // 1–9 ms each, real but not the dominant cost. Removing them
-    // requires the audio callback to gracefully ride a ring reset,
-    // which is bigger architectural work (filed as a follow-up).
-    const bool wasPlaying = (state_.load() == TransportState::Playing);
-    if (wasPlaying && stream_ && Pa_IsStreamActive(stream_) == 1) {
-        Pa_StopStream(stream_);
-    }
+    // MEMO[#40]: GUI side is purely atomic publish — no
+    // Pa_StopStream / Pa_StartStream, no mutex. The audio stream
+    // keeps running; the decoder thread picks up pendingSeekMs_,
+    // calls decoder.seek + stretcher.reset, then
+    // RingBuffer::publishDiscard(). The audio callback rides the
+    // transient by silencing the stale samples in the ring (one
+    // buffer worth max) before continuing with new-position audio.
 
-    // Anchor the source position at the seek target IMMEDIATELY so
-    // position() returns the new value to GUI callers (cursor
-    // follow during drag) without waiting for the decoder thread.
-    // The atomics are observed by the audio callback's position
-    // formula too, but the deltaFrames component clamps to zero
-    // until framesPlayed_ ticks past the new anchorOutFrames_.
+    // Anchor the source position at the seek target so position()
+    // returns the new value to GUI callers (cursor follow during
+    // drag) before the decoder thread has caught up.
     anchorSourceMs_.store(position.count());
     anchorOutFrames_.store(framesPlayed_.load());
 
-    // Hand off the heavy decoder.seek + stretcher.reset to the
-    // decoder thread. exchange semantics: if a previous seek is
-    // still pending, this one overwrites it — the decoder will
-    // see only the latest target, which is correct for drag.
     pendingSeekMs_.store(position.count());
-
-    if (wasPlaying && stream_) {
-        Pa_StartStream(stream_);
-    }
 }
 
 std::chrono::milliseconds Player::position() const noexcept {
-    if (!decoder_.isOpen()) return std::chrono::milliseconds::zero();
-    const auto sr = decoder_.outputFormat().sampleRate;
-    if (sr <= 0)            return std::chrono::milliseconds::zero();
+    const auto sr = sampleRate_.load();
+    if (sr <= 0) return std::chrono::milliseconds::zero();
 
-    // Anchor model: the decoder thread updates the anchor whenever the
-    // tempo changes or a seek happens, so position() across a piece of
-    // constant-ratio playback is just anchor + (delta * ratio).
+    // Anchor model: the decoder thread updates the anchor whenever
+    // the tempo changes; seek() updates it on the GUI side. position()
+    // across a piece of constant-ratio playback is just
+    //   anchor + (framesPlayed - anchorFrames) / sr * 1000 * ratio.
     const auto frames       = framesPlayed_.load();
     const auto anchorFrames = anchorOutFrames_.load();
     const auto anchorMs     = anchorSourceMs_.load();
@@ -214,7 +214,7 @@ void Player::setTempoRatio(double ratio) {
 }
 
 std::chrono::milliseconds Player::duration() const noexcept {
-    return decoder_.duration();
+    return std::chrono::milliseconds{durationMs_.load()};
 }
 
 int Player::paCallback(const void* /*input*/, void* output,
@@ -228,21 +228,48 @@ int Player::paCallback(const void* /*input*/, void* output,
     auto* self = static_cast<Player*>(userData);
     auto* out  = static_cast<float*>(output);
 
-    const int channels = self->decoder_.outputFormat().channels;
-    const std::size_t samplesNeeded =
-        static_cast<std::size_t>(frameCount) * static_cast<std::size_t>(channels);
-
-    std::size_t got = 0;
-    if (self->ring_) {
-        got = self->ring_->read({out, samplesNeeded});
+    // Channels read from the atomic, not from decoder_ (which the
+    // decoder thread owns during its lifetime).
+    const int channels = self->channels_.load(std::memory_order_relaxed);
+    if (channels <= 0) {
+        // Loaded but not yet ready, or being torn down — silence.
+        const std::size_t total =
+            static_cast<std::size_t>(frameCount) * 2u;   // worst-case stereo
+        for (std::size_t i = 0; i < total; ++i) out[i] = 0.0f;
+        return paContinue;
     }
-    // Pad with silence on underrun / EOF.
-    for (std::size_t i = got; i < samplesNeeded; ++i) out[i] = 0.0f;
 
-    // Only count what we actually drained — keeps position() honest at EOF.
-    self->framesPlayed_.fetch_add(
-        static_cast<std::int64_t>(got / channels),
-        std::memory_order_relaxed);
+    const std::size_t samplesNeeded =
+        static_cast<std::size_t>(frameCount)
+        * static_cast<std::size_t>(channels);
+
+    std::size_t written = 0;
+    if (self->ring_) {
+        // MEMO[#40]: flush any pending discard in a single shot.
+        // The decoder publishes a discard threshold after a seek;
+        // we drop ALL stale frames at once (not throttled to this
+        // callback's size) so the silence after a seek is bounded
+        // by decoder refill latency, not by ring occupancy /
+        // playback rate. The dropped frames never reach the
+        // speakers and are NOT counted toward framesPlayed_.
+        (void) self->ring_->flushDiscardPending();
+
+        // Read whatever real post-seek audio the decoder has
+        // refilled into the ring. If it hasn't caught up yet,
+        // got < samplesNeeded and we pad with silence below.
+        const std::size_t got = self->ring_->read(
+            {out, samplesNeeded});
+        written = got;
+
+        // framesPlayed_ counts only real frames consumed — the
+        // padding silence below is intentionally NOT counted.
+        self->framesPlayed_.fetch_add(
+            static_cast<std::int64_t>(got / channels),
+            std::memory_order_relaxed);
+    }
+
+    // Underrun / EOF padding.
+    for (std::size_t i = written; i < samplesNeeded; ++i) out[i] = 0.0f;
     return paContinue;
 }
 
@@ -253,97 +280,96 @@ void Player::decoderThread() {
 
     while (decoderRunning_.load(std::memory_order_acquire)) {
         bool didWork = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (decoder_.isOpen() && ring_ && stretcher_) {
-                // 0a. (#22) Pending seek? Pull the latest value
-                //     out and execute the heavy seek work here on
-                //     the decoder thread, off the GUI hot path.
-                //     exchange returns whatever was there; -1
-                //     means no seek pending. The GUI may overwrite
-                //     this between the load and our exchange — that's
-                //     fine, we'll catch the newer value next iteration.
-                const auto pending =
-                    pendingSeekMs_.exchange(kNoPendingSeek);
-                if (pending != kNoPendingSeek) {
-                    decoder_.seek(std::chrono::milliseconds{pending});
-                    stretcher_->reset();
-                    ring_->reset();
-                    eofFlushed_ = false;
-                    didWork = true;
-                }
+        // MEMO[#40]: no mutex. Decoder/stretcher/ring writer are
+        // owned by this thread for its entire lifetime. The GUI
+        // thread reads cached atomics (sampleRate_, channels_,
+        // durationMs_) instead of touching decoder_; the callback
+        // touches only the ring (lock-free SPSC) and channels_.
+        if (decoder_.isOpen() && ring_ && stretcher_) {
+            // 0a. Pending seek? Pull the latest value out and execute
+            //     the heavy seek work here. The GUI may overwrite
+            //     pendingSeekMs_ between our load and exchange — that's
+            //     fine; we'll catch the newer value next iteration.
+            const auto pending =
+                pendingSeekMs_.exchange(kNoPendingSeek);
+            if (pending != kNoPendingSeek) {
+                decoder_.seek(std::chrono::milliseconds{pending});
+                stretcher_->reset();
+                // MEMO[#40]: publishDiscard, NOT ring_->reset.
+                // reset() races with the audio callback's read.
+                // publishDiscard atomically marks the ring's current
+                // contents stale; the callback silences them on its
+                // next pass via consumeDiscardPending.
+                ring_->publishDiscard();
+                eofFlushed_ = false;
+                didWork = true;
+            }
 
-                // 0. If the GUI moved the tempo slider since last
-                //    iteration, advance the position anchor using the
-                //    OLD ratio (so source-time stays consistent up to
-                //    this instant) and switch the stretcher to the
-                //    new ratio. From here, the anchor formula runs at
-                //    the new ratio.
-                const double target = targetTempoRatio_.load();
-                const double currentRatio = currentTempoRatio_.load();
-                if (target != currentRatio) {
-                    const auto sr = decoder_.outputFormat().sampleRate;
-                    if (sr > 0) {
-                        const auto frames     = framesPlayed_.load();
-                        const auto oldFrames  = anchorOutFrames_.load();
-                        const auto oldAnchor  = anchorSourceMs_.load();
-                        const double deltaSec =
-                            static_cast<double>(frames - oldFrames) / sr;
-                        const auto sourceMs = oldAnchor +
-                            static_cast<std::int64_t>(
-                                deltaSec * 1000.0 * currentRatio);
-                        anchorSourceMs_.store(sourceMs);
-                        anchorOutFrames_.store(frames);
-                    }
-                    currentTempoRatio_.store(target);
-                    stretcher_->setTimeRatio(1.0 / target);
+            // 0b. Tempo change since last iteration? Apply.
+            const double target = targetTempoRatio_.load();
+            const double currentRatio = currentTempoRatio_.load();
+            if (target != currentRatio) {
+                const auto sr = sampleRate_.load();
+                if (sr > 0) {
+                    const auto frames     = framesPlayed_.load();
+                    const auto oldFrames  = anchorOutFrames_.load();
+                    const auto oldAnchor  = anchorSourceMs_.load();
+                    const double deltaSec =
+                        static_cast<double>(frames - oldFrames) / sr;
+                    const auto sourceMs = oldAnchor +
+                        static_cast<std::int64_t>(
+                            deltaSec * 1000.0 * currentRatio);
+                    anchorSourceMs_.store(sourceMs);
+                    anchorOutFrames_.store(frames);
+                }
+                currentTempoRatio_.store(target);
+                stretcher_->setTimeRatio(1.0 / target);
+                FLOG_DEBUG("player.thread",
+                           "tempo {} (time ratio {})",
+                           target, 1.0 / target);
+            }
+
+            // 1. Drain whatever the stretcher already has into the
+            //    ring. Priority: don't let the ring starve the
+            //    callback while the stretcher sits on output.
+            while (ring_->writeAvailable() >= chunkSamples
+                   && stretcher_->available() > 0) {
+                const std::size_t got = stretcher_->retrieve(
+                    {outBuf.data(), chunkSamples});
+                if (got == 0) break;
+                ring_->write({outBuf.data(), got});
+                didWork = true;
+            }
+
+            // 2. If the ring still has space, feed the stretcher
+            //    one chunk from the decoder (or flush its tail at
+            //    clean EOF, exactly once).
+            if (ring_->writeAvailable() >= chunkSamples && !eofFlushed_) {
+                const auto got = decoder_.read({inBuf.data(), chunkSamples});
+                if (got > 0) {
+                    stretcher_->process(
+                        {inBuf.data(), static_cast<std::size_t>(got)},
+                        /*final=*/false);
+                    didWork = true;
+                    FLOG_TRACE("player.thread",
+                               "in {} samples; stretcher avail={} frames; "
+                               "ring r/w={}/{}",
+                               got, stretcher_->available(),
+                               ring_->readAvailable(),
+                               ring_->writeAvailable());
+                } else if (got == 0) {
+                    // Clean EOF — flush the stretcher tail so the
+                    // last preroll-delayed samples come out.
+                    stretcher_->process({}, /*final=*/true);
+                    eofFlushed_ = true;
+                    didWork = true;
                     FLOG_DEBUG("player.thread",
-                               "tempo {} (time ratio {})",
-                               target, 1.0 / target);
+                               "decoder EOF; flushed stretcher tail "
+                               "({} frames pending)",
+                               stretcher_->available());
                 }
-
-                // 1. Drain whatever the stretcher already has into the
-                //    ring. Priority: don't let the ring starve the
-                //    callback while the stretcher sits on output.
-                while (ring_->writeAvailable() >= chunkSamples
-                       && stretcher_->available() > 0) {
-                    const std::size_t got = stretcher_->retrieve(
-                        {outBuf.data(), chunkSamples});
-                    if (got == 0) break;
-                    ring_->write({outBuf.data(), got});
-                    didWork = true;
-                }
-
-                // 2. If the ring still has space, feed the stretcher
-                //    one chunk from the decoder (or flush its tail at
-                //    clean EOF, exactly once).
-                if (ring_->writeAvailable() >= chunkSamples && !eofFlushed_) {
-                    const auto got = decoder_.read({inBuf.data(), chunkSamples});
-                    if (got > 0) {
-                        stretcher_->process(
-                            {inBuf.data(), static_cast<std::size_t>(got)},
-                            /*final=*/false);
-                        didWork = true;
-                        FLOG_TRACE("player.thread",
-                                   "in {} samples; stretcher avail={} frames; "
-                                   "ring r/w={}/{}",
-                                   got, stretcher_->available(),
-                                   ring_->readAvailable(),
-                                   ring_->writeAvailable());
-                    } else if (got == 0) {
-                        // Clean EOF — flush the stretcher tail so the
-                        // last preroll-delayed samples come out.
-                        stretcher_->process({}, /*final=*/true);
-                        eofFlushed_ = true;
-                        didWork = true;
-                        FLOG_DEBUG("player.thread",
-                                   "decoder EOF; flushed stretcher tail "
-                                   "({} frames pending)",
-                                   stretcher_->available());
-                    }
-                    // got < 0 → decoder error. Stop pushing until
-                    // seek/unload clears state.
-                }
+                // got < 0 → decoder error. Stop pushing until
+                // seek/unload clears state.
             }
         }
         if (!didWork) std::this_thread::sleep_for(5ms);
