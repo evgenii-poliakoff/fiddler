@@ -583,6 +583,83 @@ work):
   needs tighter wrap, the hook would move into the audio-callback
   path.
 
+### Zoom + viewport (#49)
+
+The score widgets support horizontal zoom and pan via a viewport
+owned by `ScoreOverlayBase`. The base stores
+`viewportStartMs_` / `viewportEndMs_`; subclasses only supply
+their `durationMs()`. `xToMs` / `msToX` are non-virtual on the
+base and read the viewport — so the whole rendering chain
+(peaks, ticks, flags, bands, cursor, drag ghosts, hit-tests,
+snap radius via `pixelsToMs`) zooms in lockstep with no
+per-subclass work.
+
+`MainWindow` is the single source of truth for the viewport
+across both widgets: `applyViewport(start, end)` calls
+`setViewport` on the waveform and the staff in lockstep and
+updates the horizontal scrollbar without re-triggering itself
+(a `suppressViewportScrollBarSignals_` guard breaks the
+feedback loop).
+
+**Gestures** (`ScoreOverlayBase::wheelEvent`):
+
+- **Ctrl + wheel** zooms by √2 per notch, anchored on the
+  cached *zoom-anchor guide* pixel — not on the wheel event's
+  `qreal position()`. Sub-pixel offsets compound across wheel
+  notches; anchoring on the same int pixel the user sees as
+  the guide line makes the visual reference equal to the math
+  reference, so the targeted feature stays under the guide
+  forever.
+- **Shift + wheel** pans by ~10 % of the visible span per
+  notch and emits `userScrolled` so MainWindow can flip the
+  Follow Playback toggle off (matching Audacity / Ableton /
+  Audition convention — any manual scroll pauses follow).
+- **Ctrl + `=` / `-` / `0`** are MainWindow `QAction`s
+  (keyboard shortcuts) anchored on the playback cursor when
+  in-viewport, or viewport center when the playhead is
+  off-screen.
+
+**Zoom-anchor guide** (the dashed amber vertical line under
+Ctrl) is updated from two sources: `mouseMoveEvent` while the
+mouse is moving with Ctrl held, AND a `QApplication`-level
+event filter that catches Ctrl press / release globally —
+without that filter the guide wouldn't appear until the user
+moved the mouse, because Qt routes key events through focus
+not through hover.
+
+**Follow Playback** is an Ableton-style toggle on MainWindow
+(`View > Follow Playback`, default on). The page-flip in
+`updatePosition` only fires when the playhead has actually
+*moved* between ticks (`curMs != lastFollowPosMs_`) — without
+this guard, a Ctrl + wheel zoom that pushes the viewport away
+from a stationary playhead would be undone on the very next
+50 ms tick. `applyViewport` re-anchors `lastFollowPosMs_` to
+the current player position so the next tick sees zero
+motion. The flip lands the playhead 20 % from the left edge
+of the new viewport so dock-jumped artifacts have visible
+lead-in.
+
+`startPlayback()` is the single point that re-engages Follow on
+every transport start (Play button, dock double-click on
+marker / loop, etc.), so an accidental nudge of the scrollbar
+doesn't leave Follow stuck off — the natural "I'm pressing
+Play again" gesture restores it.
+
+**Off-screen artifacts** rely on `msToX` returning unclamped
+values (an artifact whose ms is before the viewport returns a
+negative x; after the viewport returns x >= width). Every
+paint site has an `if (x < 0 || x >= width()) continue` bounds
+check that culls them. The one exception is `ms ==
+durationMs()` — the exact right-edge case lands at x = w on
+integer math and gets nudged to w - 1 so the last column still
+paints.
+
+`WaveformOverview`'s bucket count is `kOverviewBuckets =
+32 768` (up from the pre-#49 4 096) — keeps the painted
+waveform clean at any practical zoom, at 512 KB of cost. A
+proper multi-resolution pyramid for extreme zoom is filed as
+#50.
+
 ### Logging: spdlog (behind a facade)
 
 The application code never includes spdlog headers directly. All log
