@@ -48,6 +48,15 @@ public:
     // returns, so production and tests share the same code path.
     [[nodiscard]] bool loadFile(const QString& path);
 
+    // Project save / load (#26). Same shape as loadFile — public
+    // so integration tests can drive the round-trip without going
+    // through QFileDialog. The slots onSave / onSaveAs end up
+    // calling saveProject after picking a path. openProject is
+    // called from onOpenFile when the chosen file has a .fdlp
+    // suffix.
+    bool saveProject(const QString& path);
+    bool openProject(const QString& path);
+
     // Read-only access to the audio engine. Used by integration tests
     // to verify that UI events (clicks, slider moves) propagate
     // through to the player.
@@ -57,6 +66,16 @@ public:
     // score widget. Used by tests to verify that the playback-
     // position poll pauses during the drag.
     [[nodiscard]] bool dragInFlight() const noexcept { return dragInFlight_; }
+
+    // Test seam (#26) — suppress the close-with-dirty prompt so a
+    // test that calls window->close() doesn't block on a modal
+    // QMessageBox (there's no user to click). Production code
+    // leaves this false. Tests that exercise the close path with
+    // dirty state should drive openProject / saveProject directly
+    // and verify the dirty flag rather than rely on the dialog.
+    void setSuppressCloseDirtyPromptForTest(bool suppress) noexcept {
+        suppressCloseDirtyPrompt_ = suppress;
+    }
 
     // Test seams for the wrap-pause state machine (issue #13).
     // Production code never calls enterWrapPauseForTest — the real
@@ -138,6 +157,45 @@ protected:
 
 private slots:
     void onOpenFile();
+
+    // Project save/load (#26). Save / Save As route through
+    // saveProject(path); Open with a .fdlp suffix routes through
+    // openProject(path). The path is absolute, picked by the
+    // user via QFileDialog. Save with no project bound yet
+    // falls through to Save As.
+    void onSave();
+    void onSaveAs();
+
+private:
+    // Dirty / window-title helpers for the project flow (#26).
+    //
+    //   recomputeDirty   — re-derive dirty_ from
+    //                      (undoHistory_.size() != savedUndoSize_)
+    //                      || nonUndoableDirty_. Called after every
+    //                      undo push, every onUndo pop, and from
+    //                      slots that change non-undo state (e.g.
+    //                      the tune-type picker).
+    //   markClean        — snapshot the current state as the new
+    //                      saved baseline (savedUndoSize_ = current
+    //                      size, nonUndoableDirty_ = false), then
+    //                      recompute. Called by save / openProject /
+    //                      loadFile to mark "this is the state on
+    //                      disk now".
+    //   updateWindowTitle — re-compose the title from projectPath_
+    //                       and dirty_.
+    void recomputeDirty();
+    void markClean();
+    void updateWindowTitle();
+
+    // Single helper for every "user did a reversible thing" call
+    // site. Gates on `applyingUndo_` so the dispatch's own model
+    // mutations don't push their own reversal entries, emplaces
+    // the typed entry, and recomputes dirty. Push sites become
+    //     pushUndoEntry(undo::AddBarline{pos});
+    // instead of the four-line if/emplace/recompute block.
+    void pushUndoEntry(undo::Entry entry);
+
+private slots:
     void onPlayPause();
     void onStop();
     void onSeek(int positionMs);
@@ -307,6 +365,8 @@ private:
     std::unique_ptr<audio::Player> player_;
 
     QAction*        openAction_     = nullptr;
+    QAction*        saveAction_     = nullptr;
+    QAction*        saveAsAction_   = nullptr;
     QPushButton*    playButton_     = nullptr;
     QPushButton*    stopButton_     = nullptr;
     QSlider*        positionSlider_ = nullptr;
@@ -321,6 +381,39 @@ private:
     // poll timer pauses while this is set so its slider/label
     // repaints don't add to the per-move workload — see #22.
     bool            dragInFlight_     = false;
+
+    // Project save/load state (#26).
+    //
+    //   currentAudioPath_  the absolute path of the most-recently
+    //                      loaded audio file, or empty if nothing
+    //                      has been loaded yet. Survives into the
+    //                      project file so reopening a .fdlp can
+    //                      re-load the same audio.
+    //   projectPath_       the absolute path of the bound .fdlp
+    //                      file, or empty if the session hasn't
+    //                      been saved yet (Save As prompts).
+    //   dirty_             set true on any model mutation; flipped
+    //                      false by save / openProject / loadFile.
+    //                      Drives the window title's asterisk and
+    //                      the close-with-dirty prompt.
+    QString         currentAudioPath_;
+    QString         projectPath_;
+    bool            dirty_            = false;
+
+    // Snapshot of undoHistory_.size() at the moment we last saved
+    // (or opened) the project. dirty_ becomes true when the current
+    // size diverges from this, false when we return to it — so a
+    // Ctrl+Z that walks the undo history back to the saved
+    // checkpoint clears the asterisk, instead of leaving it stuck.
+    std::size_t     savedUndoSize_    = 0;
+
+    // Catch-all for state changes that aren't in the undo history
+    // (today: tune-type / time-signature picks). Set true on any
+    // such change, cleared on save / open. Combined with the
+    // history-size compare in recomputeDirty().
+    bool            nonUndoableDirty_ = false;
+
+    bool            suppressCloseDirtyPrompt_ = false;
     WaveformWidget* waveform_       = nullptr;
     StaffWidget*    staff_          = nullptr;
     QComboBox*      tuneTypeCombo_  = nullptr;

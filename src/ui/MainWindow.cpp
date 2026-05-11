@@ -10,6 +10,7 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/Serialize.h"
 #include "ui/ProjectViewerDock.h"
 #include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
@@ -22,7 +23,13 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QHBoxLayout>
 #include <QKeySequence>
 #include <QLabel>
@@ -145,6 +152,13 @@ MainWindow::MainWindow(QWidget* parent)
     buildMenus();
     buildCentralWidget();
 
+    // MEMO[#26]: dirty tracking is driven by explicit calls to
+    // recomputeDirty() at each undo-history push site and after
+    // each onUndo pop (not by connecting to model `changed()`
+    // signals, which would fire BEFORE the push and read a stale
+    // history size). Non-undoable mutations like tune-type picks
+    // set `nonUndoableDirty_` and recompute.
+
     // Wrap-pause QTimer — one persistent instance, started fresh
     // each time we enter the pause-between-repeats window. Holding
     // it as a member (not a static QTimer::singleShot) lets the user
@@ -240,8 +254,19 @@ void MainWindow::buildMenus() {
     openAction_->setShortcut(QKeySequence::Open);
     connect(openAction_, &QAction::triggered, this, &MainWindow::onOpenFile);
 
+    saveAction_ = new QAction(tr("&Save"), this);
+    saveAction_->setShortcut(QKeySequence::Save);
+    connect(saveAction_, &QAction::triggered, this, &MainWindow::onSave);
+
+    saveAsAction_ = new QAction(tr("Save &As…"), this);
+    saveAsAction_->setShortcut(QKeySequence::SaveAs);
+    connect(saveAsAction_, &QAction::triggered, this, &MainWindow::onSaveAs);
+
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
     fileMenu->addAction(openAction_);
+    fileMenu->addSeparator();
+    fileMenu->addAction(saveAction_);
+    fileMenu->addAction(saveAsAction_);
     fileMenu->addSeparator();
     fileMenu->addAction(tr("&Quit"), QKeySequence::Quit,
                         this, &QWidget::close);
@@ -542,15 +567,26 @@ void MainWindow::buildCentralWidget() {
 }
 
 void MainWindow::onOpenFile() {
+    // MEMO[#26]: same dialog handles audio and project files.
+    // Dispatch on the suffix — `.fdlp` loads a saved project,
+    // anything else loads as audio. The combined filter spares
+    // the user from a separate "Open Project" menu entry.
     const QString path = QFileDialog::getOpenFileName(
         this,
-        tr("Open audio file"),
+        tr("Open audio or project file"),
         {},
-        tr("Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus);;All files (*)"));
+        tr("Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus);;"
+           "Fiddler project (*.fdlp);;"
+           "All files (*)"));
     if (path.isEmpty()) {
         // MEMO: ui-event log — user dismissed the file dialog.
         // See feedback_logs_drive_tests.md for the contract.
         FLOG_DEBUG("ui.file", "open: cancelled");
+        return;
+    }
+
+    if (path.endsWith(".fdlp", Qt::CaseInsensitive)) {
+        openProject(path);
         return;
     }
 
@@ -566,6 +602,11 @@ bool MainWindow::loadFile(const QString& path) {
         statusLabel_->setText(tr("No file loaded."));
         return false;
     }
+    // MEMO[#26]: remember the absolute path so a subsequent
+    // Save / Save As can persist the audio-file reference in
+    // the .fdlp. Stored as an absolute path; cross-machine
+    // portability is a future concern.
+    currentAudioPath_ = QFileInfo(path).absoluteFilePath();
 
     const auto duration = player_->duration();
     const bool hasAudio = player_->hasAudioOutput();
@@ -670,6 +711,15 @@ bool MainWindow::loadFile(const QString& path) {
                        shared->duration().count());
         }, Qt::QueuedConnection);
     }).detach();
+
+    // MEMO[#26]: a fresh audio load detaches from any previously-
+    // bound project file. clear() above fired changed() which
+    // already flipped dirty_ true; reset both here so the window
+    // title is bare "Fiddler" until the user either saves or
+    // adds annotations.
+    projectPath_.clear();
+    markClean();
+    updateWindowTitle();
 
     return true;
 }
@@ -867,9 +917,7 @@ void MainWindow::onTapBarline() {
     if (actuallyAdded) {
         // Push to the unified LIFO so Ctrl+Z can reverse this
         // placement regardless of what's been done since.
-        if (!applyingUndo_) {
-            undoHistory_.emplace_back(undo::AddBarline{pos});
-        }
+        pushUndoEntry(undo::AddBarline{pos});
         FLOG_DEBUG("ui.score",
                    "tap-place ms={} index={} size={} sel={}",
                    pos, *inserted, barlineModel_->size(), *inserted);
@@ -909,9 +957,7 @@ void MainWindow::onTapMarker() {
     // tap-place barline: makes "tap M, press Del" symmetric.
     if (waveform_) waveform_->setSelectedMarkerId(id);
 
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::AddMarker{id});
-    }
+    pushUndoEntry(undo::AddMarker{id});
     FLOG_DEBUG("ui.score",
                "tap-marker ms={} id={} size={}",
                pos, id, markerModel_->size());
@@ -991,6 +1037,11 @@ void MainWindow::onUndo() {
     }, entry);
     applyingUndo_ = false;
 
+    // The pop above may have brought undoHistory_ size back to
+    // savedUndoSize_ — recompute so the asterisk clears when the
+    // user has undone their way back to the saved state.
+    recomputeDirty();
+
     FLOG_DEBUG("ui.score",
                "undo kind={} bar-size={} marker-size={} loop-size={}",
                kind,
@@ -1031,9 +1082,7 @@ void MainWindow::onCreateLoop() {
                    startMs, endMs);
         return;
     }
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::AddLoop{id});
-    }
+    pushUndoEntry(undo::AddLoop{id});
 
     // Clear the secondary anchor so the gesture is "spent" and a
     // fresh L press needs a fresh Ctrl+click.
@@ -1060,6 +1109,12 @@ void MainWindow::onTuneTypePresetChosen(int comboIndex) {
         preset.denominator,
         QString::fromUtf8(preset.tuneType),
     });
+    // MEMO[#26]: tune-type isn't in the undo history yet (would
+    // be a small extension to UndoEntry; filed as future work).
+    // For now, flag the project as dirty so Save still catches
+    // the change in the .fdlp file.
+    nonUndoableDirty_ = true;
+    recomputeDirty();
     FLOG_DEBUG("ui.score",
                "time-sig label={} numerator={} denominator={}",
                preset.tuneType, preset.numerator, preset.denominator);
@@ -1488,9 +1543,7 @@ void MainWindow::onBarlineDeleteRequested(std::size_t index) {
     if (index >= barlineModel_->size()) return;
     const auto sourceMs = barlineModel_->barlines()[index];
     barlineModel_->removeAt(index);
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::DeleteBarline{sourceMs});
-    }
+    pushUndoEntry(undo::DeleteBarline{sourceMs});
     FLOG_DEBUG("ui.score", "delete index={} via=widget-key size={}",
                index, barlineModel_->size());
 }
@@ -1506,10 +1559,7 @@ void MainWindow::onMarkerDeleteRequested(std::int64_t id) {
     const auto sourceMs = m.sourceMs;
     const auto name     = m.name;
     markerModel_->remove(id);
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(
-            undo::DeleteMarker{id, sourceMs, name});
-    }
+    pushUndoEntry(undo::DeleteMarker{id, sourceMs, name});
     FLOG_DEBUG("ui.score", "delete-marker id={} via=widget-key size={}",
                id, markerModel_->size());
 }
@@ -1526,10 +1576,7 @@ void MainWindow::onLoopDeleteRequested(std::int64_t id) {
     const auto endMs   = l.endMs;
     const auto name    = l.name;
     loopModel_->remove(id);
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(
-            undo::DeleteLoop{id, startMs, endMs, name});
-    }
+    pushUndoEntry(undo::DeleteLoop{id, startMs, endMs, name});
     FLOG_DEBUG("ui.score", "delete-loop id={} via=dock-key size={}",
                id, loopModel_->size());
 }
@@ -1548,9 +1595,7 @@ void MainWindow::commitMarkerDrag(std::int64_t id,
         return;
     }
     if (!markerModel_) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::EditMarkerPos{id, fromMs});
-    }
+    pushUndoEntry(undo::EditMarkerPos{id, fromMs});
     markerModel_->setPosition(id, toMs);
     // Source widget cleared its own ghost in mouseRelease; clear
     // the sister so it stops painting from the now-stale ghost
@@ -1580,10 +1625,7 @@ void MainWindow::commitLoopDrag(std::int64_t id,
     // is whatever the signal didn't claim was being dragged.
     const std::int64_t newStart = isStart ? toMs   : l.startMs;
     const std::int64_t newEnd   = isStart ? l.endMs : toMs;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(
-            undo::EditLoopRange{id, l.startMs, l.endMs});
-    }
+    pushUndoEntry(undo::EditLoopRange{id, l.startMs, l.endMs});
     loopModel_->setRange(id, newStart, newEnd);
     if (waveform_) waveform_->clearDragGhost();
     if (staff_)    staff_->clearDragGhost();
@@ -1598,9 +1640,7 @@ void MainWindow::onDockMarkerRenameRequested(std::int64_t id,
     if (!idx) return;
     const auto prevName = markerModel_->markers()[*idx].name;
     if (prevName == name) return;   // no-op edit, no history push
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::RenameMarker{id, prevName});
-    }
+    pushUndoEntry(undo::RenameMarker{id, prevName});
     markerModel_->rename(id, std::move(name));
     FLOG_DEBUG("ui.score",
                "rename-marker id={} via=dock-name", id);
@@ -1612,9 +1652,7 @@ void MainWindow::onDockMarkerPositionEditRequested(std::int64_t id,
     if (!idx) return;
     const auto prevMs = markerModel_->markers()[*idx].sourceMs;
     if (prevMs == newMs) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::EditMarkerPos{id, prevMs});
-    }
+    pushUndoEntry(undo::EditMarkerPos{id, prevMs});
     markerModel_->setPosition(id, newMs);
     FLOG_DEBUG("ui.score",
                "edit-marker-pos id={} from={} to={} via=dock-spinbox",
@@ -1627,9 +1665,7 @@ void MainWindow::onDockLoopRenameRequested(std::int64_t id,
     if (!idx) return;
     const auto prevName = loopModel_->loops()[*idx].name;
     if (prevName == name) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::RenameLoop{id, prevName});
-    }
+    pushUndoEntry(undo::RenameLoop{id, prevName});
     loopModel_->rename(id, std::move(name));
     FLOG_DEBUG("ui.score",
                "rename-loop id={} via=dock-name", id);
@@ -1644,10 +1680,7 @@ void MainWindow::onDockLoopRangeEditRequested(std::int64_t id,
     const auto prevStartMs = l.startMs;
     const auto prevEndMs   = l.endMs;
     if (prevStartMs == newStartMs && prevEndMs == newEndMs) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(
-            undo::EditLoopRange{id, prevStartMs, prevEndMs});
-    }
+    pushUndoEntry(undo::EditLoopRange{id, prevStartMs, prevEndMs});
     loopModel_->setRange(id, newStartMs, newEndMs);
     FLOG_DEBUG("ui.score",
                "edit-loop-range id={} from=[{},{}] to=[{},{}] via=dock-spinbox",
@@ -1840,6 +1873,37 @@ void MainWindow::updatePosition() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    // Close-with-dirty prompt (#26). Skip in the offscreen Qt
+    // platform used by the test suite — there's no user to
+    // click the modal, so a dirty-on-close would hang ctest.
+    // Production runs the platform plugin Qt picked for the
+    // user's desktop (xcb/wayland/cocoa/windows).
+    const bool isOffscreen =
+        qEnvironmentVariable("QT_QPA_PLATFORM")
+            .compare(QStringLiteral("offscreen"), Qt::CaseInsensitive) == 0;
+    if (dirty_ && !suppressCloseDirtyPrompt_ && !isOffscreen) {
+        const auto pick = QMessageBox::question(
+            this, tr("Unsaved changes"),
+            tr("This project has unsaved changes. Save before "
+               "closing?"),
+            QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
+            QMessageBox::Save);
+        if (pick == QMessageBox::Cancel) {
+            event->ignore();
+            return;
+        }
+        if (pick == QMessageBox::Save) {
+            // onSave routes to Save As if no path is bound. If the
+            // user cancels the Save As dialog, the project is still
+            // dirty — abort the close so they can decide again.
+            onSave();
+            if (dirty_) {
+                event->ignore();
+                return;
+            }
+        }
+        // Discard falls through to the normal close path.
+    }
     FLOG_DEBUG("ui.file", "close");
     saveLayout();
     QMainWindow::closeEvent(event);
@@ -1965,19 +2029,231 @@ void MainWindow::onPrerollChanged() {
     if (!prerollBox_) return;
     const int newMs = prerollBox_->value();
     if (newMs == prerollMs_) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(undo::EditPrerollMs{prerollMs_});
-    }
+    pushUndoEntry(undo::EditPrerollMs{prerollMs_});
     setPrerollMs(newMs);
 }
 
 void MainWindow::onPrerollEnabledToggled(bool enabled) {
     if (enabled == prerollEnabled_) return;
-    if (!applyingUndo_) {
-        undoHistory_.emplace_back(
-            undo::EditPrerollEnabled{prerollEnabled_});
-    }
+    pushUndoEntry(undo::EditPrerollEnabled{prerollEnabled_});
     setPrerollEnabled(enabled);
+}
+
+// ---- project save / load (#26) -----------------------------------------
+
+namespace {
+// MEMO[#26]: QMessageBox::warning blocks on exec() in offscreen
+// Qt — the same platform the test suite uses. Routing through
+// this helper makes the error-path code paths testable: tests
+// observe the bool return from save/openProject instead of
+// driving a modal that has no one to click.
+bool isOffscreenPlatform() {
+    return qEnvironmentVariable("QT_QPA_PLATFORM")
+        .compare(QStringLiteral("offscreen"), Qt::CaseInsensitive) == 0;
+}
+
+void showWarning(QWidget* parent, const QString& title,
+                 const QString& text)
+{
+    if (isOffscreenPlatform()) return;
+    QMessageBox::warning(parent, title, text);
+}
+} // namespace
+
+void MainWindow::recomputeDirty() {
+    // MEMO[#26 smoke]: pre-fix dirty was set sticky-true on the
+    // first edit and only cleared on save. The user reported that
+    // undoing back to the saved state didn't clear the asterisk —
+    // surprising, because their mental model is "* = diverges from
+    // saved state". The disjunction below restores that invariant:
+    // dirty is true when either the undo history has more (or
+    // fewer) entries than at save time, or a non-undoable change
+    // (tune-type pick today) has happened since save.
+    const bool isDirty =
+        (undoHistory_.size() != savedUndoSize_) || nonUndoableDirty_;
+    if (isDirty == dirty_) return;
+    dirty_ = isDirty;
+    updateWindowTitle();
+}
+
+void MainWindow::markClean() {
+    // Snapshot the current state as the new saved baseline.
+    // Subsequent recomputes return false until a real change
+    // diverges from this snapshot.
+    savedUndoSize_     = undoHistory_.size();
+    nonUndoableDirty_  = false;
+    recomputeDirty();
+}
+
+void MainWindow::pushUndoEntry(undo::Entry entry) {
+    if (applyingUndo_) return;
+    undoHistory_.push_back(std::move(entry));
+    recomputeDirty();
+}
+
+void MainWindow::updateWindowTitle() {
+    // Three states. No project bound: bare "Fiddler". Bound +
+    // clean: "Fiddler — basename". Bound + dirty: prepend "* ".
+    if (projectPath_.isEmpty()) {
+        setWindowTitle(dirty_ ? tr("* Fiddler") : tr("Fiddler"));
+        return;
+    }
+    const QString base = QFileInfo(projectPath_).fileName();
+    setWindowTitle(dirty_
+                   ? tr("* Fiddler — %1").arg(base)
+                   : tr("Fiddler — %1").arg(base));
+}
+
+void MainWindow::onSave() {
+    if (projectPath_.isEmpty()) {
+        onSaveAs();
+        return;
+    }
+    saveProject(projectPath_);
+}
+
+void MainWindow::onSaveAs() {
+    // Default suggestion: <audio-without-ext>.fdlp next to the
+    // audio file. Mirrors the Logic/Ableton convention of
+    // sidecar projects with their own extension.
+    QString suggested;
+    if (!projectPath_.isEmpty()) {
+        suggested = projectPath_;
+    } else if (!currentAudioPath_.isEmpty()) {
+        const QFileInfo info(currentAudioPath_);
+        suggested = info.absolutePath() + "/" + info.completeBaseName() + ".fdlp";
+    }
+    const QString path = QFileDialog::getSaveFileName(
+        this, tr("Save Fiddler project"),
+        suggested,
+        tr("Fiddler project (*.fdlp)"));
+    if (path.isEmpty()) return;
+    saveProject(path);
+}
+
+bool MainWindow::saveProject(const QString& path) {
+    QJsonObject root;
+    root["version"]       = score::kProjectFormatVersion;
+    root["audioPath"]     = currentAudioPath_;
+    root["timeSignature"] = score::toJson(barlineModel_->timeSignature());
+    QJsonObject preroll;
+    preroll["enabled"] = prerollEnabled_;
+    preroll["ms"]      = prerollMs_;
+    root["preroll"]   = preroll;
+    root["barlines"]  = score::toJson(*barlineModel_);
+    root["markers"]   = score::toJson(*markerModel_);
+    root["loops"]     = score::toJson(*loopModel_);
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        showWarning(this, tr("Save failed"),
+            tr("Could not open %1 for writing:\n%2")
+                .arg(path).arg(f.errorString()));
+        FLOG_WARN("ui.file", "save: failed path={} reason={}",
+                  path.toStdString(), f.errorString().toStdString());
+        return false;
+    }
+    const QJsonDocument doc(root);
+    f.write(doc.toJson(QJsonDocument::Indented));
+    f.close();
+
+    projectPath_ = path;
+    markClean();
+    updateWindowTitle();
+    FLOG_DEBUG("ui.file", "save: path={} barlines={} markers={} loops={}",
+               path.toStdString(),
+               barlineModel_->size(),
+               markerModel_->size(),
+               loopModel_->size());
+    return true;
+}
+
+bool MainWindow::openProject(const QString& path) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        showWarning(this, tr("Open failed"),
+            tr("Could not open %1:\n%2")
+                .arg(path).arg(f.errorString()));
+        FLOG_WARN("ui.file", "open-project: failed path={} reason={}",
+                  path.toStdString(), f.errorString().toStdString());
+        return false;
+    }
+    QJsonParseError err{};
+    const auto doc = QJsonDocument::fromJson(f.readAll(), &err);
+    f.close();
+    if (doc.isNull() || !doc.isObject()) {
+        showWarning(this, tr("Open failed"),
+            tr("%1 is not a valid Fiddler project (line %2: %3)")
+                .arg(path).arg(err.offset).arg(err.errorString()));
+        FLOG_WARN("ui.file", "open-project: malformed path={} reason={}",
+                  path.toStdString(), err.errorString().toStdString());
+        return false;
+    }
+    const auto root = doc.object();
+    const int ver = root.value("version").toInt(0);
+    if (ver < 1 || ver > score::kProjectFormatVersion) {
+        showWarning(this, tr("Open failed"),
+            tr("%1 was saved by a newer Fiddler "
+               "(format version %2). Please upgrade.")
+                .arg(path).arg(ver));
+        return false;
+    }
+
+    // Load the audio file first — loadFile clears the models, so
+    // anything we put in them BEFORE loadFile would be wiped out.
+    const QString audioPath = root.value("audioPath").toString();
+    if (!audioPath.isEmpty() && !loadFile(audioPath)) {
+        showWarning(this, tr("Audio missing"),
+            tr("The audio file referenced by this project "
+               "could not be opened:\n%1\n\n"
+               "The project's annotations have been loaded; "
+               "playback is unavailable.").arg(audioPath));
+        // Continue — partial open is more useful than failure.
+        // Models are clean (loadFile cleared them) and we'll
+        // populate them next.
+    }
+
+    // Populate models from JSON.
+    if (!score::loadFrom(*barlineModel_,
+                         root.value("barlines").toArray())
+        || !score::loadFrom(*markerModel_,
+                            root.value("markers").toArray())
+        || !score::loadFrom(*loopModel_,
+                            root.value("loops").toArray())) {
+        showWarning(this, tr("Open failed"),
+            tr("%1 contains malformed entries; "
+               "loading was aborted.").arg(path));
+        barlineModel_->clear();
+        markerModel_->clear();
+        loopModel_->clear();
+        return false;
+    }
+    // Time signature + pre-roll.
+    barlineModel_->setTimeSignature(
+        score::timeSignatureFromJson(
+            root.value("timeSignature").toObject()));
+    const auto preroll = root.value("preroll").toObject();
+    if (preroll.value("ms").isDouble()) {
+        setPrerollMs(preroll.value("ms").toInt());
+    }
+    if (preroll.value("enabled").isBool()) {
+        setPrerollEnabled(preroll.value("enabled").toBool());
+    }
+
+    // Drop the undo history — Ctrl+Z doesn't reach across a project
+    // load. Matches the "fresh start" mental model.
+    undoHistory_.clear();
+
+    projectPath_ = path;
+    markClean();
+    updateWindowTitle();
+    FLOG_DEBUG("ui.file",
+               "open-project: path={} audio={} barlines={} markers={} loops={}",
+               path.toStdString(), audioPath.toStdString(),
+               barlineModel_->size(),
+               markerModel_->size(),
+               loopModel_->size());
+    return true;
 }
 
 } // namespace fiddler::ui
