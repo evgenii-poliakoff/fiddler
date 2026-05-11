@@ -184,6 +184,12 @@ A *Fiddler project* is the audio file path plus everything you've placed on top 
 - **File ▸ Save As…** (**Ctrl+Shift+S**) — picks a new path. Default suggestion is the audio file's name with a `.fdlp` extension.
 - **File ▸ Open…** (**Ctrl+O**) — opens an audio file *or* a `.fdlp` project. The file dialog filter shows both kinds.
 
+### Open Recent
+
+**File ▸ Open Recent** lists the ten most-recently-opened files — both audio and `.fdlp` projects — in most-recent-first order. Picking an entry opens it the same way the file dialog would; the entry then jumps to the front of the list. If the file has moved or been deleted since you last opened it, you'll see a *File not found* dialog and the entry drops off the list automatically.
+
+The submenu is dimmed when nothing has been opened yet. **Clear Recent Files** at the bottom empties the list.
+
 When a project is loaded, the window title shows its filename: *Fiddler — tune.fdlp*. An asterisk in front of the title — *\* Fiddler — tune.fdlp* — means the session has unsaved changes. Save with **Ctrl+S** to clear the asterisk.
 
 Note that closing the window with unsaved changes prompts you to save first; pick *Discard* to lose the changes, *Cancel* to keep the window open.

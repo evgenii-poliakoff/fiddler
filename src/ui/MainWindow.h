@@ -6,6 +6,7 @@
 #include "ui/UndoEntry.h"
 
 #include <QMainWindow>
+#include <QStringList>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -20,8 +21,8 @@ class QPushButton;
 class QSpinBox;
 class QSlider;
 class QLabel;
+class QMenu;
 class QShortcut;
-class QString;
 class QTimer;
 
 namespace fiddler::audio { class Player; }
@@ -56,6 +57,18 @@ public:
     // suffix.
     bool saveProject(const QString& path);
     bool openProject(const QString& path);
+
+    // Open Recent dispatch (#43). Looks at the path's suffix and
+    // routes to openProject (.fdlp) or loadFile (anything else).
+    // On success the path is prepended to the MRU list in
+    // QSettings (cap 10, deduped). On a missing-file the entry
+    // is dropped from the MRU and a warning shown. Public so
+    // tests drive recent-file picks the same way the menu does.
+    bool openByPath(const QString& path);
+
+    // Read-only view of the persisted MRU list. Test seam.
+    [[nodiscard]] QStringList recentFiles() const;
+    void clearRecentFiles();
 
     // Read-only access to the audio engine. Used by integration tests
     // to verify that UI events (clicks, slider moves) propagate
@@ -194,6 +207,17 @@ private:
     //     pushUndoEntry(undo::AddBarline{pos});
     // instead of the four-line if/emplace/recompute block.
     void pushUndoEntry(undo::Entry entry);
+
+    // Recent files (#43). pushRecentFile prepends, dedupes, and
+    // truncates to kMaxRecentFiles; called only from successful
+    // loadFile / openProject paths. rebuildRecentFilesMenu repopulates
+    // the submenu from QSettings + binds a one-per-item action that
+    // calls openByPath. Slot so QMenu::aboutToShow can wire to it.
+    static constexpr int kMaxRecentFiles = 10;
+    void pushRecentFile(const QString& path);
+
+private slots:
+    void rebuildRecentFilesMenu();
 
 private slots:
     void onPlayPause();
@@ -367,6 +391,12 @@ private:
     QAction*        openAction_     = nullptr;
     QAction*        saveAction_     = nullptr;
     QAction*        saveAsAction_   = nullptr;
+
+    // Open Recent submenu (#43). Populated lazily from
+    // QSettings(mainwindow/recentFiles) on every aboutToShow, so
+    // a recent-files update via openByPath() is picked up without
+    // any explicit rebuild from the open call sites.
+    QMenu*          recentFilesMenu_ = nullptr;
     QPushButton*    playButton_     = nullptr;
     QPushButton*    stopButton_     = nullptr;
     QSlider*        positionSlider_ = nullptr;

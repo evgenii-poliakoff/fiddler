@@ -118,6 +118,26 @@ constexpr std::array<TuneTypePreset, 10> kTuneTypePresets = {{
     { "Mazurka (3/4)",    "Mazurka",     3, 4 },
 }};
 
+// MEMO[#26]: QMessageBox::warning blocks on exec() in offscreen
+// Qt — the same platform the test suite uses. Routing through
+// this helper makes the error-path code paths testable: tests
+// observe the bool return from save/openProject instead of
+// driving a modal that has no one to click. Lives in the
+// top-level anonymous namespace so the helper is visible to
+// open* / save* call sites throughout the TU (#43 needs it
+// from openByPath, which sits above the project-save section).
+bool isOffscreenPlatform() {
+    return qEnvironmentVariable("QT_QPA_PLATFORM")
+        .compare(QStringLiteral("offscreen"), Qt::CaseInsensitive) == 0;
+}
+
+void showWarning(QWidget* parent, const QString& title,
+                 const QString& text)
+{
+    if (isOffscreenPlatform()) return;
+    QMessageBox::warning(parent, title, text);
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -264,6 +284,17 @@ void MainWindow::buildMenus() {
 
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
     fileMenu->addAction(openAction_);
+
+    // Open Recent (#43). objectName lets integration tests locate
+    // the submenu without walking the menu by index.
+    recentFilesMenu_ = fileMenu->addMenu(tr("Open &Recent"));
+    recentFilesMenu_->menuAction()->setObjectName("openRecentMenu");
+    connect(recentFilesMenu_, &QMenu::aboutToShow,
+            this, &MainWindow::rebuildRecentFilesMenu);
+    // Build once now so the submenu's enabled state is right
+    // before the user even pops it open.
+    rebuildRecentFilesMenu();
+
     fileMenu->addSeparator();
     fileMenu->addAction(saveAction_);
     fileMenu->addAction(saveAsAction_);
@@ -585,15 +616,122 @@ void MainWindow::onOpenFile() {
         return;
     }
 
-    if (path.endsWith(".fdlp", Qt::CaseInsensitive)) {
-        openProject(path);
-        return;
+    openByPath(path);
+}
+
+bool MainWindow::openByPath(const QString& path) {
+    // Single dispatch helper shared by onOpenFile and the Open
+    // Recent submenu (#43). Routes on suffix, surfaces a warning
+    // for missing audio / corrupted projects, prunes the MRU on
+    // missing-file. openProject / loadFile handle their own
+    // "open failed" warnings; we layer the MRU bookkeeping on top.
+    const QString absolute = QFileInfo(path).absoluteFilePath();
+
+    if (!QFileInfo::exists(absolute)) {
+        showWarning(this, tr("File not found"),
+            tr("This file is no longer available:\n%1").arg(absolute));
+        FLOG_WARN("ui.file", "open-recent: missing path={}",
+                  absolute.toStdString());
+        // Drop the dead entry from the MRU so the user isn't
+        // offered it again next time the menu opens.
+        QSettings settings;
+        QStringList recent = settings.value(
+            QStringLiteral("mainwindow/recentFiles")).toStringList();
+        if (recent.removeAll(absolute) > 0) {
+            settings.setValue(
+                QStringLiteral("mainwindow/recentFiles"), recent);
+        }
+        return false;
     }
 
-    if (!loadFile(path)) {
-        QMessageBox::warning(this, tr("Open failed"),
-            tr("Could not open: %1").arg(path));
+    bool ok = false;
+    if (absolute.endsWith(QStringLiteral(".fdlp"), Qt::CaseInsensitive)) {
+        ok = openProject(absolute);
+    } else {
+        ok = loadFile(absolute);
+        if (!ok) {
+            showWarning(this, tr("Open failed"),
+                tr("Could not open: %1").arg(absolute));
+        }
     }
+
+    if (ok) {
+        pushRecentFile(absolute);
+    }
+    return ok;
+}
+
+void MainWindow::pushRecentFile(const QString& path) {
+    QSettings settings;
+    QStringList recent = settings.value(
+        QStringLiteral("mainwindow/recentFiles")).toStringList();
+    // Dedupe by exact path; the absolute form was canonicalised by
+    // the caller (openByPath uses QFileInfo::absoluteFilePath).
+    recent.removeAll(path);
+    recent.prepend(path);
+    while (recent.size() > kMaxRecentFiles) {
+        recent.removeLast();
+    }
+    settings.setValue(QStringLiteral("mainwindow/recentFiles"), recent);
+    FLOG_DEBUG("ui.file", "recent: push path={} size={}",
+               path.toStdString(), recent.size());
+
+    // MEMO[#43 smoke]: when the MRU starts empty, the submenu is
+    // disabled — and a disabled QMenu never fires aboutToShow, so
+    // pushes during this session would have stayed invisible until
+    // the next launch. Re-running the build here flips the menu to
+    // enabled and populates the entries immediately.
+    if (recentFilesMenu_) {
+        rebuildRecentFilesMenu();
+    }
+}
+
+QStringList MainWindow::recentFiles() const {
+    QSettings settings;
+    return settings.value(
+        QStringLiteral("mainwindow/recentFiles")).toStringList();
+}
+
+void MainWindow::clearRecentFiles() {
+    QSettings settings;
+    settings.remove(QStringLiteral("mainwindow/recentFiles"));
+    if (recentFilesMenu_) {
+        rebuildRecentFilesMenu();
+    }
+    FLOG_DEBUG("ui.file", "recent: cleared");
+}
+
+void MainWindow::rebuildRecentFilesMenu() {
+    if (!recentFilesMenu_) return;
+    recentFilesMenu_->clear();
+
+    const QStringList recent = recentFiles();
+    if (recent.isEmpty()) {
+        recentFilesMenu_->setEnabled(false);
+        return;
+    }
+    recentFilesMenu_->setEnabled(true);
+
+    for (const QString& path : recent) {
+        const QString filename = QFileInfo(path).fileName();
+        auto* action = recentFilesMenu_->addAction(filename);
+        action->setToolTip(path);
+        // Toolbutton-style tooltips don't show on menu items by
+        // default; status-tip lights up the status bar so the user
+        // still sees the full path on hover.
+        action->setStatusTip(path);
+        connect(action, &QAction::triggered, this, [this, path]() {
+            FLOG_DEBUG("ui.file", "open-recent: pick path={}",
+                       path.toStdString());
+            openByPath(path);
+        });
+    }
+
+    recentFilesMenu_->addSeparator();
+    auto* clearAction = recentFilesMenu_->addAction(tr("&Clear Recent Files"));
+    clearAction->setObjectName("clearRecentFilesAction");
+    connect(clearAction, &QAction::triggered,
+            this, &MainWindow::clearRecentFiles);
 }
 
 bool MainWindow::loadFile(const QString& path) {
@@ -2051,25 +2189,6 @@ void MainWindow::onPrerollEnabledToggled(bool enabled) {
 }
 
 // ---- project save / load (#26) -----------------------------------------
-
-namespace {
-// MEMO[#26]: QMessageBox::warning blocks on exec() in offscreen
-// Qt — the same platform the test suite uses. Routing through
-// this helper makes the error-path code paths testable: tests
-// observe the bool return from save/openProject instead of
-// driving a modal that has no one to click.
-bool isOffscreenPlatform() {
-    return qEnvironmentVariable("QT_QPA_PLATFORM")
-        .compare(QStringLiteral("offscreen"), Qt::CaseInsensitive) == 0;
-}
-
-void showWarning(QWidget* parent, const QString& title,
-                 const QString& text)
-{
-    if (isOffscreenPlatform()) return;
-    QMessageBox::warning(parent, title, text);
-}
-} // namespace
 
 void MainWindow::recomputeDirty() {
     // MEMO[#26 smoke]: pre-fix dirty was set sticky-true on the
