@@ -2,16 +2,23 @@
 
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
+#include "score/Pitch.h"
 #include "ui/LoopCountdownWidget.h"
+#include "util/Log.h"
 
+#include <QApplication>
 #include <QCheckBox>
+#include <QFocusEvent>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
+#include <QPushButton>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTreeWidget>
@@ -33,11 +40,13 @@ namespace {
 // kLoopIdRole.
 constexpr int kMarkerIdRole = Qt::UserRole + 1;
 constexpr int kLoopIdRole   = Qt::UserRole + 2;
+constexpr int kNoteIdRole   = Qt::UserRole + 3;
 
 // Property-stack page indices.
 constexpr int kPageNoSelection = 0;
 constexpr int kPageMarker      = 1;
 constexpr int kPageLoop        = 2;
+constexpr int kPageNote        = 3;
 
 // Glyph prefix for the armed loop's tree row. Plain ASCII (▶ would
 // also work but the play-symbol arrow looks busier next to other
@@ -88,6 +97,11 @@ void ProjectViewerDock::buildUi() {
     loopsCategory_->setFlags(Qt::ItemIsEnabled);     // not selectable
     loopsCategory_->setExpanded(true);
 
+    notesCategory_ = new QTreeWidgetItem(tree_);
+    notesCategory_->setText(0, tr("Notes"));
+    notesCategory_->setFlags(Qt::ItemIsEnabled);     // not selectable
+    notesCategory_->setExpanded(true);
+
     connect(tree_, &QTreeWidget::currentItemChanged,
             this,  &ProjectViewerDock::onTreeCurrentItemChanged);
     connect(tree_, &QTreeWidget::itemDoubleClicked,
@@ -106,7 +120,8 @@ void ProjectViewerDock::buildUi() {
         auto* l    = new QVBoxLayout(page);
         l->setContentsMargins(4, 4, 4, 4);
         auto* hint = new QLabel(
-            tr("Select a marker or loop above to view its properties."),
+            tr("Select a marker, loop, or note above "
+               "to view its properties."),
             page);
         hint->setEnabled(false);
         l->addWidget(hint);
@@ -216,8 +231,97 @@ void ProjectViewerDock::buildUi() {
         propertyStack_->insertWidget(kPageLoop, page);
     }
 
+    // Page 3: note properties — pitch (SPN + MIDI label), start,
+    // end, duration. There is intentionally NO Name field: top-level
+    // notation apps (MuseScore / Sibelius / MusicXML / ABC) don't
+    // name individual notes; the NoteModel::name field is kept for
+    // forward compatibility (annotations / fingerings) but isn't
+    // exposed in the property page.
+    {
+        auto* page = new QWidget(propertyStack_);
+        auto* form = new QFormLayout(page);
+        form->setContentsMargins(4, 4, 4, 4);
+
+        // MEMO: pitch is entered as Scientific Pitch Notation ("A4",
+        // "F#5") because a fiddler thinks in note names, not MIDI
+        // numbers. The MIDI number is shown as a read-only secondary
+        // label so the user has the conversion at hand if they want
+        // it. Same dual presentation Logic / MuseScore use.
+        auto* pitchRow = new QWidget(page);
+        auto* pitchRowLayout = new QHBoxLayout(pitchRow);
+        pitchRowLayout->setContentsMargins(0, 0, 0, 0);
+        notePitchEdit_ = new QLineEdit(pitchRow);
+        notePitchEdit_->setObjectName("notePitchEdit");
+        notePitchEdit_->setPlaceholderText(tr("e.g. A4"));
+        notePitchEdit_->installEventFilter(this);
+        connect(notePitchEdit_, &QLineEdit::editingFinished,
+                this,           &ProjectViewerDock::onNotePitchEdited);
+        notePitchMidiLabel_ = new QLabel(QString(), pitchRow);
+        notePitchMidiLabel_->setObjectName("notePitchMidiLabel");
+        notePitchMidiLabel_->setEnabled(false);
+        pitchRowLayout->addWidget(notePitchEdit_, /*stretch=*/1);
+        pitchRowLayout->addWidget(notePitchMidiLabel_);
+        form->addRow(tr("Pitch:"), pitchRow);
+
+        noteStartBox_ = new QSpinBox(page);
+        noteStartBox_->setObjectName("noteStartBox");
+        noteStartBox_->setRange(0, INT_MAX);
+        noteStartBox_->setSuffix(tr(" ms"));
+        noteStartBox_->installEventFilter(this);
+        if (auto* inner = noteStartBox_->findChild<QLineEdit*>()) {
+            inner->installEventFilter(this);
+        }
+        connect(noteStartBox_, &QSpinBox::editingFinished,
+                this, &ProjectViewerDock::onNoteStartEdited);
+        form->addRow(tr("Start:"), noteStartBox_);
+
+        noteEndBox_ = new QSpinBox(page);
+        noteEndBox_->setObjectName("noteEndBox");
+        noteEndBox_->setRange(1, INT_MAX);
+        noteEndBox_->setSuffix(tr(" ms"));
+        noteEndBox_->installEventFilter(this);
+        if (auto* inner = noteEndBox_->findChild<QLineEdit*>()) {
+            inner->installEventFilter(this);
+        }
+        connect(noteEndBox_, &QSpinBox::editingFinished,
+                this, &ProjectViewerDock::onNoteEndEdited);
+        form->addRow(tr("End:"), noteEndBox_);
+
+        noteDurationLabel_ = new QLabel(QString(), page);
+        noteDurationLabel_->setObjectName("noteDurationLabel");
+        noteDurationLabel_->setEnabled(false);
+        form->addRow(tr("Duration:"), noteDurationLabel_);
+
+        propertyStack_->insertWidget(kPageNote, page);
+    }
+
     propertyStack_->setCurrentIndex(kPageNoSelection);
     layout->addWidget(propertyStack_);
+
+    // Single multi-mode button for note placement / editing. Its
+    // label cycles among three modes — see the noteBuffer_ MEMO in
+    // the header. Initial label is "New Note ..." (Empty mode);
+    // disabled until a NoteModel is attached.
+    addNoteButton_ = new QPushButton(tr("New Note ..."), root);
+    addNoteButton_->setObjectName("addNoteButton");
+    addNoteButton_->setEnabled(false);
+    connect(addNoteButton_, &QPushButton::clicked,
+            this,           &ProjectViewerDock::onAddNoteClicked);
+    // Press is logged separately from clicked so a phantom-click
+    // (e.g. one that fires without a mouse-down) is visible in the
+    // log as a missing "press" before its "clicked".
+    connect(addNoteButton_, &QPushButton::pressed,
+            this, [this]() {
+                FLOG_DEBUG("ui.dock",
+                           "add-note-press has-model={} "
+                           "current-focus-widget={}",
+                           noteModel_ != nullptr,
+                           QApplication::focusWidget()
+                             ? QApplication::focusWidget()
+                                  ->objectName().toStdString()
+                             : std::string("none"));
+            });
+    layout->addWidget(addNoteButton_);
 
     // ---- Global pre-roll countdown -------------------------------------
     // MEMO: the countdown widget used to live inside the loop
@@ -289,6 +393,36 @@ void ProjectViewerDock::setLoopModel(
     refreshPropertyPage();
 }
 
+void ProjectViewerDock::setNoteModel(
+    std::shared_ptr<score::NoteModel> model)
+{
+    FLOG_DEBUG("ui.dock",
+               "set-note-model attach={} prev-attached={} "
+               "prev-selected-id={}",
+               model != nullptr, noteModel_ != nullptr,
+               selectedNoteId_.value_or(-1));
+    if (noteModel_) {
+        disconnect(noteModel_.get(), nullptr, this, nullptr);
+    }
+    noteModel_ = std::move(model);
+    if (noteModel_) {
+        connect(noteModel_.get(), &score::NoteModel::changed,
+                this, &ProjectViewerDock::onNoteModelChanged);
+    }
+    if (selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
+    // Detaching the model drops any pending draft / editing buffer
+    // since it has nothing to commit against.
+    noteBuffer_.reset();
+    if (addNoteButton_) {
+        addNoteButton_->setEnabled(noteModel_ != nullptr);
+    }
+    rebuildNoteSection();
+    refreshPropertyPage();
+}
+
 void ProjectViewerDock::setSelectedMarkerId(
     std::optional<std::int64_t> id)
 {
@@ -299,13 +433,17 @@ void ProjectViewerDock::setSelectedMarkerId(
         id = std::nullopt;
     }
     // MEMO: cross-kind mutual exclusion in the dock — selecting a
-    // marker clears any active loop selection. MainWindow's mirror
-    // plumbing already enforces this for the score widgets; the
-    // dock has to enforce it locally too because the tree is the
-    // origin of selection events when the user clicks a row.
+    // marker clears any active loop / note selection. MainWindow's
+    // mirror plumbing already enforces this for the score widgets;
+    // the dock has to enforce it locally too because the tree is
+    // the origin of selection events when the user clicks a row.
     if (id.has_value() && selectedLoopId_.has_value()) {
         selectedLoopId_.reset();
         emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (id.has_value() && selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
     }
     if (selectedMarkerId_ == id) {
         // Even on a no-op marker selection we may still need to
@@ -347,6 +485,10 @@ void ProjectViewerDock::setSelectedLoopId(
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
+    if (id.has_value() && selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
     if (selectedLoopId_ == id) {
         refreshPropertyPage();
         return;
@@ -366,6 +508,60 @@ void ProjectViewerDock::setSelectedLoopId(
 
     refreshPropertyPage();
     emit loopSelectionChanged(selectedLoopId_);
+}
+
+void ProjectViewerDock::setSelectedNoteId(
+    std::optional<std::int64_t> id)
+{
+    const std::int64_t requestedRaw = id.value_or(-1);
+    if (id.has_value() && noteModel_
+        && !noteModel_->indexOf(*id).has_value()) {
+        FLOG_DEBUG("ui.dock",
+                   "set-selected-note-id={} coerced=stale-id has-model={}",
+                   requestedRaw, noteModel_ != nullptr);
+        id = std::nullopt;
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (selectedNoteId_ == id) {
+        FLOG_DEBUG("ui.dock",
+                   "set-selected-note-id={} no-op-equal",
+                   requestedRaw);
+        refreshPropertyPage();
+        return;
+    }
+    FLOG_DEBUG("ui.dock",
+               "set-selected-note-id new={} prev={}",
+               id.value_or(-1), selectedNoteId_.value_or(-1));
+    selectedNoteId_ = id;
+    // State-machine: a non-null selection enters Editing mode with
+    // a buffer populated from the model. A null selection exits to
+    // Empty (clears any active buffer — including a pending draft).
+    if (id.has_value()) {
+        populateBufferFromModel(*id);
+    } else {
+        noteBuffer_.reset();
+    }
+
+    const QSignalBlocker treeBlock(tree_);
+    if (id.has_value()) {
+        if (auto* item = findNoteItem(*id)) {
+            tree_->setCurrentItem(item);
+        } else {
+            tree_->setCurrentItem(nullptr);
+        }
+    } else {
+        tree_->setCurrentItem(nullptr);
+    }
+
+    refreshPropertyPage();
+    emit noteSelectionChanged(selectedNoteId_);
 }
 
 void ProjectViewerDock::startCountdown(int totalMs) {
@@ -447,6 +643,38 @@ void ProjectViewerDock::onLoopModelChanged() {
     refreshPropertyPage();
 }
 
+void ProjectViewerDock::onNoteModelChanged() {
+    FLOG_DEBUG("ui.dock",
+               "note-model-changed size={} selected-id={} buffer-id={}",
+               noteModel_ ? noteModel_->size() : 0,
+               selectedNoteId_.value_or(-1),
+               noteBuffer_.has_value() ? noteBuffer_->id : -1);
+    // setInterval / setPitch keep the same ID; only remove drops
+    // selection.
+    if (selectedNoteId_.has_value() && noteModel_
+        && !noteModel_->indexOf(*selectedNoteId_).has_value())
+    {
+        FLOG_DEBUG("ui.dock",
+                   "note-model-changed cleared-selection id={} reason=removed",
+                   *selectedNoteId_);
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
+    // If we're editing an existing note and it's been removed from
+    // the model (e.g. via undo of an add), drop the buffer too. A
+    // draft (buffer.id == 0) is not tied to the model and survives.
+    if (noteBuffer_.has_value() && noteBuffer_->id > 0 && noteModel_
+        && !noteModel_->indexOf(noteBuffer_->id).has_value())
+    {
+        FLOG_DEBUG("ui.dock",
+                   "note-model-changed dropped-buffer id={} reason=removed",
+                   noteBuffer_->id);
+        noteBuffer_.reset();
+    }
+    rebuildNoteSection();
+    refreshPropertyPage();
+}
+
 void ProjectViewerDock::rebuildMarkerSection() {
     // MEMO: block tree signals during the rebuild. Without this,
     // deleting the currently-selected QTreeWidgetItem fires
@@ -524,6 +752,56 @@ void ProjectViewerDock::rebuildLoopSection() {
         if (auto* item = findMarkerItem(*selectedMarkerId_)) {
             tree_->setCurrentItem(item);
         }
+    } else if (selectedNoteId_.has_value()) {
+        if (auto* item = findNoteItem(*selectedNoteId_)) {
+            tree_->setCurrentItem(item);
+        }
+    }
+}
+
+void ProjectViewerDock::rebuildNoteSection() {
+    const QSignalBlocker rebuildBlock(tree_);
+
+    const int prevChildCount = notesCategory_->childCount();
+    while (notesCategory_->childCount() > 0) {
+        delete notesCategory_->takeChild(0);
+    }
+    if (noteModel_) {
+        for (const auto& n : noteModel_->notes()) {
+            auto* item = new QTreeWidgetItem(notesCategory_);
+            // Row label: "<SPN>   (<startMs>–<endMs> ms)" — no
+            // "Note N" prefix, matching notation conventions
+            // (notes are anonymous; identity is pitch + time).
+            const QString spn = score::midiToSpn(n.midi);
+            item->setText(0, QString("%1   (%2–%3 ms)")
+                                .arg(spn)
+                                .arg(n.startMs)
+                                .arg(n.endMs));
+            item->setData(0, kNoteIdRole,
+                          QVariant::fromValue<std::int64_t>(n.id));
+        }
+        notesCategory_->setExpanded(true);
+    }
+    FLOG_DEBUG("ui.dock",
+               "rebuild-note-section prev-rows={} new-rows={} "
+               "selected-id={}",
+               prevChildCount,
+               notesCategory_->childCount(),
+               selectedNoteId_.value_or(-1));
+
+    // Same selection re-apply pattern as the other rebuild helpers.
+    if (selectedNoteId_.has_value()) {
+        if (auto* item = findNoteItem(*selectedNoteId_)) {
+            tree_->setCurrentItem(item);
+        }
+    } else if (selectedMarkerId_.has_value()) {
+        if (auto* item = findMarkerItem(*selectedMarkerId_)) {
+            tree_->setCurrentItem(item);
+        }
+    } else if (selectedLoopId_.has_value()) {
+        if (auto* item = findLoopItem(*selectedLoopId_)) {
+            tree_->setCurrentItem(item);
+        }
     }
 }
 
@@ -561,7 +839,111 @@ void ProjectViewerDock::refreshPropertyPage() {
             return;
         }
     }
+    // Note property page — driven by noteBuffer_, not the model.
+    // The buffer is set in NewDraft / Editing modes; in Empty mode
+    // the page goes back to "no selection".
+    if (noteBuffer_.has_value()) {
+        const auto& buf = *noteBuffer_;
+        updatingPropertyPage_ = true;
+        notePitchEdit_->setText(score::midiToSpn(buf.midi));
+        notePitchMidiLabel_->setText(tr("(MIDI %1)").arg(buf.midi));
+        noteEndBox_->setMinimum(static_cast<int>(buf.startMs) + 1);
+        noteStartBox_->setValue(static_cast<int>(buf.startMs));
+        noteEndBox_->setValue(static_cast<int>(buf.endMs));
+        noteStartBox_->setMaximum(static_cast<int>(buf.endMs) - 1);
+        noteDurationLabel_->setText(
+            tr("%1 ms").arg(buf.endMs - buf.startMs));
+        updatingPropertyPage_ = false;
+        propertyStack_->setCurrentIndex(kPageNote);
+        FLOG_DEBUG("ui.dock",
+                   "refresh-property-page page=note buffer-id={} "
+                   "midi={} spn='{}' start={} end={}",
+                   buf.id, buf.midi,
+                   score::midiToSpn(buf.midi).toStdString(),
+                   buf.startMs, buf.endMs);
+        updateAddNoteButtonLabel();
+        return;
+    }
     propertyStack_->setCurrentIndex(kPageNoSelection);
+    FLOG_DEBUG("ui.dock", "refresh-property-page page=no-selection");
+    updateAddNoteButtonLabel();
+}
+
+void ProjectViewerDock::updateAddNoteButtonLabel() {
+    if (!addNoteButton_) return;
+    QString label;
+    if (!noteBuffer_.has_value()) {
+        label = tr("New Note ...");
+    } else if (noteBuffer_->id == 0) {
+        label = tr("Add Note");
+    } else {
+        label = tr("Apply Changes to Note");
+    }
+    if (addNoteButton_->text() != label) {
+        FLOG_DEBUG("ui.dock",
+                   "button-label change to='{}' buffer-id={}",
+                   label.toStdString(),
+                   noteBuffer_.has_value() ? noteBuffer_->id : -1);
+        addNoteButton_->setText(label);
+    }
+}
+
+void ProjectViewerDock::populateBufferFromModel(std::int64_t id) {
+    if (!noteModel_) return;
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) return;
+    const auto& n = noteModel_->notes()[*idx];
+    NoteBuffer buf;
+    buf.id      = n.id;
+    buf.startMs = n.startMs;
+    buf.endMs   = n.endMs;
+    buf.midi    = n.midi;
+    buf.name    = n.name;
+    noteBuffer_ = buf;
+    FLOG_DEBUG("ui.dock",
+               "populate-buffer-from-model id={} start={} end={} midi={}",
+               buf.id, buf.startMs, buf.endMs, buf.midi);
+}
+
+void ProjectViewerDock::enterNoteDraftMode(std::int64_t startMs,
+                                           std::int64_t endMs,
+                                           int          midi) {
+    FLOG_DEBUG("ui.dock",
+               "enter-draft-mode start={} end={} midi={}",
+               startMs, endMs, midi);
+    NoteBuffer buf;
+    buf.id      = 0;                // 0 = draft, not yet in model
+    buf.startMs = startMs;
+    buf.endMs   = endMs;
+    buf.midi    = midi;
+    noteBuffer_ = buf;
+    // Clear any existing selection — draft is exclusive with row
+    // selection.
+    if (selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
+    if (selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    // Move focus to the pitch field so user can start typing pitch
+    // immediately.
+    refreshPropertyPage();
+    if (notePitchEdit_) notePitchEdit_->setFocus();
+}
+
+void ProjectViewerDock::exitNoteMode() {
+    if (!noteBuffer_.has_value()) return;
+    FLOG_DEBUG("ui.dock",
+               "exit-note-mode prev-buffer-id={}",
+               noteBuffer_->id);
+    noteBuffer_.reset();
+    refreshPropertyPage();
 }
 
 QTreeWidgetItem*
@@ -586,6 +968,17 @@ ProjectViewerDock::findLoopItem(std::int64_t id) const {
     return nullptr;
 }
 
+QTreeWidgetItem*
+ProjectViewerDock::findNoteItem(std::int64_t id) const {
+    for (int i = 0; i < notesCategory_->childCount(); ++i) {
+        auto* child = notesCategory_->child(i);
+        if (child->data(0, kNoteIdRole).toLongLong() == id) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
 // ---- ui → model ---------------------------------------------------------
 
 void ProjectViewerDock::onTreeCurrentItemChanged(
@@ -598,11 +991,15 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
     if (current && current->parent() == markersCategory_) {
         std::optional<std::int64_t> newId =
             current->data(0, kMarkerIdRole).toLongLong();
-        // Cross-kind mutual exclusion: if a loop was selected,
-        // clear it before promoting the marker.
+        // Cross-kind mutual exclusion: clear any other-kind
+        // selection before promoting the marker.
         if (selectedLoopId_.has_value()) {
             selectedLoopId_.reset();
             emit loopSelectionChanged(selectedLoopId_);
+        }
+        if (selectedNoteId_.has_value()) {
+            selectedNoteId_.reset();
+            emit noteSelectionChanged(selectedNoteId_);
         }
         if (selectedMarkerId_ != newId) {
             selectedMarkerId_ = newId;
@@ -620,6 +1017,10 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
             selectedMarkerId_.reset();
             emit markerSelectionChanged(selectedMarkerId_);
         }
+        if (selectedNoteId_.has_value()) {
+            selectedNoteId_.reset();
+            emit noteSelectionChanged(selectedNoteId_);
+        }
         if (selectedLoopId_ != newId) {
             selectedLoopId_ = newId;
             refreshPropertyPage();
@@ -629,8 +1030,35 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
         }
         return;
     }
+    if (current && current->parent() == notesCategory_) {
+        std::optional<std::int64_t> newId =
+            current->data(0, kNoteIdRole).toLongLong();
+        FLOG_DEBUG("ui.dock",
+                   "tree-click row=note id={} prev-marker={} prev-loop={} "
+                   "prev-note={}",
+                   newId.value_or(-1),
+                   selectedMarkerId_.value_or(-1),
+                   selectedLoopId_.value_or(-1),
+                   selectedNoteId_.value_or(-1));
+        if (selectedMarkerId_.has_value()) {
+            selectedMarkerId_.reset();
+            emit markerSelectionChanged(selectedMarkerId_);
+        }
+        if (selectedLoopId_.has_value()) {
+            selectedLoopId_.reset();
+            emit loopSelectionChanged(selectedLoopId_);
+        }
+        if (selectedNoteId_ != newId) {
+            selectedNoteId_ = newId;
+            refreshPropertyPage();
+            emit noteSelectionChanged(selectedNoteId_);
+        } else {
+            refreshPropertyPage();
+        }
+        return;
+    }
 
-    // Current is null or a category header — clear both kinds.
+    // Current is null or a category header — clear every kind.
     bool emittedAny = false;
     if (selectedMarkerId_.has_value()) {
         selectedMarkerId_.reset();
@@ -640,6 +1068,11 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
     if (selectedLoopId_.has_value()) {
         selectedLoopId_.reset();
         emit loopSelectionChanged(selectedLoopId_);
+        emittedAny = true;
+    }
+    if (selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
         emittedAny = true;
     }
     if (emittedAny) refreshPropertyPage();
@@ -657,6 +1090,14 @@ void ProjectViewerDock::onTreeItemDoubleClicked(
     if (item->parent() == loopsCategory_) {
         const auto id = item->data(0, kLoopIdRole).toLongLong();
         emit loopActivated(id);
+        return;
+    }
+    if (item->parent() == notesCategory_) {
+        const auto id = item->data(0, kNoteIdRole).toLongLong();
+        FLOG_DEBUG("ui.dock",
+                   "tree-double-click row=note id={} emit=note-activated",
+                   id);
+        emit noteActivated(id);
         return;
     }
     // Category header double-click is a no-op (Qt's default
@@ -727,6 +1168,142 @@ void ProjectViewerDock::onLoopArmedToggled(bool checked) {
     emit loopArmToggleRequested(*selectedLoopId_, checked);
 }
 
+// ---- Note property page edits (state-machine, step 6.1) ----------
+//
+// In NewDraft and Editing modes, field edits mutate noteBuffer_ only.
+// The noteModel is touched at commit time (button click). In Empty
+// mode the fields are inert (page is "no selection").
+
+void ProjectViewerDock::onNotePitchEdited() {
+    if (updatingPropertyPage_) {
+        FLOG_TRACE("ui.dock",
+                   "note-pitch-edited skipped reason=updating-property-page");
+        return;
+    }
+    if (!noteBuffer_.has_value()) {
+        FLOG_DEBUG("ui.dock",
+                   "note-pitch-edited skipped reason=no-buffer");
+        return;
+    }
+    const QString text = notePitchEdit_->text().trimmed();
+    const int midi = score::spnToMidi(text);
+    if (midi < 0 || !score::NoteModel::isAcceptedPitch(midi)) {
+        FLOG_DEBUG("ui.dock",
+                   "note-pitch-edited buffer-id={} text='{}' parsed={} "
+                   "accepted=no buffer-midi={} action=revert",
+                   noteBuffer_->id, text.toStdString(),
+                   midi, noteBuffer_->midi);
+        updatingPropertyPage_ = true;
+        notePitchEdit_->setText(score::midiToSpn(noteBuffer_->midi));
+        notePitchMidiLabel_->setText(tr("(MIDI %1)").arg(noteBuffer_->midi));
+        updatingPropertyPage_ = false;
+        return;
+    }
+    if (midi == noteBuffer_->midi) {
+        FLOG_TRACE("ui.dock",
+                   "note-pitch-edited buffer-id={} midi={} no-op-equal",
+                   noteBuffer_->id, midi);
+        return;
+    }
+    FLOG_DEBUG("ui.dock",
+               "note-pitch-edited buffer-id={} from={} to={} accepted=yes",
+               noteBuffer_->id, noteBuffer_->midi, midi);
+    noteBuffer_->midi = midi;
+    updatingPropertyPage_ = true;
+    notePitchMidiLabel_->setText(tr("(MIDI %1)").arg(midi));
+    updatingPropertyPage_ = false;
+}
+
+void ProjectViewerDock::onNoteStartEdited() {
+    if (updatingPropertyPage_) return;
+    if (!noteBuffer_.has_value()) {
+        FLOG_DEBUG("ui.dock",
+                   "note-start-edited skipped reason=no-buffer");
+        return;
+    }
+    const std::int64_t newStart = noteStartBox_->value();
+    if (newStart >= noteBuffer_->endMs) {
+        FLOG_DEBUG("ui.dock",
+                   "note-start-edited buffer-id={} new-start={} "
+                   "buffer-end={} action=reject reason=start>=end",
+                   noteBuffer_->id, newStart, noteBuffer_->endMs);
+        return;
+    }
+    if (newStart == noteBuffer_->startMs) return;
+    FLOG_DEBUG("ui.dock",
+               "note-start-edited buffer-id={} from={} to={}",
+               noteBuffer_->id, noteBuffer_->startMs, newStart);
+    noteBuffer_->startMs = newStart;
+    updatingPropertyPage_ = true;
+    noteEndBox_->setMinimum(static_cast<int>(newStart) + 1);
+    noteDurationLabel_->setText(
+        tr("%1 ms").arg(noteBuffer_->endMs - newStart));
+    updatingPropertyPage_ = false;
+}
+
+void ProjectViewerDock::onNoteEndEdited() {
+    if (updatingPropertyPage_) return;
+    if (!noteBuffer_.has_value()) {
+        FLOG_DEBUG("ui.dock",
+                   "note-end-edited skipped reason=no-buffer");
+        return;
+    }
+    const std::int64_t newEnd = noteEndBox_->value();
+    if (newEnd <= noteBuffer_->startMs) {
+        FLOG_DEBUG("ui.dock",
+                   "note-end-edited buffer-id={} new-end={} "
+                   "buffer-start={} action=reject reason=end<=start",
+                   noteBuffer_->id, newEnd, noteBuffer_->startMs);
+        return;
+    }
+    if (newEnd == noteBuffer_->endMs) return;
+    FLOG_DEBUG("ui.dock",
+               "note-end-edited buffer-id={} from={} to={}",
+               noteBuffer_->id, noteBuffer_->endMs, newEnd);
+    noteBuffer_->endMs = newEnd;
+    updatingPropertyPage_ = true;
+    noteStartBox_->setMaximum(static_cast<int>(newEnd) - 1);
+    noteDurationLabel_->setText(
+        tr("%1 ms").arg(newEnd - noteBuffer_->startMs));
+    updatingPropertyPage_ = false;
+}
+
+void ProjectViewerDock::onAddNoteClicked() {
+    const QString focusName = QApplication::focusWidget()
+        ? QApplication::focusWidget()->objectName()
+        : QString();
+    if (!noteBuffer_.has_value()) {
+        // Empty mode: user is asking to begin a fresh draft. We
+        // don't know the playback ms — MainWindow does. Emit the
+        // signal and let it call enterNoteDraftMode() back on us.
+        FLOG_DEBUG("ui.dock",
+                   "button-click mode=empty action=request-draft "
+                   "focus-at-click={}",
+                   focusName.toStdString());
+        emit noteAddRequested();
+        return;
+    }
+    const auto buf = *noteBuffer_;
+    if (buf.id == 0) {
+        // NewDraft mode: commit the draft to the model.
+        FLOG_DEBUG("ui.dock",
+                   "button-click mode=new-draft action=commit "
+                   "start={} end={} midi={}",
+                   buf.startMs, buf.endMs, buf.midi);
+        emit noteCommitNewRequested(buf.startMs, buf.endMs, buf.midi);
+        exitNoteMode();
+        return;
+    }
+    // Editing mode: commit buffered diffs to the model.
+    FLOG_DEBUG("ui.dock",
+               "button-click mode=editing action=commit-changes "
+               "id={} start={} end={} midi={}",
+               buf.id, buf.startMs, buf.endMs, buf.midi);
+    emit noteCommitChangesRequested(buf.id, buf.startMs,
+                                    buf.endMs, buf.midi);
+    exitNoteMode();
+}
+
 // ---- input forwarding ---------------------------------------------------
 
 bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
@@ -742,6 +1319,45 @@ bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
         if (keyEvent->matches(QKeySequence::Undo)) {
             event->ignore();
             return true;
+        }
+    }
+
+    // Focus tracking on note property page widgets. Helps trace
+    // which widget had focus when something unexpected (e.g. an
+    // Add Note click) fires.
+    if (event->type() == QEvent::FocusIn
+        || event->type() == QEvent::FocusOut) {
+        const char* widgetTag = nullptr;
+        if      (watched == notePitchEdit_) widgetTag = "note-pitch";
+        else if (watched == noteStartBox_)  widgetTag = "note-start";
+        else if (watched == noteEndBox_)    widgetTag = "note-end";
+        if (widgetTag) {
+            const char* dir = (event->type() == QEvent::FocusIn)
+                ? "focus-in" : "focus-out";
+            // Log the key-press / mouse-press reason if Qt provided
+            // one (Qt::TabFocusReason, MouseFocusReason, etc).
+            auto* fe = static_cast<QFocusEvent*>(event);
+            FLOG_DEBUG("ui.dock",
+                       "{} widget={} reason={} selected-note-id={}",
+                       dir, widgetTag,
+                       static_cast<int>(fe->reason()),
+                       selectedNoteId_.value_or(-1));
+        }
+    }
+
+    // Key tracking on the pitch line edit specifically — log every
+    // Enter/Return so we can see the keystroke that triggers
+    // editingFinished and any potential propagation.
+    if (watched == notePitchEdit_
+        && event->type() == QEvent::KeyPress) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Return
+            || keyEvent->key() == Qt::Key_Enter) {
+            FLOG_DEBUG("ui.dock",
+                       "note-pitch-key key=enter text='{}' "
+                       "selected-id={}",
+                       notePitchEdit_->text().toStdString(),
+                       selectedNoteId_.value_or(-1));
         }
     }
 
@@ -770,6 +1386,14 @@ bool ProjectViewerDock::eventFilter(QObject* watched, QEvent* event) {
                 }
                 if (selectedLoopId_.has_value()) {
                     emit loopDeleteRequested(*selectedLoopId_);
+                    return true;
+                }
+                if (selectedNoteId_.has_value()) {
+                    FLOG_DEBUG("ui.dock",
+                               "del-key on=note id={} "
+                               "emit=note-delete-requested",
+                               *selectedNoteId_);
+                    emit noteDeleteRequested(*selectedNoteId_);
                     return true;
                 }
             }

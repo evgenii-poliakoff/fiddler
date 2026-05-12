@@ -8,10 +8,10 @@
 // interchange medium; MainWindow wraps them with QJsonDocument and
 // the QFile I/O.
 //
-// Schema version 1:
+// Schema version 2 (current; bumped from 1 in Step 6.1 to add notes):
 //
 //   {
-//     "version": 1,
+//     "version": 2,
 //     "audioPath": "/abs/path/to/tune.mp3",
 //     "timeSignature": { "numerator": 4, "denominator": 4,
 //                        "tuneType": "Reel" },
@@ -19,12 +19,21 @@
 //     "barlines": [ { "sourceMs": 1000 }, { "sourceMs": 2000 } ],
 //     "markers":  [ { "id": 1, "sourceMs": 1500, "name": "Hard turn" } ],
 //     "loops":    [ { "id": 1, "startMs": 500, "endMs": 1500,
-//                     "name": "Loop 1" } ]
+//                     "name": "Loop 1" } ],
+//     "notes":    [ { "id": 1, "startMs": 1100, "endMs": 1400,
+//                     "midi": 69, "name": "Note 1" } ]
 //   }
 //
+// Backward compatibility: a v1 file (no "notes" key) loads fine — a
+// missing array is equivalent to an empty notes list. We do NOT
+// auto-rewrite v1 files on load; the version is bumped only when
+// the user saves through the v2 build. Forward compatibility (v2
+// read by v1 build) is intentionally NOT supported; v1 has been
+// pre-release.
+//
 // IDs round-trip exactly via MarkerModel::addWithId / LoopModel::addWithId
-// (added in #20). Audio path is absolute; cross-machine portability
-// is a future concern.
+// / NoteModel::addWithId. Audio path is absolute; cross-machine
+// portability is a future concern.
 
 #pragma once
 
@@ -37,14 +46,21 @@ namespace fiddler::score {
 
 class LoopModel;
 class MarkerModel;
+class NoteModel;
 
-// Schema version this build writes and accepts on load. Bumped if
-// the JSON shape evolves in a way that older readers can't handle.
-constexpr int kProjectFormatVersion = 1;
+// Schema version this build writes and accepts on load. Bumped from
+// 1 to 2 in Step 6.1 to add the notes array. v1 files load (notes
+// stays empty); v2 files are NOT readable by a v1 build.
+//
+// MEMO: bump in lockstep with any breaking JSON change. Additive
+// changes (a new optional key whose absence is well-defined) do NOT
+// require a bump — only changes that older readers would mis-handle.
+constexpr int kProjectFormatVersion = 2;
 
 QJsonArray  toJson(const BarlineModel& m);
 QJsonArray  toJson(const MarkerModel&  m);
 QJsonArray  toJson(const LoopModel&    m);
+QJsonArray  toJson(const NoteModel&    m);
 QJsonObject toJson(const TimeSignature& ts);
 
 // Each loadFrom clears the target model first, then re-adds every
@@ -56,6 +72,7 @@ QJsonObject toJson(const TimeSignature& ts);
 bool loadFrom(BarlineModel& m, const QJsonArray& arr);
 bool loadFrom(MarkerModel&  m, const QJsonArray& arr);
 bool loadFrom(LoopModel&    m, const QJsonArray& arr);
+bool loadFrom(NoteModel&    m, const QJsonArray& arr);
 
 // Parse a TimeSignature out of a JSON object. Defaults (4/4, empty
 // tuneType) on missing fields — TimeSignature has no required

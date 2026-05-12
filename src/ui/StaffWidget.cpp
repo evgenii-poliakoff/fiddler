@@ -3,6 +3,9 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
+#include "score/Pitch.h"
+#include "util/Log.h"
 
 #include <QFont>
 #include <QFontMetrics>
@@ -12,6 +15,7 @@
 #include <QString>
 
 #include <algorithm>
+#include <climits>
 
 namespace fiddler::ui {
 
@@ -19,10 +23,18 @@ namespace {
 
 // Visual layout constants. Pulled out as named constants so the
 // numbers in the paint code mean something at a glance.
+//
+// MEMO[#step6.1]: kStaffTopMarginPx grew from 18 → 72 to leave
+// vertical room ABOVE the staff for note ledger lines. The violin
+// range goes up to E7 (top of range — see NoteModel::isAcceptedPitch).
+// E7's diatonic step is 21 above E4 (the bottom staff line), so it
+// sits at staffBottomY − 21*(kStaffSpacingPx/2) = staffBottomY − 84
+// pixels. With staffBottomY = 72 + 32 = 104, E7 lands at y = 20 —
+// safely inside the widget.
 constexpr int kStaffLineCount      = 5;
 constexpr int kStaffSpacingPx      = 8;     // gap between adjacent staff lines
-constexpr int kStaffTopMarginPx    = 18;    // room above for tune-type label + marker flags
-constexpr int kStaffBottomMarginPx = 12;    // unused for now; reserved for step 6 ledger lines
+constexpr int kStaffTopMarginPx    = 72;    // room above for tune-type label + marker flags + ledger lines up to E7
+constexpr int kStaffBottomMarginPx = 28;    // room below for ledger lines down to G3 (5 dia steps below E4)
 
 constexpr int kTimeSigLeftMarginPx = 6;
 constexpr int kTimeSigPointSize    = 14;
@@ -43,6 +55,37 @@ constexpr int kLoopLabelHeightPx       = 12;
 constexpr int kLoopLabelPaddingPx      = 4;
 constexpr int kLoopLabelFontPointSz    = 8;
 constexpr int kLoopLabelMaxWidthPx     = 120;
+
+// Note bar (piano-roll style — see project_step6_plan.md memory).
+// The bar is centred vertically on the diatonic-step y so a note ON
+// a line straddles it symmetrically, and a note IN a space sits
+// neatly between two lines. Height is one staff spacing minus a
+// hair of slack so adjacent diatonic steps don't visually touch.
+constexpr int kNoteBarHeightPx       = kStaffSpacingPx - 2;     // 6 px
+// Ledger lines: short horizontal marks every diatonic LINE position
+// (i.e. every other step) between the note and the staff body. The
+// stub extends a hair past the bar on either side so the note head
+// reads as ON the ledger, not just near it.
+constexpr int kLedgerHalfWidthPx     = 8;
+constexpr int kLedgerLineThicknessPx = 1;
+
+// Selection edge highlight — drawn around any selected note so the
+// note property page in the dock has visible feedback in the staff.
+constexpr int kNoteSelectionWidthPx  = 2;
+
+// Accidental tint — sharps and flats render in a slightly bluer /
+// teal-shifted green so they're visually distinct from naturals
+// without needing a per-note ♯ glyph. Matches the convention every
+// surveyed piano-roll editor follows: no per-note accidental
+// glyphs; pitch is communicated by row position + colour. The
+// engraving convention of "♯ in front of the note head" assumes
+// round note heads and isolated whitespace between notes, neither
+// of which fits a contiguous-rectangle layout. See the
+// project_step6_plan memory entry for the research notes.
+//
+// Same green family so the tier is recognisable (Rule: progressive
+// visual weight in the memory) — accidentals lean cool, naturals
+// lean warm.
 
 } // namespace
 
@@ -70,12 +113,34 @@ bool StaffWidget::hasContent() const noexcept {
 
 // ---- coordinate transforms ----------------------------------------------
 
-QSize StaffWidget::sizeHint()        const { return QSize(800, 100); }
-QSize StaffWidget::minimumSizeHint() const { return QSize(120,  60); }
+// MEMO[#step6.1]: height grew 100 → 132 so the violin range
+// (G3 to E7, see NoteModel::isAcceptedPitch) fits with ledger
+// lines: top margin (72) + 5 staff lines × 8 spacing (32) +
+// bottom margin (28) = 132.
+QSize StaffWidget::sizeHint()        const { return QSize(800, 132); }
+QSize StaffWidget::minimumSizeHint() const { return QSize(120, 132); }
 
 int StaffWidget::staffTopY()    const noexcept { return kStaffTopMarginPx; }
 int StaffWidget::staffBottomY() const noexcept {
     return staffTopY() + (kStaffLineCount - 1) * kStaffSpacingPx;
+}
+
+int StaffWidget::staffYForPitch(int midi) const noexcept {
+    // Bottom staff line E4 (midi 64) anchors the y axis. Each
+    // diatonic step is half the staff-line spacing — the same
+    // metric a line→space→line→space sequence uses.
+    constexpr int kE4DiatonicStep   = 30;
+    constexpr int kPxPerDiatonicStep = kStaffSpacingPx / 2;   // 4
+    int dia = score::diatonicStep(midi);
+    if (dia < 0) {
+        // Accidental — sharp spelling pins the note to the natural
+        // one semitone BELOW (A#4 sits at A4's line, with a ♯ glyph
+        // drawn to the left in paintNotes). Try midi-1 (the natural
+        // counterpart for any sharp).
+        dia = score::diatonicStep(midi - 1);
+    }
+    if (dia < 0) return INT_MIN;
+    return staffBottomY() - (dia - kE4DiatonicStep) * kPxPerDiatonicStep;
 }
 
 // ---- painting ------------------------------------------------------------
@@ -92,6 +157,7 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     paintStaffLines(painter);
     paintTimeSignature(painter);
     paintBarlines(painter);
+    paintNotes(painter);
     paintMarkers(painter);
     // Selected loop's edges re-drawn ON TOP so the user can see
     // (and drag) the edge even when a marker tick or barline sits
@@ -299,6 +365,135 @@ void StaffWidget::paintMarkers(QPainter& painter) const {
                                           -kMarkerFlagPaddingPx, 0),
                          Qt::AlignVCenter | Qt::AlignLeft,
                          fm.elidedText(m.name, Qt::ElideRight, textWidth));
+    }
+}
+
+void StaffWidget::paintNotes(QPainter& painter) const {
+    const auto noteM = noteModel();
+    if (!noteM) return;
+    const auto notes = noteM->notes();
+    const auto selId = selectedNoteId();
+
+    // MEMO[#step6.1 debug]: log every paint with the model state so
+    // we can confirm what the staff thinks it should be drawing.
+    // Bumped to DEBUG so it appears under the default
+    // `--log-filter='ui.*'` filter without needing --log-level=trace.
+    // Each call additionally logs per-note id/midi/x-range below.
+    FLOG_DEBUG("ui.staff",
+               "paint-notes count={} selected={} duration-ms={} width-px={}",
+               notes.size(), selId.value_or(-1),
+               durationMs(), width());
+
+    // Visual layers per bar, painted in order:
+    //   1. Ledger stubs (under the note so the bar rides ON the
+    //      ledger).
+    //   2. The bar fill + border.
+    //   3. The selection ring (only on the selected note).
+    //
+    // Naturals lean warm-green; accidentals lean cool-teal. Both in
+    // the same hue family for clarity. See the constant block above.
+    const QColor fillNaturalCol     (180, 220, 140, 200);
+    const QColor borderNaturalCol   (140, 200, 100);
+    const QColor fillAccidentalCol  (140, 200, 195, 200);
+    const QColor borderAccidentalCol(100, 180, 165);
+    const QColor selectionCol       (220, 255, 160);
+
+    // Treble-staff geometry — same constants as staffYForPitch.
+    // E4 (dia 30) sits on the bottom line, F5 (dia 38) on top.
+    // Ledger LINES live at every even diatonic step outside [30,38]
+    // (e.g. C4=28 → middle-C ledger below, A5=40 → first ledger above).
+    constexpr int kE4DiatonicStep    = 30;
+    constexpr int kF5DiatonicStep    = 38;
+    constexpr int kPxPerDiatonicStep = kStaffSpacingPx / 2;     // 4
+
+    const int bottomY = staffBottomY();
+
+    // y of an even-diatonic-step line position. Used for ledgers.
+    const auto yForLineDia = [&](int dia) {
+        return bottomY - (dia - kE4DiatonicStep) * kPxPerDiatonicStep;
+    };
+
+    int paintedCount = 0;
+    int skippedAccidental = 0;
+    int skippedClipped = 0;
+    for (const auto& n : notes) {
+        const int y = staffYForPitch(n.midi);
+        if (y == INT_MIN) {
+            ++skippedAccidental;
+            FLOG_TRACE("ui.staff",
+                       "paint-note id={} midi={} skipped=accidental",
+                       n.id, n.midi);
+            continue;   // accidental — model forbids in 6.1
+        }
+
+        const int xStart = msToX(n.startMs);
+        const int xEnd   = msToX(n.endMs);
+        if (xEnd <= 0 || xStart >= width()) {
+            ++skippedClipped;
+            FLOG_TRACE("ui.staff",
+                       "paint-note id={} midi={} startMs={} endMs={} "
+                       "xStart={} xEnd={} skipped=clipped (width={})",
+                       n.id, n.midi, n.startMs, n.endMs,
+                       xStart, xEnd, width());
+            continue;
+        }
+        ++paintedCount;
+        FLOG_TRACE("ui.staff",
+                   "paint-note id={} midi={} startMs={} endMs={} y={} "
+                   "xStart={} xEnd={}",
+                   n.id, n.midi, n.startMs, n.endMs, y, xStart, xEnd);
+
+        // Diatonic step for ledger logic. For accidentals (sharp
+        // spelling), use the natural-below's step — the bar is
+        // already at that y via staffYForPitch. The bar is tinted
+        // accordingly, so the accidental is visible without a
+        // separate ♯ glyph.
+        const bool isAccidental = (score::diatonicStep(n.midi) < 0);
+        const int  dia = isAccidental
+            ? score::diatonicStep(n.midi - 1)
+            : score::diatonicStep(n.midi);
+
+        const QColor& fillCol   = isAccidental
+            ? fillAccidentalCol   : fillNaturalCol;
+        const QColor& borderCol = isAccidental
+            ? borderAccidentalCol : borderNaturalCol;
+
+        const int xLeft  = std::max(0, xStart);
+        const int xRight = std::min(width(), xEnd);
+        const int barW   = std::max(1, xRight - xLeft);
+        const int barTop = y - kNoteBarHeightPx / 2;
+        const QRect barRect(xLeft, barTop, barW, kNoteBarHeightPx);
+        const int barMidX = (xLeft + xRight) / 2;
+
+        // Ledger stubs — every even-dia line position between the
+        // staff body and the note (inclusive of the note's line if
+        // it's a line position).
+        if (dia > kF5DiatonicStep) {
+            painter.setPen(QPen(borderCol, kLedgerLineThicknessPx));
+            for (int probeDia = kF5DiatonicStep + 2;
+                 probeDia <= dia; probeDia += 2) {
+                const int ly = yForLineDia(probeDia);
+                painter.drawLine(barMidX - kLedgerHalfWidthPx, ly,
+                                 barMidX + kLedgerHalfWidthPx, ly);
+            }
+        } else if (dia < kE4DiatonicStep) {
+            painter.setPen(QPen(borderCol, kLedgerLineThicknessPx));
+            for (int probeDia = kE4DiatonicStep - 2;
+                 probeDia >= dia; probeDia -= 2) {
+                const int ly = yForLineDia(probeDia);
+                painter.drawLine(barMidX - kLedgerHalfWidthPx, ly,
+                                 barMidX + kLedgerHalfWidthPx, ly);
+            }
+        }
+
+        painter.fillRect(barRect, fillCol);
+        painter.setPen(QPen(borderCol, 1.0));
+        painter.drawRect(barRect);
+
+        if (selId == n.id) {
+            painter.setPen(QPen(selectionCol, kNoteSelectionWidthPx));
+            painter.drawRect(barRect.adjusted(-1, -1, 1, 1));
+        }
     }
 }
 

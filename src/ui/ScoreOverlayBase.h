@@ -43,6 +43,7 @@ namespace fiddler::score {
 class BarlineModel;
 class LoopModel;
 class MarkerModel;
+class NoteModel;
 }
 
 namespace fiddler::ui {
@@ -67,6 +68,15 @@ public:
     [[nodiscard]] std::shared_ptr<const score::LoopModel>
         loopModel() const noexcept { return loopModel_; }
 
+    // MEMO[#step6.1]: NoteModel only paints on StaffWidget today, but
+    // it lives on the base for symmetry with the other three artifact
+    // kinds AND because future bidirectional-cursor work (#6.4) may
+    // want note hit-testing on the waveform too. WaveformWidget's
+    // paintEvent simply does not draw notes in 6.1.
+    void setNoteModel(std::shared_ptr<const score::NoteModel> model);
+    [[nodiscard]] std::shared_ptr<const score::NoteModel>
+        noteModel() const noexcept { return noteModel_; }
+
     // ---- read-only state ----------------------------------------
 
     [[nodiscard]] std::int64_t positionMs() const noexcept { return positionMs_; }
@@ -76,6 +86,8 @@ public:
         selectedMarkerId() const noexcept { return selectedMarkerId_; }
     [[nodiscard]] std::optional<std::int64_t>
         selectedLoopId() const noexcept { return selectedLoopId_; }
+    [[nodiscard]] std::optional<std::int64_t>
+        selectedNoteId() const noexcept { return selectedNoteId_; }
     [[nodiscard]] std::optional<std::int64_t>
         secondaryAnchorMs() const noexcept { return secondaryAnchorMs_; }
 
@@ -160,6 +172,7 @@ public slots:
     void setSelectedBarline(std::optional<std::size_t> index);
     void setSelectedMarkerId(std::optional<std::int64_t> id);
     void setSelectedLoopId(std::optional<std::int64_t> id);
+    void setSelectedNoteId(std::optional<std::int64_t> id);
     void setSecondaryAnchorMs(std::optional<std::int64_t> ms);
 
     // Drag-ghost mirrors (issue #22). When the partner widget is
@@ -174,6 +187,13 @@ public slots:
 
 signals:
     void seekRequested(std::int64_t ms);
+    // MEMO[#step6.1]: emitted by the plain-seek branch (when the
+    // user clicks on the widget at a location that doesn't hit any
+    // artifact). Distinct from seekRequested, which also fires for
+    // artifact clicks. MainWindow uses this to discard any pending
+    // note-draft in the dock — clicking empty space is the
+    // "I'm browsing, cancel pending input" gesture.
+    void emptySpaceClicked();
     // Fired after a setViewport call that actually changed the
     // visible range. Used by MainWindow to keep the scrollbar in
     // sync and to broadcast the new viewport to the sister widget.
@@ -185,9 +205,11 @@ signals:
     void barlineSelectionChanged(std::optional<std::size_t> index);
     void markerSelectionChanged (std::optional<std::int64_t> id);
     void loopSelectionChanged   (std::optional<std::int64_t> id);
+    void noteSelectionChanged   (std::optional<std::int64_t> id);
     void secondaryAnchorChanged (std::optional<std::int64_t> ms);
     void barlineDeleteRequested (std::size_t index);
     void markerDeleteRequested  (std::int64_t id);
+    void noteDeleteRequested    (std::int64_t id);
 
     // Live drag updates (issues #11, #22). Fired on every mouse-move
     // past the click-vs-drag threshold. MainWindow forwards these to
@@ -279,6 +301,7 @@ private slots:
     void onBarlineModelChanged();
     void onMarkerModelChanged();
     void onLoopModelChanged();
+    void onNoteModelChanged();
 
 private:
     // Drag state (issue #11). What was hit on press, where the press
@@ -334,10 +357,12 @@ private:
     std::shared_ptr<const score::BarlineModel> barlineModel_;
     std::shared_ptr<const score::MarkerModel>  markerModel_;
     std::shared_ptr<const score::LoopModel>    loopModel_;
+    std::shared_ptr<const score::NoteModel>    noteModel_;
     std::int64_t                               positionMs_ = 0;
     std::optional<std::size_t>                 selectedBarline_;
     std::optional<std::int64_t>                selectedMarkerId_;
     std::optional<std::int64_t>                selectedLoopId_;
+    std::optional<std::int64_t>                selectedNoteId_;
     std::optional<std::int64_t>                secondaryAnchorMs_;
 
     // Viewport (#49). Both are stored in source-time milliseconds.

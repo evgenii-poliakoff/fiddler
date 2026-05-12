@@ -36,14 +36,21 @@ namespace fiddler::ui::undo {
 struct AddBarline    { std::int64_t sourceMs; };
 struct AddMarker     { std::int64_t id; };
 struct AddLoop       { std::int64_t id; };
+struct AddNote       { std::int64_t id; };
 
 struct EditMarkerPos { std::int64_t id; std::int64_t prevSourceMs; };
 struct EditLoopRange { std::int64_t id;
                        std::int64_t prevStartMs;
                        std::int64_t prevEndMs; };
+struct EditNoteInterval { std::int64_t id;
+                          std::int64_t prevStartMs;
+                          std::int64_t prevEndMs; };
+struct EditNotePitch    { std::int64_t id;
+                          int          prevMidi; };
 
 struct RenameMarker  { std::int64_t id; QString prevName; };
 struct RenameLoop    { std::int64_t id; QString prevName; };
+struct RenameNote    { std::int64_t id; QString prevName; };
 
 struct DeleteBarline { std::int64_t sourceMs; };
 struct DeleteMarker  { std::int64_t id;
@@ -52,6 +59,11 @@ struct DeleteMarker  { std::int64_t id;
 struct DeleteLoop    { std::int64_t id;
                        std::int64_t startMs;
                        std::int64_t endMs;
+                       QString      name; };
+struct DeleteNote    { std::int64_t id;
+                       std::int64_t startMs;
+                       std::int64_t endMs;
+                       int          midi;
                        QString      name; };
 
 // MEMO: pre-roll is a session preference, not document state — it
@@ -65,10 +77,10 @@ struct EditPrerollMs      { int  prevMs; };
 struct EditPrerollEnabled { bool prevEnabled; };
 
 using Entry = std::variant<
-    AddBarline,    AddMarker,     AddLoop,
-    EditMarkerPos, EditLoopRange,
-    RenameMarker,  RenameLoop,
-    DeleteBarline, DeleteMarker,  DeleteLoop,
+    AddBarline,    AddMarker,     AddLoop,        AddNote,
+    EditMarkerPos, EditLoopRange, EditNoteInterval, EditNotePitch,
+    RenameMarker,  RenameLoop,    RenameNote,
+    DeleteBarline, DeleteMarker,  DeleteLoop,    DeleteNote,
     EditPrerollMs, EditPrerollEnabled>;
 
 } // namespace fiddler::ui::undo

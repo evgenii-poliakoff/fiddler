@@ -11,6 +11,8 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
+#include "score/Pitch.h"
 #include "ui/LoopCountdownWidget.h"
 #include "ui/MainWindow.h"
 #include "ui/ProjectViewerDock.h"
@@ -3048,13 +3050,14 @@ TEST_CASE("MainWindow: project file format is JSON with version field (#26)",
     REQUIRE(doc.isObject());
 
     const auto root = doc.object();
-    REQUIRE(root.value("version").toInt() == 1);
+    REQUIRE(root.value("version").toInt() == 2);
     REQUIRE(root.contains("audioPath"));
     REQUIRE(root.contains("timeSignature"));
     REQUIRE(root.contains("preroll"));
     REQUIRE(root.contains("barlines"));
     REQUIRE(root.contains("markers"));
     REQUIRE(root.contains("loops"));
+    REQUIRE(root.contains("notes"));   // added in Step 6.1
 
     REQUIRE(root.value("markers").toArray().size() == 1);
     REQUIRE(root.value("markers").toArray()[0].toObject().value("sourceMs").toInt() == 1500);
@@ -3490,4 +3493,275 @@ TEST_CASE("MainWindow: page-flip during natural playback advances viewport (#49)
     const auto leadIn = 600 - waveform->viewportStartMs();
     REQUIRE(leadIn >= 90);
     REQUIRE(leadIn <= 110);
+}
+
+// ---------------------------------------------------------------------------
+// Notes (Step 6.1) — integration through MainWindow
+// ---------------------------------------------------------------------------
+
+TEST_CASE("MainWindow: New Note → Add Note (no loop) places at playback ± default",
+          "[main-window][gui][integration][notes]") {
+    // MEMO: step 6.1 state machine — placement is two clicks:
+    //   1. "New Note ..." (Empty mode) opens a draft at playback ±
+    //      default duration; no model change yet.
+    //   2. "Add Note" (NewDraft mode) commits the draft to the model.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* slider = window->findChild<QSlider*>("positionSlider");
+    slider->setValue(800);
+    emit slider->sliderMoved(800);
+
+    auto* button = window->findChild<QPushButton*>("addNoteButton");
+    REQUIRE(button != nullptr);
+
+    // Click 1: enter NewDraft mode. Model still empty.
+    REQUIRE(button->text() == "New Note ...");
+    button->click();
+    REQUIRE(window->noteModel().empty());
+    REQUIRE(button->text() == "Add Note");
+
+    // Click 2: commit the draft.
+    button->click();
+    REQUIRE(window->noteModel().size() == 1);
+    REQUIRE(button->text() == "New Note ...");
+    const auto& n = window->noteModel().notes()[0];
+    REQUIRE(n.startMs == 600);          // 800 - 200
+    REQUIRE(n.endMs   == 1000);         // 800 + 200
+    REQUIRE(n.midi    == 69);           // A4
+}
+
+TEST_CASE("MainWindow: New Note → Add Note with armed loop inherits the loop's interval",
+          "[main-window][gui][integration][notes]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    waveform->setSelectedMarkerId(window->markerModel().markers()[1].id);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    const auto loopId = window->loopModel().loops()[0].id;
+    emit dock->loopActivated(loopId);
+
+    auto* button = window->findChild<QPushButton*>("addNoteButton");
+    button->click();   // open draft
+    button->click();   // commit
+
+    REQUIRE(window->noteModel().size() == 1);
+    const auto& n = window->noteModel().notes()[0];
+    REQUIRE(n.startMs == 500);
+    REQUIRE(n.endMs   == 1500);
+}
+
+TEST_CASE("MainWindow: Ctrl+Z undoes a note placement and a note delete",
+          "[main-window][gui][integration][notes][undo]") {
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* button = window->findChild<QPushButton*>("addNoteButton");
+    button->click();   // open draft
+    button->click();   // commit
+    REQUIRE(window->noteModel().size() == 1);
+
+    // Ctrl+Z removes the just-placed note.
+    QTest::keySequence(window.get(), QKeySequence(Qt::CTRL | Qt::Key_Z));
+    REQUIRE(window->noteModel().empty());
+
+    // Place again, then delete via Del — Ctrl+Z restores it with
+    // the same ID + interval (via NoteModel::addWithId).
+    button->click();
+    button->click();
+    REQUIRE(window->noteModel().size() == 1);
+    const auto newId = window->noteModel().notes()[0].id;
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+    staff->setSelectedNoteId(newId);
+    QTest::keyClick(window.get(), Qt::Key_Delete);
+    REQUIRE(window->noteModel().empty());
+
+    QTest::keySequence(window.get(), QKeySequence(Qt::CTRL | Qt::Key_Z));
+    REQUIRE(window->noteModel().size() == 1);
+    REQUIRE(window->noteModel().notes()[0].id      == newId);
+    REQUIRE(window->noteModel().notes()[0].startMs >= 0);
+}
+
+TEST_CASE("MainWindow: save+load round-trip preserves notes (Step 6.1)",
+          "[main-window][gui][integration][project][notes]") {
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString projectPath = tmp.filePath("notes.fdlp");
+
+    std::int64_t expectedNoteId = 0;
+    {
+        auto window = std::make_unique<MainWindow>();
+        window->show();
+        (void)QTest::qWaitForWindowExposed(window.get());
+        REQUIRE(window->loadFile(
+            QString::fromStdString(fixtureWav().string())));
+        auto* waveform =
+            window->findChild<WaveformWidget*>("waveformWidget");
+        REQUIRE(QTest::qWaitFor(
+            [&]() { return waveform->overview() != nullptr; }, 5000));
+
+        auto* button = window->findChild<QPushButton*>("addNoteButton");
+        button->click();   // open draft
+        button->click();   // commit
+        REQUIRE(window->noteModel().size() == 1);
+        expectedNoteId = window->noteModel().notes()[0].id;
+
+        REQUIRE(window->saveProject(projectPath));
+    }
+
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->openProject(projectPath));
+
+    REQUIRE(window->noteModel().size() == 1);
+    // ID + interval + pitch survive round-trip.
+    const auto idx = window->noteModel().indexOf(expectedNoteId);
+    REQUIRE(idx.has_value());
+    REQUIRE(window->noteModel().notes()[*idx].midi == 69);
+}
+
+TEST_CASE("MainWindow: empty-space waveform click closes the dock's note property page",
+          "[main-window][gui][integration][notes]") {
+    // MEMO: load-bearing regression — fixes the "stack on previous"
+    // bug from the user's transcription log. Click on an empty area
+    // of the waveform must deselect the staff's note so the dock's
+    // property page returns to "no selection", so the next Add Note
+    // is unambiguous about where it'll land.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* button = window->findChild<QPushButton*>("addNoteButton");
+    button->click();   // open draft
+    button->click();   // commit
+    REQUIRE(window->noteModel().size() == 1);
+
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+    auto* dock  = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    // Select the just-placed note explicitly (commit no longer
+    // auto-selects — selection is now driven by user gestures in
+    // the new state machine).
+    const auto newId = window->noteModel().notes()[0].id;
+    staff->setSelectedNoteId(newId);
+    REQUIRE(staff->selectedNoteId().has_value());
+    REQUIRE(dock->selectedNoteId().has_value());
+
+    // Click on an empty area of the waveform. Picking a point well
+    // away from the just-placed note's interval so no artifact hit
+    // is triggered — pure plain-seek branch.
+    QTest::mouseClick(waveform, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(waveform->width() - 20, waveform->height() / 2));
+
+    REQUIRE_FALSE(staff->selectedNoteId().has_value());
+    REQUIRE_FALSE(dock->selectedNoteId().has_value());
+}
+
+TEST_CASE("MainWindow: clicking the waveform discards a pending note draft",
+          "[main-window][gui][integration][notes]") {
+    // MEMO: load-bearing — user reported "I clicked New Note ... then
+    // realised I forgot to seek; seeking didn't update the position
+    // and I couldn't get back to 'New Note ...'". The fix routes the
+    // ScoreOverlayBase emptySpaceClicked signal to the dock's
+    // exitNoteMode(), which clears any draft.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* button = window->findChild<QPushButton*>("addNoteButton");
+    REQUIRE(button->text() == "New Note ...");
+
+    // Enter draft mode.
+    button->click();
+    REQUIRE(button->text() == "Add Note");
+    REQUIRE(window->noteModel().empty());
+
+    // Click on the waveform at an arbitrary (empty) location.
+    QTest::mouseClick(waveform, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(waveform->width() / 2, waveform->height() / 2));
+
+    // Draft is discarded; button resets.
+    REQUIRE(button->text() == "New Note ...");
+    REQUIRE(window->noteModel().empty());
+
+    // A second click on the button now opens a fresh draft at the
+    // new playback position.
+    button->click();
+    REQUIRE(button->text() == "Add Note");
+    button->click();   // commit
+    REQUIRE(window->noteModel().size() == 1);
+}
+
+TEST_CASE("MainWindow: v1 projects load with empty notes (backward compat)",
+          "[main-window][gui][integration][project][notes]") {
+    // MEMO: load-bearing — files written by the pre-Step-6.1 v1 build
+    // have no "notes" key. The current build must still open them
+    // without error; missing-array → empty notes list.
+    qtApp();
+    QTemporaryDir tmp;
+    REQUIRE(tmp.isValid());
+    const QString path = tmp.filePath("v1.fdlp");
+
+    // Hand-craft a minimal v1 file. timeSignature + preroll are
+    // optional-defaulting; barlines / markers / loops are required
+    // arrays but may be empty.
+    QJsonObject root;
+    root["version"]   = 1;
+    root["audioPath"] = QString::fromStdString(fixtureWav().string());
+    root["barlines"]  = QJsonArray{};
+    root["markers"]   = QJsonArray{};
+    root["loops"]     = QJsonArray{};
+    // No "notes" key.
+
+    QFile f(path);
+    REQUIRE(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    f.close();
+
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->openProject(path));
+
+    REQUIRE(window->noteModel().empty());
 }

@@ -8,9 +8,11 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
 #include "ui/StaffWidget.h"
 
 #include <QApplication>
+#include <QImage>
 #include <QMouseEvent>
 #include <QSignalSpy>
 #include <QTest>
@@ -26,6 +28,7 @@
 using fiddler::score::BarlineModel;
 using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
+using fiddler::score::NoteModel;
 using fiddler::test::qtApp;
 using fiddler::ui::StaffWidget;
 
@@ -56,7 +59,7 @@ void setUpWidget(StaffWidget&                   w,
                  std::shared_ptr<BarlineModel>  model,
                  std::int64_t                   durationMs = 4000,
                  int                            widthPx    = 800,
-                 int                            heightPx   = 100)
+                 int                            heightPx   = 140)
 {
     w.setBarlineModel(model);
     w.setDurationMs(durationMs);
@@ -964,4 +967,323 @@ TEST_CASE("StaffWidget: panBy is a no-op when not zoomed",
     w.panBy(500);
     REQUIRE(vpSpy.count() == 0);
     REQUIRE_FALSE(w.isZoomed());
+}
+
+// ---------------------------------------------------------------------------
+// Notes (Step 6.1)
+//
+// The fixture 4 s / 800 px gives 1 ms = 0.2 px, so a 400 ms note from
+// 1000 ms to 1400 ms spans pixels [200, 280). The treble-staff
+// geometry constants are mirrored from StaffWidget.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Mirror of the constants in StaffWidget.cpp. Bumped in #step6.1
+// when the top margin grew to leave room for E7 ledger lines.
+constexpr int kStaffTopMargin = 72;
+constexpr int kStaffSpacing   = 8;
+constexpr int kBottomLineY    = kStaffTopMargin + 4 * kStaffSpacing; // 104
+constexpr int kPxPerHalfStep  = kStaffSpacing / 2;                   // 4
+
+std::shared_ptr<NoteModel> installNotes(StaffWidget& w) {
+    auto model = std::make_shared<NoteModel>();
+    w.setNoteModel(model);
+    return model;
+}
+
+bool isNoteGreen(QColor c) {
+    // Note fill is (180, 220, 140, 200) over background (20,20,24).
+    // After alpha-blend the on-screen colour lands around (95, 140, 90).
+    return c.green() > c.red() && c.green() > c.blue()
+        && c.green() > 100;
+}
+
+} // namespace
+
+TEST_CASE("StaffWidget: paints note bar at expected y for E4 (bottom line)",
+          "[staff-widget][gui][notes]") {
+    // MEMO: load-bearing — staff-Y geometry. E4 sits ON the bottom
+    // staff line; if the formula drifts, every painted note moves.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);   // E4
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Bar centre-x is around (200 + 280) / 2 = 240. Pick a column
+    // inside the bar but away from edges so the pen border doesn't
+    // dominate the probe.
+    const int probeX = 240;
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY)));
+
+    // Above and below the bar (4+ px away from y=50), the column
+    // should NOT read as note-green — we just see staff background
+    // or a staff line. Probe well above the bar to dodge the line
+    // and any selection ring.
+    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX, kBottomLineY - 12)));
+    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX, kBottomLineY + 12)));
+}
+
+TEST_CASE("StaffWidget: A4 sits in the second-from-bottom space",
+          "[staff-widget][gui][notes]") {
+    // E4 = bottom line; F4 = first space; G4 = 2nd line; A4 = 2nd
+    // space. Bottom line is y=50; A4 (3 diatonic steps up) is at
+    // y=50 - 3*4 = 38.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 69) != 0);   // A4
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    REQUIRE(isNoteGreen(image.pixelColor(240, kBottomLineY - 3 * kPxPerHalfStep)));
+}
+
+TEST_CASE("StaffWidget: middle-C note draws a ledger line below the staff",
+          "[staff-widget][gui][notes][ledger]") {
+    // MEMO: load-bearing — middle C (C4 = midi 60) is dia 28, one
+    // diatonic step (2*4 = 8 px) below the bottom line. A ledger
+    // line must appear at that y, painted in the note's border
+    // colour. If the ledger walk regresses, this fails first.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 60) != 0);   // C4
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Middle-C y = bottomY + 2 * kPxPerHalfStep = 58.
+    const int middleCY = kBottomLineY + 2 * kPxPerHalfStep;
+    // The note bar itself spans middleCY ± 3 px. The ledger stub
+    // extends ±8 px around the bar centre x=240; check just outside
+    // the bar's x range (xLeft=200, xRight=280) for a border-colour
+    // pixel that can only be the ledger stub. Bar mid is 240; stub
+    // covers 232..248. Bar covers 200..280. So an x INSIDE the bar
+    // (say 236) at exactly middleCY is inside the bar AND on the
+    // ledger — the pixel reads as note-green there.
+    //
+    // To prove the ledger specifically, probe just below the bar's
+    // bottom edge (middleCY + 4) — without a ledger this would be
+    // staff background; we expect background because the ledger
+    // stub is only one pixel thick at middleCY. So instead, probe
+    // the ledger overhang region: x between 236 and 247 sits inside
+    // the ledger stub but OUTSIDE the bar's vertical range — no,
+    // that's not right either.
+    //
+    // Simplest check: the ledger stub at x=232..247 lies UNDER the
+    // bar (same x range as the bar). The bar covers y in (middleCY-3,
+    // middleCY+3). The ledger stub is at exactly y=middleCY, so it
+    // sits under the bar — we don't see it through the bar fill.
+    //
+    // To make the ledger visible we need to probe OUTSIDE the bar's
+    // horizontal range. The bar's xLeft is 200 (msToX(1000)). The
+    // ledger stub centred at barMidX=240 extends to x=232..247 — all
+    // inside the bar. So in this fixture the ledger isn't visible
+    // outside the bar.
+    //
+    // Use a SHORT note (50 ms = 10 px wide) so the bar is narrower
+    // than the ledger stub. Then the ledger overhang is visible.
+    notes->clear();
+    REQUIRE(notes->add(1000, 1050, 60) != 0);   // 50 ms note at C4
+
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Bar centre x = (msToX(1000) + msToX(1050))/2 = (200 + 210)/2 = 205.
+    // Ledger stub extends ±8 px → 197..213. Bar covers 200..210.
+    // So x=215 is OUTSIDE the bar but… outside the ledger too.
+    // Adjust: x=212 is at the ledger's right edge AND outside the
+    // bar (which ends at 210). Probe there.
+    const int outsideBarLedgerX = 212;
+    // The ledger-only pixel reads as the border colour (140,200,100).
+    const QColor c = image.pixelColor(outsideBarLedgerX, middleCY);
+    REQUIRE(c.green() > 150);     // ledger uses the same border green
+    REQUIRE(c.green() > c.red());
+    REQUIRE(c.green() > c.blue());
+}
+
+TEST_CASE("StaffWidget: paints multiple notes (chord) at the same interval",
+          "[staff-widget][gui][notes][chord]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+
+    // Three-note chord on the same interval — C4 + E4 + G4.
+    REQUIRE(notes->add(1000, 1400, 60) != 0);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    REQUIRE(notes->add(1000, 1400, 67) != 0);
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // Each note should paint at its own y.
+    const int probeX = 240;
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY)));               // E4 line
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY - 2 * kPxPerHalfStep)));  // G4 (2nd line)
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY + 2 * kPxPerHalfStep)));  // C4 (1 ledger below)
+}
+
+TEST_CASE("StaffWidget: setSelectedNoteId clears other-kind selections",
+          "[staff-widget][gui][notes]") {
+    qtApp();
+    StaffWidget w;
+    const std::int64_t bars[] = { 500 };
+    setUpWidget(w, makeModel(std::span<const std::int64_t>{bars}));
+    const std::int64_t markers[] = { 1000 };
+    auto markerModel = installMarkers(w, std::span<const std::int64_t>{markers});
+    auto noteModel   = installNotes(w);
+    REQUIRE(noteModel->add(2000, 2400, 64) != 0);
+    const auto noteId = *noteModel->idAt(0);
+
+    w.setSelectedBarline(0);
+    REQUIRE(w.selectedBarline().has_value());
+    w.setSelectedMarkerId(*markerModel->idAt(0));
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+
+    QSignalSpy markerSpy(&w, &StaffWidget::markerSelectionChanged);
+    QSignalSpy noteSpy  (&w, &StaffWidget::noteSelectionChanged);
+
+    w.setSelectedNoteId(noteId);
+
+    REQUIRE(w.selectedNoteId() == noteId);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE(markerSpy.count() == 1);
+    REQUIRE(noteSpy.count()   == 1);
+}
+
+TEST_CASE("StaffWidget: removing the selected note clears the selection",
+          "[staff-widget][gui][notes]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    const auto noteId = *notes->idAt(0);
+    w.setSelectedNoteId(noteId);
+    REQUIRE(w.selectedNoteId() == noteId);
+
+    QSignalSpy selSpy(&w, &StaffWidget::noteSelectionChanged);
+    REQUIRE(notes->remove(noteId));
+    REQUIRE_FALSE(w.selectedNoteId().has_value());
+    REQUIRE(selSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: setNoteModel(nullptr) detaches and clears selection",
+          "[staff-widget][gui][notes]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    w.setSelectedNoteId(*notes->idAt(0));
+    REQUIRE(w.selectedNoteId().has_value());
+
+    w.setNoteModel(nullptr);
+    REQUIRE_FALSE(w.selectedNoteId().has_value());
+    REQUIRE(w.noteModel() == nullptr);
+}
+
+TEST_CASE("StaffWidget: accidental note paints at natural-below y with cool-tint fill",
+          "[staff-widget][gui][notes][accidentals]") {
+    // MEMO: load-bearing — A♯4 (midi 70) renders at A4's y (the
+    // natural one semitone below), but the bar is filled with the
+    // cool-shifted accidental tint instead of the warm natural
+    // green. Following the piano-roll convention every surveyed
+    // DAW uses (Logic, Pro Tools, Ableton, FL, Cubase, …): no
+    // per-note ♯ glyph; pitch and accidental state are conveyed by
+    // position + colour alone. The contiguous-rectangle layout
+    // makes engraving-style glyphs impractical.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 70) != 0);   // A#4 — accidental
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    // A4's y = bottomY - 3 * kPxPerHalfStep (A4 is 3 dia steps
+    // above E4 — line E4, space F4, line G4, space A4).
+    const int a4Y = kBottomLineY - 3 * kPxPerHalfStep;
+    const QColor barPixel = image.pixelColor(240, a4Y);
+    // Accidental fill is (140,200,195,200) alpha-blended over the
+    // dark background (20,20,24). The blue channel ends up
+    // comparable to the green channel (cool tint), unlike naturals
+    // where green dominates strongly over blue. Pin the inequality
+    // that distinguishes the two tints.
+    REQUIRE(barPixel.green() > 100);                  // bar is painted (not bg)
+    REQUIRE(barPixel.blue()  > barPixel.red() + 30);  // blue-shifted from natural
+}
+
+TEST_CASE("StaffWidget: natural and accidental at same y use distinguishable colors",
+          "[staff-widget][gui][notes][accidentals]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 69) != 0);   // A4 (natural)
+    REQUIRE(notes->add(2000, 2400, 70) != 0);   // A#4 (accidental — same y)
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    const int a4Y = kBottomLineY - 3 * kPxPerHalfStep;
+    // A4 spans 1000-1400 ms → ~200-280 px. Probe x=240 (inside
+    // first bar).
+    const QColor naturalPx = image.pixelColor(240, a4Y);
+    // A#4 spans 2000-2400 ms → ~400-480 px. Probe x=440.
+    const QColor accidentalPx = image.pixelColor(440, a4Y);
+
+    // Both pixels painted (not background).
+    REQUIRE(naturalPx.green()    > 100);
+    REQUIRE(accidentalPx.green() > 100);
+    // They are clearly different in blue channel — the
+    // accidental's blue is higher.
+    REQUIRE(accidentalPx.blue() > naturalPx.blue() + 30);
+}
+
+TEST_CASE("StaffWidget: empty-space click clears any active note selection",
+          "[staff-widget][gui][notes]") {
+    // MEMO: load-bearing rule — a click on the waveform / staff at a
+    // location that doesn't hit any artifact (the "plain seek" path)
+    // clears the current note selection. Mirrors the DAW convention
+    // and — critically — prevents the "stack on previous" trap:
+    // after editing a note's pitch, the user clicks the waveform to
+    // browse, and the dock's note property page closes so the next
+    // Add Note is unambiguous. See onMousePressEvent's empty-space
+    // branch.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    const auto id = *notes->idAt(0);
+    w.setSelectedNoteId(id);
+    REQUIRE(w.selectedNoteId() == id);
+
+    QSignalSpy selSpy(&w, &StaffWidget::noteSelectionChanged);
+    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
+
+    // Click far from the note (x=600 ≈ 3000 ms) — no barline / marker /
+    // loop hit either, so the plain-seek branch runs.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 40));
+
+    REQUIRE_FALSE(w.selectedNoteId().has_value());
+    REQUIRE(selSpy.count() == 1);
+    REQUIRE(seekSpy.count() == 1);
 }

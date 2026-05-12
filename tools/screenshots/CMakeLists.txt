@@ -35,6 +35,8 @@ target_sources(fiddler-screenshots PRIVATE
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/MarkerModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/NoteModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/Pitch.cpp
     ${CMAKE_SOURCE_DIR}/src/score/Serialize.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/LoopCountdownWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
