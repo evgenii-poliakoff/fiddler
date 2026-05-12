@@ -27,6 +27,10 @@ add_executable(fiddler
     score/LoopModel.h
     score/MarkerModel.cpp
     score/MarkerModel.h
+    score/NoteModel.cpp
+    score/NoteModel.h
+    score/Pitch.cpp
+    score/Pitch.h
     score/Serialize.cpp
     score/Serialize.h
     util/Log.cpp

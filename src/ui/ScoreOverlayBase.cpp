@@ -3,6 +3,8 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
+#include "util/Log.h"
 
 #include <QApplication>
 #include <QColor>
@@ -111,6 +113,24 @@ void ScoreOverlayBase::setLoopModel(
     if (selectedLoopId_.has_value()) {
         selectedLoopId_.reset();
         emit loopSelectionChanged(selectedLoopId_);
+    }
+    update();
+}
+
+void ScoreOverlayBase::setNoteModel(
+    std::shared_ptr<const score::NoteModel> model)
+{
+    if (noteModel_) {
+        disconnect(noteModel_.get(), nullptr, this, nullptr);
+    }
+    noteModel_ = std::move(model);
+    if (noteModel_) {
+        connect(noteModel_.get(), &score::NoteModel::changed,
+                this, &ScoreOverlayBase::onNoteModelChanged);
+    }
+    if (selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
     }
     update();
 }
@@ -334,8 +354,12 @@ void ScoreOverlayBase::setSelectedBarline(std::optional<std::size_t> index) {
         selectedLoopId_.reset();
         emit loopSelectionChanged(selectedLoopId_);
     }
+    if (index.has_value() && selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
     if (selectedBarline_ == index) {
-        // Repaint just in case the marker/loop-clear above changed
+        // Repaint just in case the other-kind clears above changed
         // visible state. update() is a no-op when nothing moved.
         update();
         return;
@@ -357,6 +381,10 @@ void ScoreOverlayBase::setSelectedMarkerId(std::optional<std::int64_t> id) {
     if (id.has_value() && selectedLoopId_.has_value()) {
         selectedLoopId_.reset();
         emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (id.has_value() && selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
     }
     if (selectedMarkerId_ == id) {
         update();
@@ -380,6 +408,10 @@ void ScoreOverlayBase::setSelectedLoopId(std::optional<std::int64_t> id) {
         selectedMarkerId_.reset();
         emit markerSelectionChanged(selectedMarkerId_);
     }
+    if (id.has_value() && selectedNoteId_.has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
     if (selectedLoopId_ == id) {
         update();
         return;
@@ -387,6 +419,39 @@ void ScoreOverlayBase::setSelectedLoopId(std::optional<std::int64_t> id) {
     selectedLoopId_ = id;
     update();
     emit loopSelectionChanged(selectedLoopId_);
+}
+
+void ScoreOverlayBase::setSelectedNoteId(std::optional<std::int64_t> id) {
+    const std::int64_t requestedRaw = id.value_or(-1);
+    if (id.has_value() && noteModel_
+        && !noteModel_->indexOf(*id).has_value()) {
+        FLOG_DEBUG("ui.score",
+                   "overlay set-selected-note-id={} coerced=stale-id",
+                   requestedRaw);
+        id = std::nullopt;
+    }
+    if (id.has_value() && selectedBarline_.has_value()) {
+        selectedBarline_.reset();
+        emit barlineSelectionChanged(selectedBarline_);
+    }
+    if (id.has_value() && selectedMarkerId_.has_value()) {
+        selectedMarkerId_.reset();
+        emit markerSelectionChanged(selectedMarkerId_);
+    }
+    if (id.has_value() && selectedLoopId_.has_value()) {
+        selectedLoopId_.reset();
+        emit loopSelectionChanged(selectedLoopId_);
+    }
+    if (selectedNoteId_ == id) {
+        update();
+        return;
+    }
+    FLOG_DEBUG("ui.score",
+               "overlay set-selected-note-id new={} prev={}",
+               id.value_or(-1), selectedNoteId_.value_or(-1));
+    selectedNoteId_ = id;
+    update();
+    emit noteSelectionChanged(selectedNoteId_);
 }
 
 void ScoreOverlayBase::setSecondaryAnchorMs(std::optional<std::int64_t> ms) {
@@ -428,10 +493,37 @@ void ScoreOverlayBase::onLoopModelChanged() {
     update();
 }
 
+void ScoreOverlayBase::onNoteModelChanged() {
+    // setInterval / setPitch keep the same ID, so a selected note
+    // survives a re-sort or a wheel-pitch-adjust; only an outright
+    // remove drops the selection. Same shape as the other models.
+    FLOG_DEBUG("ui.score",
+               "overlay note-model-changed widget={} size={} "
+               "selected-id={} duration-ms={} width-px={} "
+               "viewport=[{},{}]",
+               objectName().toStdString(),
+               noteModel_ ? noteModel_->size() : 0,
+               selectedNoteId_.value_or(-1),
+               durationMs(), width(),
+               viewportStartMs_, viewportEndMs_);
+    if (selectedNoteId_.has_value() && noteModel_
+        && !noteModel_->indexOf(*selectedNoteId_).has_value()) {
+        selectedNoteId_.reset();
+        emit noteSelectionChanged(selectedNoteId_);
+    }
+    update();
+}
+
 // ---- mouse + key handling ------------------------------------------------
 
 void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     if (event->button() != Qt::LeftButton || !hasContent()) {
+        FLOG_TRACE("ui.score",
+                   "overlay mouse-press widget={} button={} ignored "
+                   "reason={}",
+                   objectName().toStdString(),
+                   static_cast<int>(event->button()),
+                   hasContent() ? "non-left-button" : "no-content");
         QWidget::mousePressEvent(event);
         return;
     }
@@ -441,6 +533,15 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     const bool ctrlHeld =
         (event->modifiers() & Qt::ControlModifier) != 0;
     const auto tolMs = pixelsToMs(kHitTolerancePx);
+    FLOG_TRACE("ui.score",
+               "overlay mouse-press widget={} x={} y={} ms={} ctrl={} "
+               "sel-bar={} sel-marker={} sel-loop={} sel-note={}",
+               objectName().toStdString(),
+               x, event->pos().y(), ms, ctrlHeld,
+               selectedBarline_.value_or(static_cast<std::size_t>(-1)),
+               selectedMarkerId_.value_or(-1),
+               selectedLoopId_.value_or(-1),
+               selectedNoteId_.value_or(-1));
 
     // MEMO: hit-test priority — by default markers FIRST (labelled
     // and visually atop barlines, so a click on a flag should select
@@ -606,10 +707,37 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         update();
         emit markerSelectionChanged(selectedMarkerId_);
     }
+    // MEMO[#step6.1]: empty-space click on the score widgets also
+    // clears any active note selection — including across widgets.
+    // Asymmetry: notes paint only on the staff (in 6.1), so the
+    // waveform's own selectedNoteId_ is always empty. If we gated
+    // the emit on `if (selectedNoteId_.has_value())`, a click on
+    // the waveform would never tell the staff to deselect, leaving
+    // the dock's note property page stuck on the previous note —
+    // the exact bug surfaced in the user's transcription log.
+    //
+    // Fix: clear + emit UNCONDITIONALLY in the plain-seek branch.
+    // The application's mirror plumbing (MainWindow's
+    // onStaffNoteSelectionChanged / onWaveformNoteSelectionChanged)
+    // sees the emit and propagates the deselection to the sister
+    // widget and the dock. setSelectedNoteId is idempotent on
+    // already-empty, so the chain terminates cleanly.
+    selectedNoteId_.reset();
+    update();
+    emit noteSelectionChanged(selectedNoteId_);
     if (secondaryAnchorMs_.has_value()) {
         setSecondaryAnchorMs(std::nullopt);
     }
     emit seekRequested(ms);
+    // MEMO[#step6.1]: fire AFTER seekRequested so MainWindow's seek
+    // handler has updated playback first. Receivers (the dock's
+    // note property page) treat this as the user's "I'm done with
+    // the previous focus — give me a clean slate" cue and discard
+    // any pending draft. setSelectedNoteId(nullopt) won't reach the
+    // dock from here (the selection chain short-circuits when both
+    // sides are already null), so this dedicated signal is the only
+    // way to propagate the "discard draft" intent on plain seeks.
+    emit emptySpaceClicked();
     event->accept();
 }
 

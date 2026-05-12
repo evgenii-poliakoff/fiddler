@@ -180,19 +180,70 @@ When the pre-roll is on, a circular countdown widget appears at the bottom of th
 
 The pre-roll runs whenever playback resumes from Paused or Stopped — when you press Play, double-click a marker, or cancel and resume. Armed loops are the exception: they always play a pre-roll between repeats when pre-roll is enabled, even when playback is already running. This gives you the same ready-set-go cadence between every take.
 
-## 8. The project viewer dock
+## 8. Notes
 
-The dock on the right of the window lists every marker and loop in the recording, with a property page below the tree for editing the selected artifact.
+A *note* is a region of the recording over which you perceived a single pitch — onset, offset, and which pitch was sounding. Notes appear as horizontal green bars on the staff, anchored horizontally to their time interval and vertically to their pitch.
+
+![A note bar at A4 spanning a loop interval on the staff.](img/manual-note-bar.png)
+
+### Placing a note — two stages
+
+Note placement is deliberately two-click. The button at the bottom of the project viewer dock changes its label to tell you which stage you're in:
+
+| Button label | Meaning |
+|---|---|
+| **New Note …** | Nothing pending. Clicking begins a new note draft at the current playback position. |
+| **Add Note** | A new-note draft is open. The property page above shows its defaults; edit them, then click to commit the note to the staff. |
+| **Apply Changes to Note** | You're editing an existing note (selected from the Notes list). The property page reflects a *buffered* copy; click to apply your edits to the stored note, or click outside to discard. |
+
+The two-stage flow:
+
+1. **Seek** to the region you want to transcribe (click the waveform or staff).
+2. Click **New Note …** — the property page populates with the defaults (Start/End = playback ± 200 ms, Pitch = A4). No note is on the staff yet.
+3. Adjust the **Pitch** (and the interval / duration if needed). Pitch is entered in Scientific Pitch Notation: `A4`, `F5`, `C4`. Lowercase letters work and the field renders the canonical uppercase form after Enter. Naturals only in this build — `C#4` or `Bb3` are silently rejected.
+4. Click **Add Note** — the bar now appears on the staff.
+
+Clicking the waveform or anywhere outside a note while a draft is open *discards the draft* and the button label resets to **New Note …**.
+
+### Editing an existing note
+
+Click a note's row in the Notes list. The property page shows its current values and the button changes to **Apply Changes to Note**. Edits buffer in the property page; nothing is written back until you click the button. Clicking the waveform / another row instead discards the buffered changes.
+
+### Property page fields
+
+- *Pitch* — Scientific Pitch Notation. Naturals (`A4`, `C5`, `G3`) and **accidentals** (`F#4`, `A#5`, `Bb3`) are both accepted. The dock normalises flat input to sharp spelling — type `Bb4` and the field shows `A#4` (the enharmonic) on commit. The `(MIDI N)` label beside the field is the equivalent MIDI number. Accepted range is the violin's playable span: **G3 (open G string) to E7** — anything outside silently reverts to the previous valid value. Accidentals share the staff line of their natural-below (an A♯4 sits on the A4 space) but are rendered in a **cooler, teal-shifted green** so they're visually distinct from naturals. This matches the piano-roll convention every major DAW uses (Logic, Pro Tools, Ableton, FL Studio, Cubase…): no per-note ♯ glyph on the bar — pitch identity is conveyed by row + colour.
+- *Start* and *End* — interval boundaries in milliseconds. Each is clamped relative to the other so the interval stays valid (End ≥ Start + 1).
+- *Duration* — read-only, derived from `End − Start`.
+
+Notes outside the treble staff paint with short *ledger lines* at every line position between the note and the staff body — middle C below the staff, A5 above, and so on. The staff is tall enough to show the full violin range with the necessary ledger lines on both sides.
+
+### Notes vs barlines, markers, loops
+
+| | Anchor | What it represents |
+|---|---|---|
+| **Barline** | one source-time stamp | structural beat boundary |
+| **Marker** | one named source-time stamp | a cue point in your practice |
+| **Loop** | a named source-time range | a region you want to drill |
+| **Note** | a source-time range *and* a pitch | a perceived note in the tune |
+
+Notes are the only artifact that carries a pitch. **Delete** removes the selected note exactly like it removes the other artifact kinds; **Ctrl+Z** brings it back with its original interval and pitch.
+
+> *What's next.* The dock button is the foundation gesture. The follow-up step adds mouse-hover preview on the staff with an optional reference-tone synth so you can match a note's pitch to the recording by ear before committing it.
+
+## 9. The project viewer dock
+
+The dock on the right of the window lists every marker, loop, and note in the recording, with a property page below the tree for editing the selected artifact.
 
 ![The project viewer dock with markers and loops expanded.](img/manual-dock-detail.png)
 
-- *Tree.* Markers and Loops as two collapsible categories. Click a row to select; double-click a row to jump and play.
-- *Property page.* Shows the fields of the currently-selected artifact. Markers expose Name and Position; loops expose Name, Start, End, and the Armed checkbox.
+- *Tree.* Markers, Loops, and Notes as three collapsible categories. Click a row to select; double-click a row to jump and play.
+- *Property page.* Shows the fields of the currently-selected artifact. Markers expose Name and Position; loops expose Name, Start, End, and the Armed checkbox; notes expose Pitch, Start, End, and Duration (no per-note name — notes are anonymous, matching MuseScore / MusicXML conventions).
+- *Note button.* Below the property page — its label cycles among **New Note …**, **Add Note**, and **Apply Changes to Note** depending on what the dock is showing. See *§8 Notes* for the workflow.
 - *Pre-roll countdown.* When the pre-roll is enabled, the countdown ring appears at the bottom of the dock and animates during each pre-roll silence.
 
 Press **F4** to hide or show the dock. The dock's visibility persists across sessions, so a hidden dock stays hidden until you press **F4** again.
 
-## 9. Saving, opening, and undo
+## 10. Saving, opening, and undo
 
 ### Save and reopen
 
@@ -214,13 +265,13 @@ Note that closing the window with unsaved changes prompts you to save first; pic
 
 ### Undo
 
-Press **Ctrl+Z** to reverse the most recent edit. The undo history covers every kind of action across barlines, markers, and loops, in the order you took them: placements, drags, dock spinbox edits, renames, and deletes. Pre-roll changes — both the duration spinbox and the enable checkbox — are covered too. A deleted artifact returns with the same name and the same position it had before.
+Press **Ctrl+Z** to reverse the most recent edit. The undo history covers every kind of action across barlines, markers, loops, and notes, in the order you took them: placements, drags, dock spinbox edits, pitch edits, renames, and deletes. Pre-roll changes — both the duration spinbox and the enable checkbox — are covered too. A deleted artifact returns with the same name and the same position (or interval and pitch) it had before.
 
 Repeated **Ctrl+Z** presses walk back through the history one step at a time. When the history drains, further presses are quiet no-ops. Redo (**Ctrl+Shift+Z**) is on the roadmap.
 
 Note that the undo history resets when you load a project: **Ctrl+Z** does not reach across a Open call.
 
-## 10. Keyboard shortcuts
+## 11. Keyboard shortcuts
 
 | Key | Action | Where |
 |---|---|---|
@@ -246,7 +297,7 @@ Note that the undo history resets when you load a project: **Ctrl+Z** does not r
 | **Esc** | Clear the current selection | waveform, staff |
 | **← / →** | Step through artifacts of the same kind | waveform, staff |
 
-## 11. Reporting bugs
+## 12. Reporting bugs
 
 If something goes wrong, re-run Fiddler with the structured event log enabled and attach the resulting file to your bug report.
 
@@ -260,7 +311,7 @@ Every user-driven action — file open, play, pause, seek, tempo change, tap-to-
 
 Note that the log captures gestures and state, not audio content. The recording you had open is not embedded in the log.
 
-## 12. Glossary
+## 13. Glossary
 
 *Anchor*. A source-time position that serves as one endpoint of a loop. The primary anchor is the currently-selected artifact; the secondary anchor is set by Ctrl+clicking another artifact. Pressing **L** creates a loop spanning both.
 
@@ -271,6 +322,10 @@ Note that the log captures gestures and state, not audio content. The recording 
 *Loop*. A region of the recording, bounded by two source-time positions, that plays back repeatedly while armed.
 
 *Marker*. A labelled cue point in the recording. Tap **M** during playback to drop one at the playback position.
+
+*Note*. A labelled region of the recording paired with a perceived pitch. Added via the dock's Add Note button. Pitches are written in SPN (e.g., *A4*, *F5*) and restricted to naturals — sharps and flats arrive with the key-signature feature later.
+
+*SPN*. *Scientific Pitch Notation* — the standard letter+octave spelling for a pitch (*A4* = the A above middle C). Used throughout Fiddler's Pitch fields. *C4* is middle C.
 
 *Pre-roll*. A short silence inserted before audio resumes, giving you time to ready the bow. Set the duration in the transport row's Pre-roll spinbox.
 

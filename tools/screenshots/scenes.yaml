@@ -208,7 +208,28 @@
     horizontal: 12
     vertical: 12
 
-# ---- Chapter 8 — project viewer dock -------------------------------------
+# ---- Chapter 8 — notes ---------------------------------------------------
+
+# A handful of placed notes on the staff covering natural, sharp,
+# in-staff and ledger-below positions so the ledger and accidental
+# glyph layouts are visible. One note is selected so the selection
+# ring shows.
+- id: manual-note-bar
+  output: manual-note-bar.png
+  capture:
+    region: [staffWidget]
+  setup:
+    - load-fixture
+    - tap-barlines-at: 1000,3000,5000,7000
+    - add-note-at: 1100,1900,64        # E4 (bottom line)
+    - add-note-at: 2200,2700,69        # A4 (second-from-bottom space)
+    - add-note-at: 4000,4400,70        # A#4 (accidental on A4 line)
+    - add-note-at: 6000,6300,60        # C4 (middle C — ledger below)
+    - select-note: 2
+  margin:
+    vertical: 0
+
+# ---- Chapter 9 — project viewer dock -------------------------------------
 
 - id: manual-dock-detail
   output: manual-dock-detail.png
@@ -219,4 +240,6 @@
     - tap-markers-at: 1500,3500,5500
     - tap-barlines-at: 2000,4000,6000
     - build-loop-marker-pair: 1,3
+    - add-note-at: 1700,2300,64
+    - add-note-at: 4100,4700,69
     - select-loop: 1

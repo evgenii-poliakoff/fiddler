@@ -4,8 +4,10 @@
 #include "screenshot_fixture.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
 #include "ui/MainWindow.h"
 #include "ui/ProjectViewerDock.h"
+#include "ui/StaffWidget.h"
 #include "ui/WaveformWidget.h"
 
 #include <QComboBox>
@@ -240,6 +242,50 @@ void doShowPopup(ui::MainWindow& window, const QString& arg) {
     flushEvents();
 }
 
+// Add a note with explicit interval + pitch via the model directly.
+// Argument: "<startMs>,<endMs>,<midi>". Used by user-manual scenes
+// that want a deterministic note layout without depending on
+// transport state.
+void doAddNoteAt(ui::MainWindow& window, const QString& arg) {
+    const auto parts = arg.split(',', Qt::SkipEmptyParts);
+    if (parts.size() != 3) {
+        throw std::runtime_error(
+            "add-note-at: arg must be 'startMs,endMs,midi' (got '" +
+            arg.toStdString() + "')");
+    }
+    bool okS = false, okE = false, okM = false;
+    const qint64 startMs = parts[0].trimmed().toLongLong(&okS);
+    const qint64 endMs   = parts[1].trimmed().toLongLong(&okE);
+    const int    midi    = parts[2].trimmed().toInt(&okM);
+    if (!okS || !okE || !okM) {
+        throw std::runtime_error(
+            "add-note-at: each field must be an integer (got '" +
+            arg.toStdString() + "')");
+    }
+    auto& nm = const_cast<score::NoteModel&>(window.noteModel());
+    (void)nm.add(startMs, endMs, midi);
+    flushEvents();
+}
+
+// Select the Nth note (1-based) on the staff. After this the dock
+// mirrors the selection and the note bar paints with the selection
+// ring.
+void doSelectNote(ui::MainWindow& window, const QString& arg) {
+    bool ok = false;
+    const int ordinal = arg.toInt(&ok);
+    if (!ok || ordinal < 1) {
+        throw std::runtime_error(
+            "select-note: arg must be a 1-based ordinal (got '" +
+            arg.toStdString() + "')");
+    }
+    const auto& nm = window.noteModel();
+    if (nm.size() < static_cast<std::size_t>(ordinal)) return;
+    const auto id = nm.notes()[ordinal - 1].id;
+    auto* staff = window.findChild<ui::StaffWidget*>("staffWidget");
+    if (staff) staff->setSelectedNoteId(id);
+    flushEvents();
+}
+
 // Enter the wrap-pause / pre-roll countdown for the Nth loop with
 // the current pre-roll value. Uses MainWindow's existing test
 // seam so the countdown widget is visibly mid-state for capture.
@@ -277,6 +323,8 @@ const QHash<QString, ActionFn>& registry() {
         {"select-marker",           doSelectMarker},
         {"select-loop",             doSelectLoop},
         {"build-loop-marker-pair",  doBuildLoopMarkerPair},
+        {"add-note-at",             doAddNoteAt},
+        {"select-note",             doSelectNote},
         {"show-popup",              doShowPopup},
         {"enter-countdown",         doEnterCountdown},
     };

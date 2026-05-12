@@ -9,11 +9,14 @@
 #include "qt_test_app.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
 #include "ui/LoopCountdownWidget.h"
 #include "ui/ProjectViewerDock.h"
 
 #include <QCheckBox>
+#include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QSignalSpy>
 #include <QSpinBox>
 #include <QStackedWidget>
@@ -30,6 +33,7 @@
 
 using fiddler::score::LoopModel;
 using fiddler::score::MarkerModel;
+using fiddler::score::NoteModel;
 using fiddler::test::qtApp;
 using fiddler::ui::ProjectViewerDock;
 
@@ -141,10 +145,12 @@ TEST_CASE("ProjectViewerDock: with no model, tree is empty and 'no selection' sh
     ProjectViewerDock dock;
     auto* tree = treeOf(dock);
 
-    // Two top-level category headers: Markers + Loops. Both empty.
-    REQUIRE(tree->topLevelItemCount() == 2);
+    // Three top-level category headers: Markers + Loops + Notes.
+    // All empty.
+    REQUIRE(tree->topLevelItemCount() == 3);
     REQUIRE(tree->topLevelItem(0)->childCount() == 0);
     REQUIRE(tree->topLevelItem(1)->childCount() == 0);
+    REQUIRE(tree->topLevelItem(2)->childCount() == 0);
 
     // The "no selection" page is index 0 in the property stack.
     REQUIRE(stackOf(dock)->currentIndex() == 0);
@@ -979,4 +985,290 @@ TEST_CASE("ProjectViewerDock: disabling pre-roll mid-countdown cancels the widge
 
     dock.setPrerollEnabled(false);
     REQUIRE_FALSE(countdown->isCountingDown());
+}
+
+// ---------------------------------------------------------------------------
+// Notes section (Step 6.1)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ProjectViewerDock: setNoteModel adds Notes category and rows",
+          "[project-viewer-dock][gui][notes]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto* tree = treeOf(dock);
+
+    auto notes = std::make_shared<NoteModel>();
+    notes->add(1000, 1400, 64, "First");          // E4
+    notes->add(2000, 2400, 69, "Second");         // A4
+
+    dock.setNoteModel(notes);
+
+    // Notes category is the third top-level item (after Markers, Loops).
+    REQUIRE(tree->topLevelItemCount() == 3);
+    auto* notesCategory = tree->topLevelItem(2);
+    REQUIRE(notesCategory->text(0) == "Notes");
+    REQUIRE(notesCategory->childCount() == 2);
+    // Row label includes the SPN spelling.
+    REQUIRE(notesCategory->child(0)->text(0).contains("E4"));
+    REQUIRE(notesCategory->child(1)->text(0).contains("A4"));
+}
+
+TEST_CASE("ProjectViewerDock: Add Note button is disabled without a NoteModel",
+          "[project-viewer-dock][gui][notes]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto* button = dock.findChild<QPushButton*>("addNoteButton");
+    REQUIRE(button != nullptr);
+    REQUIRE_FALSE(button->isEnabled());
+
+    dock.setNoteModel(std::make_shared<NoteModel>());
+    REQUIRE(button->isEnabled());
+}
+
+TEST_CASE("ProjectViewerDock: Add Note button emits noteAddRequested",
+          "[project-viewer-dock][gui][notes]") {
+    qtApp();
+    ProjectViewerDock dock;
+    dock.setNoteModel(std::make_shared<NoteModel>());
+    auto* button = dock.findChild<QPushButton*>("addNoteButton");
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::noteAddRequested);
+    button->click();
+    REQUIRE(spy.count() == 1);
+}
+
+TEST_CASE("ProjectViewerDock: selecting a note enters Editing mode "
+          "and shows note property page",
+          "[project-viewer-dock][gui][notes]") {
+    // MEMO: state machine — clicking a note row puts the dock into
+    // Editing mode. Property page reflects buffered values (mirror
+    // of the model). No per-note Name field exists in the dock —
+    // names are an internal-only future-compat slot.
+    qtApp();
+    ProjectViewerDock dock;
+    auto* stack = stackOf(dock);
+    auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
+    auto* midiLabel = dock.findChild<QLabel*>("notePitchMidiLabel");
+    auto* startBox  = dock.findChild<QSpinBox*>("noteStartBox");
+    auto* endBox    = dock.findChild<QSpinBox*>("noteEndBox");
+    auto* durLabel  = dock.findChild<QLabel*>("noteDurationLabel");
+    auto* button    = dock.findChild<QPushButton*>("addNoteButton");
+    REQUIRE(pitchEdit != nullptr);
+    REQUIRE(midiLabel != nullptr);
+    REQUIRE(startBox  != nullptr);
+    REQUIRE(endBox    != nullptr);
+    REQUIRE(durLabel  != nullptr);
+    REQUIRE(button    != nullptr);
+
+    auto notes = std::make_shared<NoteModel>();
+    const auto id = notes->add(1000, 1400, 64);   // E4, 400 ms
+    dock.setNoteModel(notes);
+
+    dock.setSelectedNoteId(id);
+
+    // Page index 3 is the Note page (kPageNote in the dock impl).
+    REQUIRE(stack->currentIndex() == 3);
+    REQUIRE(pitchEdit->text() == "E4");
+    REQUIRE(midiLabel->text().contains("64"));
+    REQUIRE(startBox->value() == 1000);
+    REQUIRE(endBox->value() == 1400);
+    REQUIRE(durLabel->text().startsWith("400"));
+    REQUIRE(button->text() == "Apply Changes to Note");
+}
+
+TEST_CASE("ProjectViewerDock: invalid pitch input reverts to the buffered value",
+          "[project-viewer-dock][gui][notes]") {
+    // MEMO: range + parse validation in NoteModel::isAcceptedPitch
+    // is what the dock defers to. In the new state machine, edits
+    // update an in-memory buffer (not the model directly), so an
+    // out-of-range or unparseable entry reverts the line edit to
+    // the buffer's value. The model is only touched on button
+    // click — so no notePitchEditRequested signal is emitted from
+    // typing.
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    const auto id = notes->add(1000, 1400, 64);
+    dock.setNoteModel(notes);
+    dock.setSelectedNoteId(id);
+
+    auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
+
+    pitchEdit->setText("D2");                       // below violin range
+    emit pitchEdit->editingFinished();
+    REQUIRE(pitchEdit->text() == "E4");             // reverted to buffer
+    REQUIRE(notes->notes()[0].midi == 64);          // model untouched
+
+    pitchEdit->setText("F7");                       // above violin range
+    emit pitchEdit->editingFinished();
+    REQUIRE(pitchEdit->text() == "E4");
+    REQUIRE(notes->notes()[0].midi == 64);
+
+    pitchEdit->setText("Z9");                       // garbage
+    emit pitchEdit->editingFinished();
+    REQUIRE(pitchEdit->text() == "E4");
+    REQUIRE(notes->notes()[0].midi == 64);
+
+    pitchEdit->setText("C#5");                      // accidental — accepted
+    emit pitchEdit->editingFinished();
+    REQUIRE(pitchEdit->text() == "C#5");            // buffer updated
+    REQUIRE(notes->notes()[0].midi == 64);          // model still untouched
+
+    pitchEdit->setText("A4");                       // valid natural
+    emit pitchEdit->editingFinished();
+    REQUIRE(pitchEdit->text() == "A4");
+    REQUIRE(notes->notes()[0].midi == 64);
+}
+
+TEST_CASE("ProjectViewerDock: state machine — button label cycles Empty → "
+          "NewDraft → Empty",
+          "[project-viewer-dock][gui][notes][state-machine]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    dock.setNoteModel(notes);
+    auto* button = dock.findChild<QPushButton*>("addNoteButton");
+    REQUIRE(button->text() == "New Note ...");
+
+    // Enter NewDraft. Button label transitions; model untouched.
+    dock.enterNoteDraftMode(1000, 1400, 64);
+    REQUIRE(button->text() == "Add Note");
+    REQUIRE(notes->empty());
+
+    // Exit (via exitNoteMode — same path the user takes by clicking
+    // outside or a different row). Button returns to Empty.
+    dock.exitNoteMode();
+    REQUIRE(button->text() == "New Note ...");
+    REQUIRE(notes->empty());
+}
+
+TEST_CASE("ProjectViewerDock: state machine — selecting a note enters Editing, "
+          "button label = 'Apply Changes to Note'",
+          "[project-viewer-dock][gui][notes][state-machine]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    const auto id = notes->add(1000, 1400, 64);
+    dock.setNoteModel(notes);
+    auto* button = dock.findChild<QPushButton*>("addNoteButton");
+
+    dock.setSelectedNoteId(id);
+    REQUIRE(button->text() == "Apply Changes to Note");
+
+    dock.setSelectedNoteId(std::nullopt);
+    REQUIRE(button->text() == "New Note ...");
+}
+
+TEST_CASE("ProjectViewerDock: draft-mode field edits update buffer, "
+          "click commits to model",
+          "[project-viewer-dock][gui][notes][state-machine]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    dock.setNoteModel(notes);
+
+    QSignalSpy commitSpy(&dock,
+        &ProjectViewerDock::noteCommitNewRequested);
+
+    dock.enterNoteDraftMode(1000, 1400, 64);
+    auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
+    auto* button    = dock.findChild<QPushButton*>("addNoteButton");
+
+    // Edit pitch in draft. Buffer should update; model untouched.
+    pitchEdit->setText("G4");
+    emit pitchEdit->editingFinished();
+    REQUIRE(notes->empty());
+
+    // Click button to commit. Signal carries the buffered values.
+    button->click();
+    REQUIRE(commitSpy.count() == 1);
+    auto args = commitSpy.takeFirst();
+    REQUIRE(args.at(0).value<std::int64_t>() == 1000);   // startMs
+    REQUIRE(args.at(1).value<std::int64_t>() == 1400);   // endMs
+    REQUIRE(args.at(2).toInt()              == 67);      // G4
+
+    // After commit, exit back to Empty.
+    REQUIRE(button->text() == "New Note ...");
+}
+
+TEST_CASE("ProjectViewerDock: Editing-mode edits buffered, "
+          "'Apply Changes to Note' emits commit signal",
+          "[project-viewer-dock][gui][notes][state-machine]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    const auto id = notes->add(1000, 1400, 64);   // E4
+    dock.setNoteModel(notes);
+    dock.setSelectedNoteId(id);
+
+    QSignalSpy commitSpy(&dock,
+        &ProjectViewerDock::noteCommitChangesRequested);
+
+    auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
+    auto* button    = dock.findChild<QPushButton*>("addNoteButton");
+
+    // Edit pitch. Model untouched until commit.
+    pitchEdit->setText("F5");
+    emit pitchEdit->editingFinished();
+    REQUIRE(notes->notes()[0].midi == 64);
+
+    // Click "Apply Changes to Note" — commit signal carries id +
+    // buffered values.
+    button->click();
+    REQUIRE(commitSpy.count() == 1);
+    auto args = commitSpy.takeFirst();
+    REQUIRE(args.at(0).value<std::int64_t>() == id);
+    REQUIRE(args.at(3).toInt()              == 77);   // F5
+
+    // Exits to Empty (button label back to "New Note ...").
+    REQUIRE(button->text() == "New Note ...");
+}
+
+TEST_CASE("ProjectViewerDock: selecting a row while in NewDraft discards "
+          "the draft",
+          "[project-viewer-dock][gui][notes][state-machine]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto notes = std::make_shared<NoteModel>();
+    const auto id = notes->add(2000, 2400, 71);
+    dock.setNoteModel(notes);
+    auto* button = dock.findChild<QPushButton*>("addNoteButton");
+
+    dock.enterNoteDraftMode(500, 900, 60);
+    REQUIRE(button->text() == "Add Note");
+
+    // Clicking the existing note's row (programmatic select) should
+    // discard the draft and switch to Editing.
+    dock.setSelectedNoteId(id);
+    REQUIRE(button->text() == "Apply Changes to Note");
+}
+
+TEST_CASE("ProjectViewerDock: selecting a note clears marker / loop selection",
+          "[project-viewer-dock][gui][notes]") {
+    qtApp();
+    ProjectViewerDock dock;
+    const std::int64_t stamps[]   = { 1000 };
+    auto markers = makeModelWith(std::span<const std::int64_t>{stamps});
+    auto loops   = makeLoopModelWith(
+        std::span<const std::pair<std::int64_t, std::int64_t>>{
+            { {2000, 3000} } });
+    auto notes = std::make_shared<NoteModel>();
+    const auto noteId = notes->add(4000, 4400, 64);
+
+    dock.setMarkerModel(markers);
+    dock.setLoopModel(loops);
+    dock.setNoteModel(notes);
+
+    const auto markerId = markers->idAt(0).value();
+    dock.setSelectedMarkerId(markerId);
+    REQUIRE(dock.selectedMarkerId().has_value());
+
+    QSignalSpy markerSpy(&dock, &ProjectViewerDock::markerSelectionChanged);
+    QSignalSpy noteSpy  (&dock, &ProjectViewerDock::noteSelectionChanged);
+
+    dock.setSelectedNoteId(noteId);
+    REQUIRE(dock.selectedNoteId() == noteId);
+    REQUIRE_FALSE(dock.selectedMarkerId().has_value());
+    REQUIRE(markerSpy.count() == 1);
+    REQUIRE(noteSpy.count()   == 1);
 }

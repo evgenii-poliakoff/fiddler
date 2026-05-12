@@ -70,6 +70,7 @@ private:
     void paintLoops(QPainter& painter)         const;
     void paintBarlines(QPainter& painter)      const;
     void paintMarkers(QPainter& painter)       const;
+    void paintNotes(QPainter& painter)         const;
     void paintSelectedLoopEdges(QPainter& painter) const;
     void paintSecondaryAnchor(QPainter& painter) const;
     void paintCursor(QPainter& painter)        const;
@@ -77,6 +78,18 @@ private:
     // Pixel y-coordinates of the top and bottom staff lines.
     [[nodiscard]] int staffTopY()    const noexcept;
     [[nodiscard]] int staffBottomY() const noexcept;
+
+    // Pixel y-coordinate of a natural MIDI pitch on the treble staff.
+    // Bottom line (E4 / midi 64) sits at staffBottomY(); each diatonic
+    // step is half the staff-line spacing. Returns INT_MIN for
+    // non-natural pitches (caller guards against that — 6.1 model
+    // enforces naturals-only).
+    //
+    // MEMO[#6.1]: treble clef only; bass / alto staff arrive with
+    // multi-clef support later. The fixed reference also means a
+    // future "transpose by N semitones" affordance must apply to the
+    // input pitch before this maps to y.
+    [[nodiscard]] int staffYForPitch(int midi) const noexcept;
 
     std::int64_t durationMs_ = 0;
 };

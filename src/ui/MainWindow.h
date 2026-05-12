@@ -31,6 +31,7 @@ namespace fiddler::score {
 class BarlineModel;
 class LoopModel;
 class MarkerModel;
+class NoteModel;
 }
 
 namespace fiddler::ui {
@@ -174,6 +175,7 @@ public:
     [[nodiscard]] const score::BarlineModel& barlineModel() const noexcept;
     [[nodiscard]] const score::MarkerModel&  markerModel()  const noexcept;
     [[nodiscard]] const score::LoopModel&    loopModel()    const noexcept;
+    [[nodiscard]] const score::NoteModel&    noteModel()    const noexcept;
 
 protected:
     // MEMO: per-widget event filter installed on every input that
@@ -307,6 +309,17 @@ private slots:
     void onStaffLoopSelectionChanged   (std::optional<std::int64_t> id);
     void onDockLoopSelectionChanged    (std::optional<std::int64_t> id);
 
+    // Note selection mirroring (step 6.1). Notes paint only on the
+    // staff today, but the waveform still emits noteSelectionChanged
+    // on its plain-seek branch (with id=nullopt) so a click on an
+    // empty waveform area can deselect the staff's note — closing
+    // the dock's property page. Once 6.4 lands note hit-testing on
+    // the waveform too, the waveform's emits will start carrying
+    // real ids and this becomes a symmetric three-way mirror.
+    void onWaveformNoteSelectionChanged(std::optional<std::int64_t> id);
+    void onStaffNoteSelectionChanged   (std::optional<std::int64_t> id);
+    void onDockNoteSelectionChanged    (std::optional<std::int64_t> id);
+
     // Secondary-anchor mirroring (waveform <-> staff). The dock
     // doesn't track its own secondary anchor — it just emits gesture
     // signals that we translate into setSecondaryAnchorMs calls on
@@ -332,6 +345,11 @@ private slots:
     // transport into wrap-around mode (see updatePosition).
     void onLoopActivated(std::int64_t id);
 
+    // Dock fired noteActivated — seek to startMs and start playback.
+    // The 6.2 tone-synth work will hook here too, firing a brief
+    // pulse at the note's pitch.
+    void onNoteActivated(std::int64_t id);
+
     // The Arm checkbox on the loop property page was toggled.
     // `armed=true` arms the loop *without* seeking or auto-playing
     // (the user might be mid-listen and just want wrap-around to
@@ -347,6 +365,34 @@ private slots:
     void onDockLoopRangeEditRequested     (std::int64_t id,
                                            std::int64_t newStartMs,
                                            std::int64_t newEndMs);
+    void onDockNoteRenameRequested        (std::int64_t id, QString name);
+    void onDockNoteIntervalEditRequested  (std::int64_t id,
+                                           std::int64_t newStartMs,
+                                           std::int64_t newEndMs);
+    void onDockNotePitchEditRequested     (std::int64_t id, int newMidi);
+
+    // "New Note ..." button. The dock asks for the playback-derived
+    // defaults; we compute them (armed loop's interval if armed,
+    // else playback ± 200 ms; default pitch A4 = MIDI 69) and call
+    // back into projectViewerDock_->enterNoteDraftMode(...). The
+    // dock then shows the editable draft fields. No model touch.
+    void onDockAddNoteRequested();
+
+    // Commit the dock's NewDraft buffer to the model — one new note
+    // with the buffered (startMs, endMs, midi). Pushes one undo
+    // entry.
+    void onDockNoteCommitNewRequested(std::int64_t startMs,
+                                      std::int64_t endMs,
+                                      int          midi);
+
+    // Commit the dock's Editing buffer to an existing model note —
+    // applies whichever of (interval, pitch) actually differs from
+    // the current model values. Pushes one undo entry per changed
+    // field (or none if buffer == model).
+    void onDockNoteCommitChangesRequested(std::int64_t id,
+                                          std::int64_t startMs,
+                                          std::int64_t endMs,
+                                          int          midi);
 
     // Connected to LoopModel::changed — drops the armed state if
     // the armed loop has been removed from the model.
@@ -357,6 +403,7 @@ private slots:
     void onBarlineDeleteRequested(std::size_t index);
     void onMarkerDeleteRequested (std::int64_t id);
     void onLoopDeleteRequested   (std::int64_t id);
+    void onNoteDeleteRequested   (std::int64_t id);
 
     // Drag-to-nudge requests from the score widgets (issue #11).
     // Fired per mouse-move while the drag is in flight; we just
@@ -510,6 +557,7 @@ private:
     std::shared_ptr<score::BarlineModel> barlineModel_;
     std::shared_ptr<score::MarkerModel>  markerModel_;
     std::shared_ptr<score::LoopModel>    loopModel_;
+    std::shared_ptr<score::NoteModel>    noteModel_;
 
     // MEMO: invariant — selection mirrors are one-shot, not loops.
     // Each widget (and now the dock) emits *SelectionChanged when

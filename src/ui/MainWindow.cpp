@@ -10,6 +10,8 @@
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
+#include "score/NoteModel.h"
+#include "score/Pitch.h"
 #include "score/Serialize.h"
 #include "ui/ProjectViewerDock.h"
 #include "ui/ScoreOverlayBase.h"
@@ -158,7 +160,8 @@ MainWindow::MainWindow(QWidget* parent)
     , player_(std::make_unique<audio::Player>())
     , barlineModel_(std::make_shared<score::BarlineModel>())
     , markerModel_(std::make_shared<score::MarkerModel>())
-    , loopModel_(std::make_shared<score::LoopModel>()) {
+    , loopModel_(std::make_shared<score::LoopModel>())
+    , noteModel_(std::make_shared<score::NoteModel>()) {
     // Listen for loop removals so we can drop armedLoopId_ if the
     // armed loop disappears (Del or Ctrl+Z). The model's signal is
     // the only way to find out; widgets and the dock route their
@@ -280,6 +283,10 @@ const score::MarkerModel& MainWindow::markerModel() const noexcept {
 
 const score::LoopModel& MainWindow::loopModel() const noexcept {
     return *loopModel_;
+}
+
+const score::NoteModel& MainWindow::noteModel() const noexcept {
+    return *noteModel_;
 }
 
 void MainWindow::buildMenus() {
@@ -407,6 +414,7 @@ void MainWindow::buildCentralWidget() {
     waveform_->setBarlineModel(barlineModel_);
     waveform_->setMarkerModel(markerModel_);
     waveform_->setLoopModel(loopModel_);
+    waveform_->setNoteModel(noteModel_);
     connect(waveform_, &WaveformWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 // MEMO: log includes the source ("waveform-click")
@@ -429,6 +437,21 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(waveform_, &WaveformWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    // MEMO[#step6.1]: notes don't paint on the waveform yet, but the
+    // waveform's plain-seek branch emits noteSelectionChanged on every
+    // empty-space click so the staff and dock can drop their note
+    // selection in lockstep. See onWaveformNoteSelectionChanged.
+    connect(waveform_, &WaveformWidget::noteSelectionChanged,
+            this, &MainWindow::onWaveformNoteSelectionChanged);
+    // Empty-space click → discard any pending note draft in the
+    // dock. The selection chain alone misses this because in
+    // NewDraft mode no widget has selectedNoteId set, so a
+    // setSelectedNoteId(nullopt) call hits the no-op-equal early
+    // return. Hooking emptySpaceClicked directly avoids that.
+    connect(waveform_, &WaveformWidget::emptySpaceClicked,
+            this, [this]() {
+                if (projectViewerDock_) projectViewerDock_->exitNoteMode();
+            });
     // Viewport / zoom (#49). Either widget can be the source of
     // a zoom gesture; the slot syncs the partner and the scrollbar.
     connect(waveform_, &ScoreOverlayBase::viewportChanged,
@@ -464,6 +487,7 @@ void MainWindow::buildCentralWidget() {
     staff_->setBarlineModel(barlineModel_);
     staff_->setMarkerModel(markerModel_);
     staff_->setLoopModel(loopModel_);
+    staff_->setNoteModel(noteModel_);
     connect(staff_, &StaffWidget::seekRequested,
             this, [this](std::int64_t ms) {
                 FLOG_DEBUG("ui.score",
@@ -482,6 +506,14 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onBarlineDeleteRequested);
     connect(staff_, &StaffWidget::markerDeleteRequested,
             this, &MainWindow::onMarkerDeleteRequested);
+    connect(staff_, &StaffWidget::noteSelectionChanged,
+            this, &MainWindow::onStaffNoteSelectionChanged);
+    connect(staff_, &StaffWidget::noteDeleteRequested,
+            this, &MainWindow::onNoteDeleteRequested);
+    connect(staff_, &StaffWidget::emptySpaceClicked,
+            this, [this]() {
+                if (projectViewerDock_) projectViewerDock_->exitNoteMode();
+            });
     connect(staff_, &ScoreOverlayBase::viewportChanged,
             this, &MainWindow::onViewportChanged);
     connect(staff_, &ScoreOverlayBase::userScrolled,
@@ -574,6 +606,7 @@ void MainWindow::buildCentralWidget() {
     projectViewerDock_ = new ProjectViewerDock(this);
     projectViewerDock_->setMarkerModel(markerModel_);
     projectViewerDock_->setLoopModel(loopModel_);
+    projectViewerDock_->setNoteModel(noteModel_);
     // Sync the dock's countdown-widget visibility with our current
     // prerollEnabled_ state. restoreLayout() will push the
     // persisted value through later if a previous session saved
@@ -624,6 +657,28 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopRangeEditRequested,
             this, &MainWindow::onDockLoopRangeEditRequested);
+
+    // Note dock signals (step 6.1).
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteSelectionChanged,
+            this, &MainWindow::onDockNoteSelectionChanged);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteDeleteRequested,
+            this, &MainWindow::onNoteDeleteRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteActivated,
+            this, &MainWindow::onNoteActivated);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteAddRequested,
+            this, &MainWindow::onDockAddNoteRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteCommitNewRequested,
+            this, &MainWindow::onDockNoteCommitNewRequested);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::noteCommitChangesRequested,
+            this, &MainWindow::onDockNoteCommitChangesRequested);
+    // Legacy per-field signals are no longer wired — see the
+    // state-machine refactor in #step6.1.
 
     // ---- View menu ------------------------------------------------------
     // MEMO: built here (not in buildMenus) because it needs the
@@ -872,6 +927,7 @@ bool MainWindow::loadFile(const QString& path) {
     barlineModel_->clear();
     markerModel_->clear();
     loopModel_->clear();
+    noteModel_->clear();
     undoHistory_.clear();
 
     // Disarm any previously-armed loop. loopModel_->clear() above
@@ -1368,18 +1424,30 @@ void MainWindow::onUndo() {
         } else if constexpr (std::is_same_v<E, undo::AddLoop>) {
             loopModel_->remove(e.id);
             kind = "add-loop";
+        } else if constexpr (std::is_same_v<E, undo::AddNote>) {
+            noteModel_->remove(e.id);
+            kind = "add-note";
         } else if constexpr (std::is_same_v<E, undo::EditMarkerPos>) {
             markerModel_->setPosition(e.id, e.prevSourceMs);
             kind = "edit-marker-pos";
         } else if constexpr (std::is_same_v<E, undo::EditLoopRange>) {
             loopModel_->setRange(e.id, e.prevStartMs, e.prevEndMs);
             kind = "edit-loop-range";
+        } else if constexpr (std::is_same_v<E, undo::EditNoteInterval>) {
+            noteModel_->setInterval(e.id, e.prevStartMs, e.prevEndMs);
+            kind = "edit-note-interval";
+        } else if constexpr (std::is_same_v<E, undo::EditNotePitch>) {
+            noteModel_->setPitch(e.id, e.prevMidi);
+            kind = "edit-note-pitch";
         } else if constexpr (std::is_same_v<E, undo::RenameMarker>) {
             markerModel_->rename(e.id, e.prevName);
             kind = "rename-marker";
         } else if constexpr (std::is_same_v<E, undo::RenameLoop>) {
             loopModel_->rename(e.id, e.prevName);
             kind = "rename-loop";
+        } else if constexpr (std::is_same_v<E, undo::RenameNote>) {
+            noteModel_->rename(e.id, e.prevName);
+            kind = "rename-note";
         } else if constexpr (std::is_same_v<E, undo::DeleteBarline>) {
             barlineModel_->add(e.sourceMs);
             kind = "delete-barline";
@@ -1389,6 +1457,9 @@ void MainWindow::onUndo() {
         } else if constexpr (std::is_same_v<E, undo::DeleteLoop>) {
             loopModel_->addWithId(e.id, e.startMs, e.endMs, e.name);
             kind = "delete-loop";
+        } else if constexpr (std::is_same_v<E, undo::DeleteNote>) {
+            noteModel_->addWithId(e.id, e.startMs, e.endMs, e.midi, e.name);
+            kind = "delete-note";
         } else if constexpr (std::is_same_v<E, undo::EditPrerollMs>) {
             setPrerollMs(e.prevMs);
             kind = "edit-preroll-ms";
@@ -1405,10 +1476,11 @@ void MainWindow::onUndo() {
     recomputeDirty();
 
     FLOG_DEBUG("ui.score",
-               "undo kind={} bar-size={} marker-size={} loop-size={}",
+               "undo kind={} bar-size={} marker-size={} "
+               "loop-size={} note-size={}",
                kind,
                barlineModel_->size(), markerModel_->size(),
-               loopModel_->size());
+               loopModel_->size(), noteModel_->size());
 }
 
 void MainWindow::onCreateLoop() {
@@ -2068,6 +2140,246 @@ void MainWindow::onDockLoopRangeEditRequested(std::int64_t id,
                id, prevStartMs, prevEndMs, newStartMs, newEndMs);
 }
 
+// ---- Note flow (Step 6.1) ------------------------------------------------
+
+void MainWindow::onNoteActivated(std::int64_t id) {
+    // Double-click on a note row in the dock: seek to the note's
+    // start and start playback. Same "jump-and-play" idiom as
+    // markers and loops. 6.2 will additionally fire a reference
+    // tone at the note's pitch.
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) return;
+    const auto& n = noteModel_->notes()[*idx];
+    onSeek(static_cast<int>(n.startMs));
+    if (player_ && player_->hasAudioOutput()
+        && player_->state() != audio::TransportState::Playing) {
+        onPlayPause();
+    }
+    FLOG_DEBUG("ui.score", "note-activated id={} startMs={} midi={}",
+               id, n.startMs, n.midi);
+}
+
+void MainWindow::onNoteDeleteRequested(std::int64_t id) {
+    // Snapshot the full state pre-delete so Ctrl+Z can restore
+    // the same id + interval + pitch + name via NoteModel::addWithId.
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) return;
+    const auto& n = noteModel_->notes()[*idx];
+    const auto startMs = n.startMs;
+    const auto endMs   = n.endMs;
+    const auto midi    = n.midi;
+    const auto name    = n.name;
+    noteModel_->remove(id);
+    pushUndoEntry(undo::DeleteNote{id, startMs, endMs, midi, name});
+    FLOG_DEBUG("ui.score", "delete-note id={} size={}",
+               id, noteModel_->size());
+}
+
+void MainWindow::onDockNoteRenameRequested(std::int64_t id,
+                                           QString      name) {
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) {
+        FLOG_WARN("ui.score",
+                  "rename-note id={} via=dock-name skipped reason=stale-id",
+                  id);
+        return;
+    }
+    const auto prevName = noteModel_->notes()[*idx].name;
+    if (prevName == name) {
+        FLOG_DEBUG("ui.score",
+                   "rename-note id={} via=dock-name no-op-equal name='{}'",
+                   id, name.toStdString());
+        return;
+    }
+    pushUndoEntry(undo::RenameNote{id, prevName});
+    noteModel_->rename(id, std::move(name));
+    FLOG_DEBUG("ui.score", "rename-note id={} via=dock-name "
+               "from='{}' to='{}'",
+               id, prevName.toStdString(),
+               noteModel_->notes()[*idx].name.toStdString());
+}
+
+void MainWindow::onDockNoteIntervalEditRequested(std::int64_t id,
+                                                 std::int64_t newStartMs,
+                                                 std::int64_t newEndMs) {
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) {
+        FLOG_WARN("ui.score",
+                  "edit-note-interval id={} skipped reason=stale-id", id);
+        return;
+    }
+    const auto& n = noteModel_->notes()[*idx];
+    const auto prevStartMs = n.startMs;
+    const auto prevEndMs   = n.endMs;
+    if (prevStartMs == newStartMs && prevEndMs == newEndMs) {
+        FLOG_DEBUG("ui.score",
+                   "edit-note-interval id={} via=dock-spinbox "
+                   "no-op-equal start={} end={}",
+                   id, newStartMs, newEndMs);
+        return;
+    }
+    pushUndoEntry(undo::EditNoteInterval{id, prevStartMs, prevEndMs});
+    noteModel_->setInterval(id, newStartMs, newEndMs);
+    FLOG_DEBUG("ui.score",
+               "edit-note-interval id={} from=[{},{}] to=[{},{}] "
+               "via=dock-spinbox",
+               id, prevStartMs, prevEndMs, newStartMs, newEndMs);
+}
+
+void MainWindow::onDockNotePitchEditRequested(std::int64_t id,
+                                              int          newMidi) {
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) {
+        FLOG_WARN("ui.score",
+                  "edit-note-pitch id={} skipped reason=stale-id", id);
+        return;
+    }
+    const auto prevMidi = noteModel_->notes()[*idx].midi;
+    if (prevMidi == newMidi) {
+        FLOG_DEBUG("ui.score",
+                   "edit-note-pitch id={} via=dock-pitch no-op-equal midi={}",
+                   id, newMidi);
+        return;
+    }
+    pushUndoEntry(undo::EditNotePitch{id, prevMidi});
+    noteModel_->setPitch(id, newMidi);
+    FLOG_DEBUG("ui.score",
+               "edit-note-pitch id={} from={} to={} via=dock-pitch",
+               id, prevMidi, newMidi);
+}
+
+void MainWindow::onDockAddNoteRequested() {
+    // Dock entered Empty mode and the user clicked "New Note ...".
+    // We compute defaults from transport state and ask the dock to
+    // enter NewDraft mode with those values. No model touch — the
+    // model only changes when the user later clicks "Add Note"
+    // (the commit gesture), which routes to
+    // onDockNoteCommitNewRequested.
+    constexpr std::int64_t kDefaultHalfDurationMs = 200;
+    constexpr int          kDefaultMidi           = 69;
+    std::int64_t startMs;
+    std::int64_t endMs;
+    const char*  source;
+    if (armedLoopId_.has_value() && loopModel_) {
+        const auto idx = loopModel_->indexOf(*armedLoopId_);
+        if (idx) {
+            const auto& l = loopModel_->loops()[*idx];
+            startMs = l.startMs;
+            endMs   = l.endMs;
+            source  = "armed-loop";
+        } else {
+            startMs = 0;
+            endMs   = kDefaultHalfDurationMs * 2;
+            source  = "loop-stale";
+        }
+    } else {
+        const std::int64_t pos = player_ ? player_->position().count()
+                                         : std::int64_t{0};
+        startMs = std::max<std::int64_t>(0, pos - kDefaultHalfDurationMs);
+        endMs   = startMs + kDefaultHalfDurationMs * 2;
+        source  = "playback-pos";
+    }
+    FLOG_DEBUG("ui.score",
+               "enter-note-draft via={} start={} end={} midi={}",
+               source, startMs, endMs, kDefaultMidi);
+    if (projectViewerDock_) {
+        projectViewerDock_->enterNoteDraftMode(startMs, endMs, kDefaultMidi);
+    }
+}
+
+void MainWindow::onDockNoteCommitNewRequested(std::int64_t startMs,
+                                              std::int64_t endMs,
+                                              int          midi) {
+    const auto id = noteModel_->add(startMs, endMs, midi);
+    if (id == 0) {
+        FLOG_WARN("ui.score",
+                  "commit-new-note rejected start={} end={} midi={}",
+                  startMs, endMs, midi);
+        return;
+    }
+    pushUndoEntry(undo::AddNote{id});
+    FLOG_DEBUG("ui.score",
+               "commit-new-note id={} start={} end={} midi={} size={}",
+               id, startMs, endMs, midi, noteModel_->size());
+}
+
+void MainWindow::onDockNoteCommitChangesRequested(std::int64_t id,
+                                                  std::int64_t startMs,
+                                                  std::int64_t endMs,
+                                                  int          midi) {
+    const auto idx = noteModel_->indexOf(id);
+    if (!idx) {
+        FLOG_WARN("ui.score",
+                  "commit-note-changes id={} skipped reason=stale-id", id);
+        return;
+    }
+    const auto& n = noteModel_->notes()[*idx];
+    const bool intervalChanged = (n.startMs != startMs || n.endMs != endMs);
+    const bool pitchChanged    = (n.midi    != midi);
+    if (!intervalChanged && !pitchChanged) {
+        FLOG_DEBUG("ui.score",
+                   "commit-note-changes id={} no-op (buffer == model)", id);
+        return;
+    }
+    // Push one undo entry per changed field so each can be peeled
+    // back independently. Order: interval first, then pitch — this
+    // matches the order the user typically edits.
+    if (intervalChanged) {
+        pushUndoEntry(undo::EditNoteInterval{id, n.startMs, n.endMs});
+        noteModel_->setInterval(id, startMs, endMs);
+        FLOG_DEBUG("ui.score",
+                   "commit-note-changes id={} interval from=[{},{}] to=[{},{}]",
+                   id, n.startMs, n.endMs, startMs, endMs);
+    }
+    if (pitchChanged) {
+        // Read prevMidi from the model AGAIN — setInterval above may
+        // have reordered or otherwise touched the entry.
+        const auto idx2 = noteModel_->indexOf(id);
+        const int prevMidi = idx2 ? noteModel_->notes()[*idx2].midi : n.midi;
+        pushUndoEntry(undo::EditNotePitch{id, prevMidi});
+        noteModel_->setPitch(id, midi);
+        FLOG_DEBUG("ui.score",
+                   "commit-note-changes id={} pitch from={} to={}",
+                   id, prevMidi, midi);
+    }
+}
+
+void MainWindow::onWaveformNoteSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    // Waveform's plain-seek branch emits this unconditionally with
+    // id=nullopt so an empty-space click on the waveform clears the
+    // staff's note selection (and via the staff's mirror, the
+    // dock's). Without this, the dock's note property page would
+    // survive the click and the user would be "stuck" editing a
+    // note they've already moved past — the exact stack-on-previous
+    // trap. See ScoreOverlayBase::mousePressEvent's plain-seek
+    // branch.
+    FLOG_DEBUG("ui.score",
+               "note-selection mirror from=waveform to=staff id={}",
+               id.value_or(-1));
+    if (staff_) staff_->setSelectedNoteId(id);
+}
+
+void MainWindow::onStaffNoteSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    // Mirror staff → dock. (Waveform doesn't paint notes in 6.1.)
+    FLOG_DEBUG("ui.score",
+               "note-selection mirror from=staff to=dock id={}",
+               id.value_or(-1));
+    if (projectViewerDock_) projectViewerDock_->setSelectedNoteId(id);
+}
+
+void MainWindow::onDockNoteSelectionChanged(
+    std::optional<std::int64_t> id)
+{
+    FLOG_DEBUG("ui.score",
+               "note-selection mirror from=dock to=staff id={}",
+               id.value_or(-1));
+    if (staff_) staff_->setSelectedNoteId(id);
+}
+
 void MainWindow::onDragStarted() {
     // MEMO[#40]: pre-#40 we stopped the 50 ms position poll here
     // because Player::seek() blocked the GUI for ~140 ms on the
@@ -2149,6 +2461,22 @@ void MainWindow::onDeleteSelectedArtifact() {
         FLOG_DEBUG("ui.score",
                    "delete-loop id={} via=window-shortcut size={}",
                    id, loopModel_->size());
+    } else if (staff_) {
+        // MEMO: notes are not painted on the waveform in 6.1, so
+        // the note-selection slot only ever lives on the staff. The
+        // mirror plumbing above keeps barline / marker / loop
+        // selection on the waveform in sync, but note selection
+        // intentionally doesn't reach it. Read from the staff here.
+        if (const auto nid = staff_->selectedNoteId()) {
+            const auto id = *nid;
+            onNoteDeleteRequested(id);
+            FLOG_DEBUG("ui.score",
+                       "delete-note id={} via=window-shortcut size={}",
+                       id, noteModel_->size());
+        } else {
+            FLOG_DEBUG("ui.score",
+                       "delete via=window-shortcut no-selection");
+        }
     } else {
         FLOG_DEBUG("ui.score", "delete via=window-shortcut no-selection");
     }
@@ -2556,6 +2884,7 @@ bool MainWindow::saveProject(const QString& path) {
     root["barlines"]  = score::toJson(*barlineModel_);
     root["markers"]   = score::toJson(*markerModel_);
     root["loops"]     = score::toJson(*loopModel_);
+    root["notes"]     = score::toJson(*noteModel_);
 
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -2573,11 +2902,13 @@ bool MainWindow::saveProject(const QString& path) {
     projectPath_ = path;
     markClean();
     updateWindowTitle();
-    FLOG_DEBUG("ui.file", "save: path={} barlines={} markers={} loops={}",
+    FLOG_DEBUG("ui.file",
+               "save: path={} barlines={} markers={} loops={} notes={}",
                path.toStdString(),
                barlineModel_->size(),
                markerModel_->size(),
-               loopModel_->size());
+               loopModel_->size(),
+               noteModel_->size());
     return true;
 }
 
@@ -2632,13 +2963,16 @@ bool MainWindow::openProject(const QString& path) {
         || !score::loadFrom(*markerModel_,
                             root.value("markers").toArray())
         || !score::loadFrom(*loopModel_,
-                            root.value("loops").toArray())) {
+                            root.value("loops").toArray())
+        || !score::loadFrom(*noteModel_,
+                            root.value("notes").toArray())) {
         showWarning(this, tr("Open failed"),
             tr("%1 contains malformed entries; "
                "loading was aborted.").arg(path));
         barlineModel_->clear();
         markerModel_->clear();
         loopModel_->clear();
+        noteModel_->clear();
         return false;
     }
     // Time signature + pre-roll.
@@ -2661,11 +2995,13 @@ bool MainWindow::openProject(const QString& path) {
     markClean();
     updateWindowTitle();
     FLOG_DEBUG("ui.file",
-               "open-project: path={} audio={} barlines={} markers={} loops={}",
+               "open-project: path={} audio={} "
+               "barlines={} markers={} loops={} notes={}",
                path.toStdString(), audioPath.toStdString(),
                barlineModel_->size(),
                markerModel_->size(),
-               loopModel_->size());
+               loopModel_->size(),
+               noteModel_->size());
     return true;
 }
 

@@ -12,6 +12,8 @@ add_executable(fiddler_tests
     test_loop_model.cpp
     test_main_window.cpp
     test_marker_model.cpp
+    test_note_model.cpp
+    test_pitch.cpp
     test_project_viewer_dock.cpp
     test_ringbuffer.cpp
     test_staff_widget.cpp
@@ -66,6 +68,8 @@ target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/MarkerModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/NoteModel.cpp
+    ${CMAKE_SOURCE_DIR}/src/score/Pitch.cpp
     ${CMAKE_SOURCE_DIR}/src/score/Serialize.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/LoopCountdownWidget.cpp
     ${CMAKE_SOURCE_DIR}/src/ui/MainWindow.cpp
