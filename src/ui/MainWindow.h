@@ -405,6 +405,14 @@ private slots:
     void onLoopDeleteRequested   (std::int64_t id);
     void onNoteDeleteRequested   (std::int64_t id);
 
+    // Piano-roll click-to-place (step 6.2). The staff emits this
+    // when a click lands on an empty grid cell. We add a note to
+    // the model at (ms, midi) with default duration (armed loop's
+    // interval if armed, else ± 200 ms around ms), push an undo
+    // entry, and select the new note. Discards any pending dock
+    // draft along the way.
+    void onStaffPlaceNoteRequested(std::int64_t ms, int midi);
+
     // Drag-to-nudge requests from the score widgets (issue #11).
     // Fired per mouse-move while the drag is in flight; we just
     // forward to the model. Logging happens on the *Committed slots

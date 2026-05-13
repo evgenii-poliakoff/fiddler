@@ -153,11 +153,14 @@ ScoreOverlayBase::primaryAnchorMs() const noexcept {
 }
 
 std::int64_t ScoreOverlayBase::pixelsToMs(int px) const noexcept {
-    // Pixel→ms scale by sampling xToMs at the origin and at `px`.
-    // Picks up the viewport zoom automatically: at deep zoom-in a
-    // given pixel count maps to a smaller ms span, so hit-tests
-    // tighten in lockstep with what the user sees.
-    return xToMs(px) - xToMs(0);
+    // Pixel→ms scale by sampling xToMs at two points INSIDE the
+    // time axis (i.e. past leftMarginPx()), so the piano-roll
+    // keyboard column doesn't collapse the answer to zero. Picks up
+    // the viewport zoom automatically: at deep zoom-in a given
+    // pixel count maps to a smaller ms span, so hit-tests tighten
+    // in lockstep with what the user sees.
+    const int lm = leftMarginPx();
+    return xToMs(lm + px) - xToMs(lm);
 }
 
 // ---- viewport / coord transforms (#49) -----------------------------------
@@ -181,27 +184,33 @@ EffectiveRange effectiveRange(std::int64_t viewportStart,
 } // namespace
 
 std::int64_t ScoreOverlayBase::xToMs(int x) const noexcept {
+    // MEMO[#step6.2]: leftMarginPx() reserves the leftmost pixels
+    // for a non-time region (the piano keyboard column on the
+    // StaffWidget). The time axis maps onto [lm, width()).
+    const int lm = leftMarginPx();
+    const int xInGrid = x - lm;
     const std::int64_t dur = durationMs();
-    const int w = width();
+    const int w = width() - lm;
     if (dur <= 0 || w <= 0) return 0;
     const auto [vStart, vEnd] =
         effectiveRange(viewportStartMs_, viewportEndMs_, dur);
     const std::int64_t span = vEnd - vStart;
     if (span <= 0) return 0;
     const std::int64_t ms =
-        vStart + static_cast<std::int64_t>(x) * span / w;
+        vStart + static_cast<std::int64_t>(xInGrid) * span / w;
     return std::clamp<std::int64_t>(ms, 0, dur);
 }
 
 int ScoreOverlayBase::msToX(std::int64_t ms) const noexcept {
+    const int lm = leftMarginPx();
     const std::int64_t dur = durationMs();
-    const int w = width();
+    const int w = width() - lm;
     if (dur <= 0 || w <= 0) return 0;
     const auto [vStart, vEnd] =
         effectiveRange(viewportStartMs_, viewportEndMs_, dur);
     const std::int64_t span = vEnd - vStart;
     if (span <= 0) return 0;
-    const std::int64_t x =
+    const std::int64_t xInGrid =
         (ms - vStart) * static_cast<std::int64_t>(w) / span;
     // MEMO[#49 smoke]: pre-fix this clamped to [0, w-1], so an
     // off-screen artifact rendered against the leftmost or
@@ -211,8 +220,8 @@ int ScoreOverlayBase::msToX(std::int64_t ms) const noexcept {
     // We only nudge the exact right-edge case (ms == vEnd gives
     // x == w on integer math) to w-1 so the rightmost column
     // can still paint a marker landing exactly at the boundary.
-    if (x == w) return w - 1;
-    return static_cast<int>(x);
+    if (xInGrid == w) return lm + static_cast<int>(w - 1);
+    return lm + static_cast<int>(xInGrid);
 }
 
 bool ScoreOverlayBase::isZoomed() const noexcept {
@@ -529,6 +538,18 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     }
     setFocus();
     const int x = event->pos().x();
+    // MEMO[#step6.2]: ignore clicks in the leftMarginPx() region
+    // (the piano-keyboard column on the staff). The keyboard is a
+    // visual / future-tone-preview surface, not a click target for
+    // seek or placement.
+    if (x < leftMarginPx()) {
+        FLOG_TRACE("ui.score",
+                   "overlay mouse-press widget={} x={} ignored "
+                   "reason=left-margin (kbWidth={})",
+                   objectName().toStdString(), x, leftMarginPx());
+        event->accept();
+        return;
+    }
     const auto ms = xToMs(x);
     const bool ctrlHeld =
         (event->modifiers() & Qt::ControlModifier) != 0;
@@ -680,7 +701,27 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         return;
     }
 
-    // 4. No artifact hit. Ctrl+click on empty space is a no-op so
+    // 4. Note bar hit? (step 6.2 — piano-roll). The subclass
+    // overrides hitNote() to consult its chromatic-row geometry
+    // and the NoteModel. On hit we behave like the barline /
+    // marker branches: select + seek to the note's startMs.
+    // Important: this branch must beat the empty-space placement
+    // below — otherwise a click on an existing bar would add a
+    // second overlapping note instead of selecting the first.
+    if (noteModel_ && noteModel_->size() > 0) {
+        if (const auto noteId = hitNote(x, event->pos().y())) {
+            const auto idx = noteModel_->indexOf(*noteId);
+            if (idx) {
+                prepareClickStateChange();
+                setSelectedNoteId(*noteId);
+                emit seekRequested(noteModel_->notes()[*idx].startMs);
+                event->accept();
+                return;
+            }
+        }
+    }
+
+    // 5. No artifact hit. Ctrl+click on empty space is a no-op so
     // the user can't accidentally lose their second anchor by
     // missing a tick. Plain click clears barline + marker
     // selections (and the secondary anchor) and seeks.
@@ -738,6 +779,12 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     // sides are already null), so this dedicated signal is the only
     // way to propagate the "discard draft" intent on plain seeks.
     emit emptySpaceClicked();
+    // MEMO[#step6.2]: additive subclass hook. The piano-roll
+    // StaffWidget uses it to emit placeNoteRequested(ms, midi) —
+    // turning a click on the empty grid into a note placement
+    // alongside the seek. Base default is no-op so WaveformWidget
+    // keeps the plain-seek behaviour unchanged.
+    onEmptySpaceClick(x, event->pos().y(), ms);
     event->accept();
 }
 
@@ -751,10 +798,7 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
     const std::optional<int> newGuide = (ctrlHeld && hasContent())
         ? std::make_optional<int>(static_cast<int>(event->position().x()))
         : std::nullopt;
-    if (newGuide != zoomAnchorGuideX_) {
-        zoomAnchorGuideX_ = newGuide;
-        update();
-    }
+    updateZoomAnchorGuide(newGuide);
 
     // We only react when a drag candidate was armed during
     // mousePressEvent — otherwise pass through. (The base no longer
@@ -1025,10 +1069,7 @@ ScoreOverlayBase::findSnapAnchor(std::int64_t cursorMs) const noexcept {
 }
 
 void ScoreOverlayBase::leaveEvent(QEvent* event) {
-    if (zoomAnchorGuideX_.has_value()) {
-        zoomAnchorGuideX_.reset();
-        update();
-    }
+    updateZoomAnchorGuide(std::nullopt);
     QWidget::leaveEvent(event);
 }
 
@@ -1050,13 +1091,9 @@ bool ScoreOverlayBase::eventFilter(QObject* /*watched*/, QEvent* event) {
         if (!underMouse() || !hasContent()) return false;
         const int x = mapFromGlobal(QCursor::pos()).x();
         if (x < 0 || x >= width()) return false;
-        if (zoomAnchorGuideX_ != x) {
-            zoomAnchorGuideX_ = x;
-            update();
-        }
-    } else if (zoomAnchorGuideX_.has_value()) {
-        zoomAnchorGuideX_.reset();
-        update();
+        updateZoomAnchorGuide(x);
+    } else {
+        updateZoomAnchorGuide(std::nullopt);
     }
     return false;   // never consume; pass through to other widgets
 }
@@ -1068,18 +1105,22 @@ void ScoreOverlayBase::keyReleaseEvent(QKeyEvent* event) {
     // invisible. Update the guide on Ctrl release (and the press
     // mirror lives in keyPressEvent below) so it tracks Ctrl
     // independent of mouse motion.
-    if ((event->key() == Qt::Key_Control)
-        && zoomAnchorGuideX_.has_value())
-    {
-        zoomAnchorGuideX_.reset();
-        update();
+    if (event->key() == Qt::Key_Control) {
+        updateZoomAnchorGuide(std::nullopt);
     }
     QWidget::keyReleaseEvent(event);
 }
 
 void ScoreOverlayBase::paintZoomAnchorGuide(QPainter& painter) const {
-    if (!zoomAnchorGuideX_.has_value()) return;
-    const int x = *zoomAnchorGuideX_;
+    // Prefer the OWN-widget guide (the user is hovering here with
+    // Ctrl held); else fall back to the mirror from the sister
+    // widget so the dashed line spans both surfaces continuously.
+    int x = -1;
+    if (zoomAnchorGuideX_.has_value()) {
+        x = *zoomAnchorGuideX_;
+    } else if (mirroredZoomAnchorAxisX_.has_value()) {
+        x = leftMarginPx() + *mirroredZoomAnchorAxisX_;
+    }
     if (x < 0 || x >= width()) return;
     // Faint amber line — distinct from the playback cursor (red),
     // the secondary anchor (cyan), and the loop selection markers.
@@ -1090,6 +1131,29 @@ void ScoreOverlayBase::paintZoomAnchorGuide(QPainter& painter) const {
     painter.setPen(guidePen);
     painter.drawLine(x, 0, x, height());
     painter.restore();
+}
+
+void ScoreOverlayBase::updateZoomAnchorGuide(std::optional<int> newX) {
+    if (newX == zoomAnchorGuideX_) return;
+    zoomAnchorGuideX_ = newX;
+    update();
+    // Emit the TIME-AXIS x (widget-x minus the keyboard column),
+    // not source-ms. Integer copy → integer copy with no precision
+    // loss; ms quantises sub-millisecond positions that matter at
+    // deep zoom and would visibly desync the sister's guide.
+    const std::optional<int> axisX =
+        newX.has_value()
+        ? std::make_optional<int>(*newX - leftMarginPx())
+        : std::nullopt;
+    emit zoomAnchorGuideChanged(axisX);
+}
+
+void ScoreOverlayBase::setMirroredZoomAnchorAxisX(
+    std::optional<int> axisX)
+{
+    if (axisX == mirroredZoomAnchorAxisX_) return;
+    mirroredZoomAnchorAxisX_ = axisX;
+    update();   // no signal emit — receiver-only; breaks the loop
 }
 
 void ScoreOverlayBase::wheelEvent(QWheelEvent* event) {
@@ -1161,11 +1225,7 @@ void ScoreOverlayBase::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_Control && underMouse() && hasContent()) {
         const int x = mapFromGlobal(QCursor::pos()).x();
         if (x >= 0 && x < width()) {
-            const std::optional<int> newGuide = x;
-            if (newGuide != zoomAnchorGuideX_) {
-                zoomAnchorGuideX_ = newGuide;
-                update();
-            }
+            updateZoomAnchorGuide(x);
         }
     }
 

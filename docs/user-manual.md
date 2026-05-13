@@ -36,7 +36,7 @@ The Fiddler window is divided into four working areas, stacked vertically with a
 
 - *Transport row.* Play and Stop buttons, the *Tune type* picker, and the *Pre-roll* checkbox and spinbox. The transport row stays at the top so the controls are always reachable.
 - *Waveform.* A summary view of the loaded recording. Click anywhere along the waveform to seek; the red cursor tracks the current playback position.
-- *Staff.* A musical staff with the time signature on the left. Barlines you place with **B** appear here, lined up with the same source-time as the waveform above.
+- *Staff.* A piano-roll editor. A keyboard column on the left labels every C with its octave; rows to the right of the keyboard represent every semitone, with black-key rows shaded slightly darker than white-key rows. The grid lines up 1:1 with the waveform above — barlines you place with **B** appear here, lined up with the same source-time as the waveform, and note bars sit on the row of their pitch.
 - *Position and tempo sliders.* The position slider mirrors the playback cursor and accepts dragging for precise seeks. The tempo slider sets playback speed from 25 % to 100 %.
 - *Project viewer dock.* The right-hand panel lists every marker and loop in the recording, with a property page below for renaming and re-positioning. Press **F4** to hide or show the dock.
 
@@ -182,40 +182,29 @@ The pre-roll runs whenever playback resumes from Paused or Stopped — when you 
 
 ## 8. Notes
 
-A *note* is a region of the recording over which you perceived a single pitch — onset, offset, and which pitch was sounding. Notes appear as horizontal green bars on the staff, anchored horizontally to their time interval and vertically to their pitch.
+A *note* is a region of the recording over which you perceived a single pitch — onset, offset, and which pitch was sounding. Notes appear as horizontal green bars on the staff, on the row of their pitch and spanning their time interval.
 
 ![A note bar at A4 spanning a loop interval on the staff.](img/manual-note-bar.png)
 
-### Placing a note — two stages
+### Place a note by clicking the staff
 
-Note placement is deliberately two-click. The button at the bottom of the project viewer dock changes its label to tell you which stage you're in:
+Click a cell on the chromatic grid to place a note. The grid is the area to the right of the piano keyboard; click on the row whose pitch you want and at the horizontal position where the note begins, and a bar appears straight away. The click also seeks the playback cursor to that position — so the gesture *places* and *navigates* in one move, the same way DAW piano rolls work.
 
-| Button label | Meaning |
-|---|---|
-| **New Note …** | Nothing pending. Clicking begins a new note draft at the current playback position. |
-| **Add Note** | A new-note draft is open. The property page above shows its defaults; edit them, then click to commit the note to the staff. |
-| **Apply Changes to Note** | You're editing an existing note (selected from the Notes list). The property page reflects a *buffered* copy; click to apply your edits to the stored note, or click outside to discard. |
+The new note's interval is the currently *armed* loop when one is armed; otherwise it spans the click position ± 200 ms. Either way it lands selected, so you can fine-tune Start, End, or Pitch from the property page in the dock without re-finding the bar.
 
-The two-stage flow:
+The piano keyboard column itself is **not** clickable — it labels the rows and is reserved for a future preview-tone gesture. Clicks land only on the grid.
 
-1. **Seek** to the region you want to transcribe (click the waveform or staff).
-2. Click **New Note …** — the property page populates with the defaults (Start/End = playback ± 200 ms, Pitch = A4). No note is on the staff yet.
-3. Adjust the **Pitch** (and the interval / duration if needed). Pitch is entered in Scientific Pitch Notation: `A4`, `F5`, `C4`. Lowercase letters work and the field renders the canonical uppercase form after Enter. Naturals only in this build — `C#4` or `Bb3` are silently rejected.
-4. Click **Add Note** — the bar now appears on the staff.
+### Edit a note from the property page
 
-Clicking the waveform or anywhere outside a note while a draft is open *discards the draft* and the button label resets to **New Note …**.
+Click a bar on the staff to select it. The dock's property page shows the note's Pitch, Start, End, and Duration; edits commit live on Enter / Tab / focus-loss, the same way marker and loop fields work. Clicking the waveform or the staff in an empty area deselects the note.
 
-### Editing an existing note
-
-Click a note's row in the Notes list. The property page shows its current values and the button changes to **Apply Changes to Note**. Edits buffer in the property page; nothing is written back until you click the button. Clicking the waveform / another row instead discards the buffered changes.
+> *Keyboard-only fallback.* If you'd rather type a note in than click for it, the dock button below the property page drives a two-stage flow: click **New Note …** with nothing selected to start a draft at the current playback position, edit Start / End / Pitch on the property page, click **Add Note** to commit. Useful when you already know the values and want to skip the staff aim.
 
 ### Property page fields
 
-- *Pitch* — Scientific Pitch Notation. Naturals (`A4`, `C5`, `G3`) and **accidentals** (`F#4`, `A#5`, `Bb3`) are both accepted. The dock normalises flat input to sharp spelling — type `Bb4` and the field shows `A#4` (the enharmonic) on commit. The `(MIDI N)` label beside the field is the equivalent MIDI number. Accepted range is the violin's playable span: **G3 (open G string) to E7** — anything outside silently reverts to the previous valid value. Accidentals share the staff line of their natural-below (an A♯4 sits on the A4 space) but are rendered in a **cooler, teal-shifted green** so they're visually distinct from naturals. This matches the piano-roll convention every major DAW uses (Logic, Pro Tools, Ableton, FL Studio, Cubase…): no per-note ♯ glyph on the bar — pitch identity is conveyed by row + colour.
+- *Pitch* — Scientific Pitch Notation. Naturals (`A4`, `C5`, `G3`) and accidentals (`F#4`, `A#5`, `Bb3`) are both accepted. The dock normalises flat input to sharp spelling — type `Bb4` and the field shows `A#4` (the enharmonic) on commit. The `(MIDI N)` label beside the field is the equivalent MIDI number. Accepted range is the violin's playable span: **G3 (open G string) to E7** — anything outside silently reverts to the previous valid value. Every pitch — natural or accidental — has its own row on the chromatic grid; row position and key colour communicate the pitch directly, so the bar carries no extra glyph. This matches the piano-roll convention every major DAW uses (Logic, Pro Tools, Ableton, FL Studio, Cubase…).
 - *Start* and *End* — interval boundaries in milliseconds. Each is clamped relative to the other so the interval stays valid (End ≥ Start + 1).
 - *Duration* — read-only, derived from `End − Start`.
-
-Notes outside the treble staff paint with short *ledger lines* at every line position between the note and the staff body — middle C below the staff, A5 above, and so on. The staff is tall enough to show the full violin range with the necessary ledger lines on both sides.
 
 ### Notes vs barlines, markers, loops
 
@@ -228,17 +217,17 @@ Notes outside the treble staff paint with short *ledger lines* at every line pos
 
 Notes are the only artifact that carries a pitch. **Delete** removes the selected note exactly like it removes the other artifact kinds; **Ctrl+Z** brings it back with its original interval and pitch.
 
-> *What's next.* The dock button is the foundation gesture. The follow-up step adds mouse-hover preview on the staff with an optional reference-tone synth so you can match a note's pitch to the recording by ear before committing it.
+> *What's next.* Click-to-place is the foundation gesture. The follow-up step adds an optional reference-tone synth on the keyboard column so you can audition a pitch against the recording before committing the note.
 
 ## 9. The project viewer dock
 
-The dock on the right of the window lists every marker, loop, and note in the recording, with a property page below the tree for editing the selected artifact.
+The dock on the right of the window lists every marker and loop in the recording, with a property page below the tree for editing the selected artifact.
 
 ![The project viewer dock with markers and loops expanded.](img/manual-dock-detail.png)
 
-- *Tree.* Markers, Loops, and Notes as three collapsible categories. Click a row to select; double-click a row to jump and play.
-- *Property page.* Shows the fields of the currently-selected artifact. Markers expose Name and Position; loops expose Name, Start, End, and the Armed checkbox; notes expose Pitch, Start, End, and Duration (no per-note name — notes are anonymous, matching MuseScore / MusicXML conventions).
-- *Note button.* Below the property page — its label cycles among **New Note …**, **Add Note**, and **Apply Changes to Note** depending on what the dock is showing. See *§8 Notes* for the workflow.
+- *Tree.* Markers and Loops as two collapsible categories. Click a row to select; double-click a row to jump and play. Notes are not listed — they are selected and edited via the staff (piano roll), since pitch + interval already identifies each note on the grid.
+- *Property page.* Shows the fields of the currently-selected artifact, headed by a caption — "Marker properties:", "Loop properties:", or "Note properties:". Markers expose Name and Position; loops expose Name, Start, End, and the Armed checkbox; notes expose Pitch, Start, End, and Duration (no per-note name — notes are anonymous, matching MuseScore / MusicXML conventions). All fields commit live on Enter / Tab / focus-loss.
+- *Note button.* Below the property page — labelled **New Note …** when nothing is pending and **Add Note** while a draft is open. Hidden while you're editing an existing note (the property page does the writing). See *§8 Notes* for the workflow.
 - *Pre-roll countdown.* When the pre-roll is enabled, the countdown ring appears at the bottom of the dock and animates during each pre-roll silence.
 
 Press **F4** to hide or show the dock. The dock's visibility persists across sessions, so a hidden dock stays hidden until you press **F4** again.

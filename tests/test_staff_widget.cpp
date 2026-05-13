@@ -38,6 +38,38 @@ using fiddler::ui::StaffWidget;
 
 namespace {
 
+// ---- piano-roll geometry mirrors (step 6.2) ---------------------
+// Mirror of the constants in StaffWidget.cpp. The y axis is chromatic
+// (E7 at top, G3 at bottom) and the leftmost kKeyboardWidth pixels
+// are reserved for the piano keyboard column — xToMs / msToX in the
+// base offset the time axis past that. Used across the barline /
+// marker / loop / viewport / note tests below so click positions land
+// on the actual artifact x and not in the keyboard column.
+constexpr int kKeyboardWidth      = 56;
+constexpr int kGridTopMargin      = 18;
+constexpr int kSemitoneRowHeight  = 8;
+constexpr int kRowMidiHigh        = 100;   // E7 — top of range
+constexpr int kRowMidiLow         = 55;    // G3 — bottom of range
+constexpr int kRowCount           = kRowMidiHigh - kRowMidiLow + 1;
+constexpr int kGridHeightPx       = kRowCount * kSemitoneRowHeight;
+constexpr int kGridBottomMargin   = 18;
+constexpr int kStaffHeightPx      =
+    kGridTopMargin + kGridHeightPx + kGridBottomMargin;     // 404
+
+// Row CENTER y for the given midi value.
+constexpr int rowYForMidiTest(int midi) {
+    const int rowIndex = kRowMidiHigh - midi;
+    return kGridTopMargin
+         + rowIndex * kSemitoneRowHeight
+         + kSemitoneRowHeight / 2;
+}
+// Pixel x corresponding to the given source-ms, honouring the
+// keyboard-column left margin.
+constexpr int xForMsTest(int ms, int widthPx = 800, int durationMs = 4000) {
+    const int gridW = widthPx - kKeyboardWidth;
+    return kKeyboardWidth + ms * gridW / durationMs;
+}
+
 // Construct a model with the given barlines pre-loaded. Returned as
 // shared_ptr so the widget can take a const view; the test still
 // holds a non-const handle to mutate it later.
@@ -53,13 +85,13 @@ makeModel(std::span<const std::int64_t> stamps = {}) {
 // Configure a StaffWidget with a typical "loaded file" state:
 //   - durationMs as given (default 4000 = 4 s)
 //   - the supplied barline model attached
-//   - resized to a width that makes msToX easy to reason about
-//     (1 ms per pixel when w=4000, etc.)
+//   - resized so the chromatic grid fits at its natural height —
+//     the piano-roll layout is taller than the old diatonic staff
 void setUpWidget(StaffWidget&                   w,
                  std::shared_ptr<BarlineModel>  model,
                  std::int64_t                   durationMs = 4000,
                  int                            widthPx    = 800,
-                 int                            heightPx   = 140)
+                 int                            heightPx   = kStaffHeightPx)
 {
     w.setBarlineModel(model);
     w.setDurationMs(durationMs);
@@ -108,14 +140,16 @@ TEST_CASE("StaffWidget: click without a duration emits no signals",
 // Coordinate transforms
 // ---------------------------------------------------------------------------
 
-TEST_CASE("StaffWidget: xToMs / msToX round-trip across the width",
+TEST_CASE("StaffWidget: xToMs / msToX round-trip across the grid",
           "[staff-widget][gui][coords]") {
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel(), /*durationMs=*/10'000,
-                /*widthPx=*/800, /*heightPx=*/80);
+                /*widthPx=*/800, /*heightPx=*/420);
 
-    for (int x = 0; x < 800; x += 37) {
+    // Iterate over the grid x range — the keyboard column [0, kKbWidth)
+    // is reserved (xToMs returns 0 there, msToX never produces those x).
+    for (int x = kKeyboardWidth + 1; x < 800; x += 37) {
         const auto ms        = w.xToMs(x);
         const int  roundTrip = w.msToX(ms);
         // ±1 px slack for integer truncation on either side.
@@ -143,7 +177,7 @@ TEST_CASE("StaffWidget: out-of-range x and ms clamp to file bounds",
     // off-screen markers drawing as a column stack at x=0).
     // Only ms == durationMs is nudged to width-1 so the exact
     // right edge still paints.
-    REQUIRE(w.msToX(-500)   <  0);
+    REQUIRE(w.msToX(-500)   <  kKeyboardWidth);
     REQUIRE(w.msToX(99'999) >  599);
     REQUIRE(w.msToX(3000)   == 599);   // exact right-edge nudge
 }
@@ -156,16 +190,17 @@ TEST_CASE("StaffWidget: click on a barline selects it and seeks to its ms",
           "[staff-widget][gui][barlines]") {
     qtApp();
     StaffWidget w;
-    // 4 s file, 800 px wide → 1 ms per 0.2 px. A barline at 1000 ms
-    // maps to x = 200.
+    // 4 s file, 800 px wide; the time axis starts after the keyboard
+    // column so a barline at 1000 ms maps to x = xForMsTest(1000).
     const std::int64_t stamps[] = { 1000 };
     setUpWidget(w, makeModel(std::span<const std::int64_t>{stamps}));
 
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
     QSignalSpy selSpy (&w, &StaffWidget::barlineSelectionChanged);
 
-    // Click at x=202 — within the 5 px tolerance of the tick at 200.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(202, 50));
+    // Click 2 px right of the tick — within the 5 px hit tolerance.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(1000) + 2, 50));
 
     REQUIRE(w.selectedBarline() == 0);
 
@@ -189,8 +224,9 @@ TEST_CASE("StaffWidget: click far from any barline seeks without selecting",
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
     QSignalSpy selSpy (&w, &StaffWidget::barlineSelectionChanged);
 
-    // Click at x=600 (3000 ms) — nowhere near the only barline at 200.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 50));
+    // Click at x for 3000 ms — far from the only barline at 1000 ms.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(3000), 50));
 
     REQUIRE_FALSE(w.selectedBarline().has_value());
     REQUIRE(seekSpy.count() == 1);
@@ -210,11 +246,13 @@ TEST_CASE("StaffWidget: clicking elsewhere clears an existing selection",
     setUpWidget(w, makeModel(std::span<const std::int64_t>{stamps}));
 
     // Pre-select via a click on the bar.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 50));
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(1000), 50));
     REQUIRE(w.selectedBarline() == 0);
 
     QSignalSpy selSpy(&w, &StaffWidget::barlineSelectionChanged);
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 50));
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(3000), 50));
 
     REQUIRE_FALSE(w.selectedBarline().has_value());
     REQUIRE(selSpy.count() == 1);
@@ -232,8 +270,9 @@ TEST_CASE("StaffWidget: right click does not emit any signals",
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
     QSignalSpy selSpy (&w, &StaffWidget::barlineSelectionChanged);
 
-    QTest::mouseClick(&w, Qt::RightButton,  Qt::NoModifier, QPoint(200, 50));
-    QTest::mouseClick(&w, Qt::MiddleButton, Qt::NoModifier, QPoint(200, 50));
+    const QPoint barX{xForMsTest(1000), 50};
+    QTest::mouseClick(&w, Qt::RightButton,  Qt::NoModifier, barX);
+    QTest::mouseClick(&w, Qt::MiddleButton, Qt::NoModifier, barX);
 
     REQUIRE(seekSpy.count() == 0);
     REQUIRE(selSpy.count()  == 0);
@@ -253,8 +292,9 @@ TEST_CASE("StaffWidget: arrow keys navigate selection between barlines",
     w.setFocus();
     (void)QTest::qWaitForWindowExposed(&w);
 
-    // Pre-select the second barline (1500 ms → x=300).
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(300, 50));
+    // Pre-select the second barline at 1500 ms.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(1500), 50));
     REQUIRE(w.selectedBarline() == 1);
 
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
@@ -451,7 +491,7 @@ TEST_CASE("StaffWidget: paints marker ticks + label flags without crashing",
 
 TEST_CASE("StaffWidget: click on a marker selects by ID and seeks",
           "[staff-widget][gui][markers]") {
-    // 4 s file across 800 px → marker at 1000 ms is at x=200.
+    // 4 s file across 800 px — marker at 1000 ms is at xForMsTest(1000).
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel());
@@ -461,7 +501,8 @@ TEST_CASE("StaffWidget: click on a marker selects by ID and seeks",
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
     QSignalSpy selSpy (&w, &StaffWidget::markerSelectionChanged);
 
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(202, 40));
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(1000) + 2, 40));
 
     REQUIRE(w.selectedMarkerId() == *model->idAt(0));
     REQUIRE(seekSpy.count() == 1);
@@ -473,17 +514,19 @@ TEST_CASE("StaffWidget: marker click clears barline selection (mutual exclusion)
           "[staff-widget][gui][markers]") {
     qtApp();
     StaffWidget w;
-    const std::int64_t bars[] = { 500 };           // x=100
+    const std::int64_t bars[] = { 500 };
     auto barModel = makeModel(std::span<const std::int64_t>{bars});
     setUpWidget(w, barModel);
-    const std::int64_t markers[] = { 2000 };       // x=400
+    const std::int64_t markers[] = { 2000 };
     installMarkers(w, std::span<const std::int64_t>{markers});
 
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(102, 40));
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(500) + 2, 40));
     REQUIRE(w.selectedBarline() == 0);
 
     QSignalSpy barSelSpy(&w, &StaffWidget::barlineSelectionChanged);
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(402, 40));
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(2000) + 2, 40));
 
     REQUIRE(w.selectedMarkerId().has_value());
     REQUIRE_FALSE(w.selectedBarline().has_value());
@@ -708,13 +751,15 @@ TEST_CASE("StaffWidget: Ctrl+click on a marker promotes prior primary to seconda
     const std::int64_t stamps[] = { 1000, 3000 };
     installMarkers(w, std::span<const std::int64_t>{stamps});
 
-    // 4-second file, 800-pixel widget: 1000ms → x=200, 3000ms → x=600.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(200, 50));
+    // 4-second file, 800-pixel widget: time axis starts after the
+    // keyboard column; xForMsTest maps ms → widget-x.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(1000), 50));
     REQUIRE(w.primaryAnchorMs() == 1000);
     REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
 
     QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
-                      QPoint(600, 50));
+                      QPoint(xForMsTest(3000), 50));
     REQUIRE(w.primaryAnchorMs() == 3000);
     REQUIRE(w.secondaryAnchorMs() == 1000);
 }
@@ -815,7 +860,11 @@ TEST_CASE("StaffWidget: dragging a loop's left edge updates startMs",
     const auto args = commitSpy.takeFirst();
     REQUIRE(args[1].toBool() == true);          // isStartEdge
     REQUIRE(loops->loops()[0].endMs == 2000);   // partner intact
-    REQUIRE(std::abs(loops->loops()[0].startMs - 1300) < 5);
+    // ±6 ms slack: the chromatic grid loses ~56 px to the keyboard
+    // column, so 1 px ≈ 5.37 ms (vs. 5 ms on the keyboard-less
+    // WaveformWidget). A single pixel of integer-truncation slop in
+    // msToX → xToMs round-trip can land just past 5 ms here.
+    REQUIRE(std::abs(loops->loops()[0].startMs - 1300) <= 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -835,10 +884,10 @@ TEST_CASE("StaffWidget: default viewport maps full duration to widget width",
     REQUIRE_FALSE(w.isZoomed());
     REQUIRE(w.viewportSpanMs() == 0);   // unset = fit-to-window
 
-    // 4000 ms across 800 px = 5 ms/px.
-    REQUIRE(w.xToMs(0)   == 0);
-    REQUIRE(w.xToMs(400) == 2000);
-    REQUIRE(w.msToX(2000) == 400);
+    // 4000 ms across (800 - keyboard) px. xForMsTest mirrors the math.
+    REQUIRE(w.xToMs(kKeyboardWidth)       == 0);
+    REQUIRE(w.xToMs(xForMsTest(2000))     == 2000);
+    REQUIRE(w.msToX(2000)                 == xForMsTest(2000));
 }
 
 TEST_CASE("StaffWidget: setting a viewport maps that range to the full width",
@@ -848,24 +897,27 @@ TEST_CASE("StaffWidget: setting a viewport maps that range to the full width",
     setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
 
     QSignalSpy vpSpy(&w, &StaffWidget::viewportChanged);
-    w.setViewport(1000, 2000);     // 1-second window across 800 px
+    w.setViewport(1000, 2000);     // 1-second window across the grid
 
     REQUIRE(vpSpy.count() == 1);
     REQUIRE(w.isZoomed());
     REQUIRE(w.viewportStartMs() == 1000);
     REQUIRE(w.viewportEndMs()   == 2000);
 
-    // 1000 ms / 800 px = 1.25 ms/px.
-    REQUIRE(w.xToMs(0)   == 1000);
-    REQUIRE(w.xToMs(400) == 1500);
-    REQUIRE(w.msToX(1500) == 400);
-    // ms == viewportEnd lands at exact width — nudged to w-1
-    // so the right-edge column still paints. Anything strictly
-    // outside the viewport is returned unclamped so paint code
-    // can cull (#49 follow-up).
+    // 1000 ms across (800 - kKeyboardWidth = 744) px ≈ 1.34 ms/px.
+    // x = kKeyboardWidth corresponds to viewportStart; halfway across
+    // the grid lands at viewport mid (~1500 ms).
+    const int gridMidX = kKeyboardWidth + (800 - kKeyboardWidth) / 2;
+    REQUIRE(w.xToMs(kKeyboardWidth) == 1000);
+    REQUIRE(std::abs(static_cast<int>(w.xToMs(gridMidX)) - 1500) <= 2);
+    REQUIRE(std::abs(w.msToX(1500) - gridMidX) <= 2);
+    // ms == viewportEnd lands at the exact right edge — nudged to
+    // width-1 so the right-edge column still paints. Anything
+    // strictly outside the viewport is returned unclamped so paint
+    // code can cull (#49 follow-up).
     REQUIRE(w.msToX(2000) == 799);
-    REQUIRE(w.msToX(0)    <  0);     // off-screen left
-    REQUIRE(w.msToX(3000) >= 800);   // off-screen right
+    REQUIRE(w.msToX(0)    <  kKeyboardWidth); // off-screen left
+    REQUIRE(w.msToX(3000) >= 800);            // off-screen right
 }
 
 TEST_CASE("StaffWidget: setViewport clamps to duration and enforces min span",
@@ -898,7 +950,8 @@ TEST_CASE("StaffWidget: setViewport(0,0) restores fit-to-window",
 
     REQUIRE(vpSpy.count() == 1);
     REQUIRE_FALSE(w.isZoomed());
-    REQUIRE(w.xToMs(400) == 2000);  // back to full-range math
+    // Back to full-range math — x at grid midpoint maps to ms 2000.
+    REQUIRE(w.xToMs(xForMsTest(2000)) == 2000);
 }
 
 TEST_CASE("StaffWidget: zoomBy preserves the anchor's pixel position",
@@ -907,10 +960,11 @@ TEST_CASE("StaffWidget: zoomBy preserves the anchor's pixel position",
     StaffWidget w;
     setUpWidget(w, makeModel(), /*durationMs=*/10000, /*widthPx=*/1000);
 
-    // Pre-zoom, ms=2500 sits at x=250.
+    // Pre-zoom, ms=2500 sits at xForMsTest(2500, 1000, 10000).
     const std::int64_t anchorMs = 2500;
     const int          anchorPx = w.msToX(anchorMs);
-    REQUIRE(anchorPx == 250);
+    REQUIRE(anchorPx == xForMsTest(2500, /*widthPx=*/1000,
+                                         /*durationMs=*/10000));
 
     // Zoom in 2×. Anchor should stay at (approximately) the same x.
     w.zoomBy(0.5, anchorMs);
@@ -970,21 +1024,16 @@ TEST_CASE("StaffWidget: panBy is a no-op when not zoomed",
 }
 
 // ---------------------------------------------------------------------------
-// Notes (Step 6.1)
+// Notes (Step 6.2 — chromatic piano roll)
 //
-// The fixture 4 s / 800 px gives 1 ms = 0.2 px, so a 400 ms note from
-// 1000 ms to 1400 ms spans pixels [200, 280). The treble-staff
-// geometry constants are mirrored from StaffWidget.cpp.
+// The fixture 4 s / 800 px with a 56-px keyboard column gives a grid
+// of 744 px for the 4000-ms axis, so 1 ms ≈ 0.186 px. A 400 ms note
+// at 1000 ms spans pixels [xForMsTest(1000), xForMsTest(1400)). Pitch
+// goes to its own chromatic row — `rowYForMidiTest(midi)` returns
+// the row's centre y.
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// Mirror of the constants in StaffWidget.cpp. Bumped in #step6.1
-// when the top margin grew to leave room for E7 ledger lines.
-constexpr int kStaffTopMargin = 72;
-constexpr int kStaffSpacing   = 8;
-constexpr int kBottomLineY    = kStaffTopMargin + 4 * kStaffSpacing; // 104
-constexpr int kPxPerHalfStep  = kStaffSpacing / 2;                   // 4
 
 std::shared_ptr<NoteModel> installNotes(StaffWidget& w) {
     auto model = std::make_shared<NoteModel>();
@@ -992,19 +1041,26 @@ std::shared_ptr<NoteModel> installNotes(StaffWidget& w) {
     return model;
 }
 
+// Note fill is (180, 220, 140, ~215) alpha-blended over the
+// white-key row background (34, 34, 38). The composite stays
+// clearly green-dominant.
 bool isNoteGreen(QColor c) {
-    // Note fill is (180, 220, 140, 200) over background (20,20,24).
-    // After alpha-blend the on-screen colour lands around (95, 140, 90).
     return c.green() > c.red() && c.green() > c.blue()
         && c.green() > 100;
 }
 
+// Centre x of the bar [startMs, endMs) under the test fixture.
+constexpr int barMidXTest(int startMs, int endMs) {
+    return (xForMsTest(startMs) + xForMsTest(endMs)) / 2;
+}
+
 } // namespace
 
-TEST_CASE("StaffWidget: paints note bar at expected y for E4 (bottom line)",
+TEST_CASE("StaffWidget: paints note bar on its chromatic row for E4",
           "[staff-widget][gui][notes]") {
-    // MEMO: load-bearing — staff-Y geometry. E4 sits ON the bottom
-    // staff line; if the formula drifts, every painted note moves.
+    // MEMO: load-bearing — chromatic Y geometry. Every note bar is
+    // centred on `rowYForMidi(midi)`; if the formula drifts every
+    // painted note moves.
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
@@ -1015,25 +1071,23 @@ TEST_CASE("StaffWidget: paints note bar at expected y for E4 (bottom line)",
     image.fill(Qt::transparent);
     w.render(&image);
 
-    // Bar centre-x is around (200 + 280) / 2 = 240. Pick a column
-    // inside the bar but away from edges so the pen border doesn't
-    // dominate the probe.
-    const int probeX = 240;
-    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY)));
+    const int probeX = barMidXTest(1000, 1400);
+    const int rowY   = rowYForMidiTest(64);
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, rowY)));
 
-    // Above and below the bar (4+ px away from y=50), the column
-    // should NOT read as note-green — we just see staff background
-    // or a staff line. Probe well above the bar to dodge the line
-    // and any selection ring.
-    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX, kBottomLineY - 12)));
-    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX, kBottomLineY + 12)));
+    // A row 6 semitones higher / lower has the row tint only — no
+    // bar paint — so it should NOT read as note-green.
+    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX,
+                                               rowYForMidiTest(64 + 6))));
+    REQUIRE_FALSE(isNoteGreen(image.pixelColor(probeX,
+                                               rowYForMidiTest(64 - 6))));
 }
 
-TEST_CASE("StaffWidget: A4 sits in the second-from-bottom space",
+TEST_CASE("StaffWidget: A4 paints on its own row above E4",
           "[staff-widget][gui][notes]") {
-    // E4 = bottom line; F4 = first space; G4 = 2nd line; A4 = 2nd
-    // space. Bottom line is y=50; A4 (3 diatonic steps up) is at
-    // y=50 - 3*4 = 38.
+    // A4 (midi 69) sits 5 semitones above E4 (midi 64) — five rows
+    // higher on the piano roll (i.e. five rowHeights toward the
+    // top of the widget).
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
@@ -1044,73 +1098,8 @@ TEST_CASE("StaffWidget: A4 sits in the second-from-bottom space",
     image.fill(Qt::transparent);
     w.render(&image);
 
-    REQUIRE(isNoteGreen(image.pixelColor(240, kBottomLineY - 3 * kPxPerHalfStep)));
-}
-
-TEST_CASE("StaffWidget: middle-C note draws a ledger line below the staff",
-          "[staff-widget][gui][notes][ledger]") {
-    // MEMO: load-bearing — middle C (C4 = midi 60) is dia 28, one
-    // diatonic step (2*4 = 8 px) below the bottom line. A ledger
-    // line must appear at that y, painted in the note's border
-    // colour. If the ledger walk regresses, this fails first.
-    qtApp();
-    StaffWidget w;
-    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
-    auto notes = installNotes(w);
-    REQUIRE(notes->add(1000, 1400, 60) != 0);   // C4
-
-    QImage image(w.size(), QImage::Format_ARGB32);
-    image.fill(Qt::transparent);
-    w.render(&image);
-
-    // Middle-C y = bottomY + 2 * kPxPerHalfStep = 58.
-    const int middleCY = kBottomLineY + 2 * kPxPerHalfStep;
-    // The note bar itself spans middleCY ± 3 px. The ledger stub
-    // extends ±8 px around the bar centre x=240; check just outside
-    // the bar's x range (xLeft=200, xRight=280) for a border-colour
-    // pixel that can only be the ledger stub. Bar mid is 240; stub
-    // covers 232..248. Bar covers 200..280. So an x INSIDE the bar
-    // (say 236) at exactly middleCY is inside the bar AND on the
-    // ledger — the pixel reads as note-green there.
-    //
-    // To prove the ledger specifically, probe just below the bar's
-    // bottom edge (middleCY + 4) — without a ledger this would be
-    // staff background; we expect background because the ledger
-    // stub is only one pixel thick at middleCY. So instead, probe
-    // the ledger overhang region: x between 236 and 247 sits inside
-    // the ledger stub but OUTSIDE the bar's vertical range — no,
-    // that's not right either.
-    //
-    // Simplest check: the ledger stub at x=232..247 lies UNDER the
-    // bar (same x range as the bar). The bar covers y in (middleCY-3,
-    // middleCY+3). The ledger stub is at exactly y=middleCY, so it
-    // sits under the bar — we don't see it through the bar fill.
-    //
-    // To make the ledger visible we need to probe OUTSIDE the bar's
-    // horizontal range. The bar's xLeft is 200 (msToX(1000)). The
-    // ledger stub centred at barMidX=240 extends to x=232..247 — all
-    // inside the bar. So in this fixture the ledger isn't visible
-    // outside the bar.
-    //
-    // Use a SHORT note (50 ms = 10 px wide) so the bar is narrower
-    // than the ledger stub. Then the ledger overhang is visible.
-    notes->clear();
-    REQUIRE(notes->add(1000, 1050, 60) != 0);   // 50 ms note at C4
-
-    image.fill(Qt::transparent);
-    w.render(&image);
-
-    // Bar centre x = (msToX(1000) + msToX(1050))/2 = (200 + 210)/2 = 205.
-    // Ledger stub extends ±8 px → 197..213. Bar covers 200..210.
-    // So x=215 is OUTSIDE the bar but… outside the ledger too.
-    // Adjust: x=212 is at the ledger's right edge AND outside the
-    // bar (which ends at 210). Probe there.
-    const int outsideBarLedgerX = 212;
-    // The ledger-only pixel reads as the border colour (140,200,100).
-    const QColor c = image.pixelColor(outsideBarLedgerX, middleCY);
-    REQUIRE(c.green() > 150);     // ledger uses the same border green
-    REQUIRE(c.green() > c.red());
-    REQUIRE(c.green() > c.blue());
+    REQUIRE(isNoteGreen(image.pixelColor(barMidXTest(1000, 1400),
+                                         rowYForMidiTest(69))));
 }
 
 TEST_CASE("StaffWidget: paints multiple notes (chord) at the same interval",
@@ -1120,7 +1109,8 @@ TEST_CASE("StaffWidget: paints multiple notes (chord) at the same interval",
     setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
     auto notes = installNotes(w);
 
-    // Three-note chord on the same interval — C4 + E4 + G4.
+    // Three-note chord on the same interval — C4 + E4 + G4. Each
+    // sits on its own chromatic row.
     REQUIRE(notes->add(1000, 1400, 60) != 0);
     REQUIRE(notes->add(1000, 1400, 64) != 0);
     REQUIRE(notes->add(1000, 1400, 67) != 0);
@@ -1129,11 +1119,34 @@ TEST_CASE("StaffWidget: paints multiple notes (chord) at the same interval",
     image.fill(Qt::transparent);
     w.render(&image);
 
-    // Each note should paint at its own y.
-    const int probeX = 240;
-    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY)));               // E4 line
-    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY - 2 * kPxPerHalfStep)));  // G4 (2nd line)
-    REQUIRE(isNoteGreen(image.pixelColor(probeX, kBottomLineY + 2 * kPxPerHalfStep)));  // C4 (1 ledger below)
+    const int probeX = barMidXTest(1000, 1400);
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, rowYForMidiTest(60))));
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, rowYForMidiTest(64))));
+    REQUIRE(isNoteGreen(image.pixelColor(probeX, rowYForMidiTest(67))));
+}
+
+TEST_CASE("StaffWidget: accidental note (A#4) lands on its own chromatic row",
+          "[staff-widget][gui][notes][piano-roll]") {
+    // MEMO[#step6.2]: the diatonic 6.1 staff fused A#4 onto A4's y
+    // and distinguished them with a tint. In the piano-roll layout
+    // every accidental has its own row — A#4 (midi 70) sits one row
+    // ABOVE A4 (midi 69), not the same row. Pin that.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 69) != 0);   // A4 (natural)
+    REQUIRE(notes->add(2000, 2400, 70) != 0);   // A#4 (accidental)
+
+    QImage image(w.size(), QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    w.render(&image);
+
+    const int a4Y   = rowYForMidiTest(69);
+    const int as4Y  = rowYForMidiTest(70);
+    REQUIRE(as4Y != a4Y);
+    REQUIRE(isNoteGreen(image.pixelColor(barMidXTest(1000, 1400), a4Y)));
+    REQUIRE(isNoteGreen(image.pixelColor(barMidXTest(2000, 2400), as4Y)));
 }
 
 TEST_CASE("StaffWidget: setSelectedNoteId clears other-kind selections",
@@ -1196,94 +1209,135 @@ TEST_CASE("StaffWidget: setNoteModel(nullptr) detaches and clears selection",
     REQUIRE(w.noteModel() == nullptr);
 }
 
-TEST_CASE("StaffWidget: accidental note paints at natural-below y with cool-tint fill",
-          "[staff-widget][gui][notes][accidentals]") {
-    // MEMO: load-bearing — A♯4 (midi 70) renders at A4's y (the
-    // natural one semitone below), but the bar is filled with the
-    // cool-shifted accidental tint instead of the warm natural
-    // green. Following the piano-roll convention every surveyed
-    // DAW uses (Logic, Pro Tools, Ableton, FL, Cubase, …): no
-    // per-note ♯ glyph; pitch and accidental state are conveyed by
-    // position + colour alone. The contiguous-rectangle layout
-    // makes engraving-style glyphs impractical.
+TEST_CASE("StaffWidget: empty-space click clears any active note selection "
+          "but ALSO triggers note placement on the clicked row",
+          "[staff-widget][gui][notes][piano-roll]") {
+    // MEMO[#step6.2]: a click on an empty cell of the piano-roll
+    // grid is BOTH a plain-seek (which clears any prior note
+    // selection — same "stack on previous" trap rule as 6.1) AND a
+    // note-placement gesture. The two effects compose: the prior
+    // selection is cleared, the seek fires, and the staff emits
+    // `placeNoteRequested(ms, midi)` for MainWindow to add a new
+    // note. The new note's selection is set by MainWindow, so the
+    // widget-level `selectedNoteId()` stays empty in this isolated
+    // test.
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
     auto notes = installNotes(w);
-    REQUIRE(notes->add(1000, 1400, 70) != 0);   // A#4 — accidental
-
-    QImage image(w.size(), QImage::Format_ARGB32);
-    image.fill(Qt::transparent);
-    w.render(&image);
-
-    // A4's y = bottomY - 3 * kPxPerHalfStep (A4 is 3 dia steps
-    // above E4 — line E4, space F4, line G4, space A4).
-    const int a4Y = kBottomLineY - 3 * kPxPerHalfStep;
-    const QColor barPixel = image.pixelColor(240, a4Y);
-    // Accidental fill is (140,200,195,200) alpha-blended over the
-    // dark background (20,20,24). The blue channel ends up
-    // comparable to the green channel (cool tint), unlike naturals
-    // where green dominates strongly over blue. Pin the inequality
-    // that distinguishes the two tints.
-    REQUIRE(barPixel.green() > 100);                  // bar is painted (not bg)
-    REQUIRE(barPixel.blue()  > barPixel.red() + 30);  // blue-shifted from natural
-}
-
-TEST_CASE("StaffWidget: natural and accidental at same y use distinguishable colors",
-          "[staff-widget][gui][notes][accidentals]") {
-    qtApp();
-    StaffWidget w;
-    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
-    auto notes = installNotes(w);
-    REQUIRE(notes->add(1000, 1400, 69) != 0);   // A4 (natural)
-    REQUIRE(notes->add(2000, 2400, 70) != 0);   // A#4 (accidental — same y)
-
-    QImage image(w.size(), QImage::Format_ARGB32);
-    image.fill(Qt::transparent);
-    w.render(&image);
-
-    const int a4Y = kBottomLineY - 3 * kPxPerHalfStep;
-    // A4 spans 1000-1400 ms → ~200-280 px. Probe x=240 (inside
-    // first bar).
-    const QColor naturalPx = image.pixelColor(240, a4Y);
-    // A#4 spans 2000-2400 ms → ~400-480 px. Probe x=440.
-    const QColor accidentalPx = image.pixelColor(440, a4Y);
-
-    // Both pixels painted (not background).
-    REQUIRE(naturalPx.green()    > 100);
-    REQUIRE(accidentalPx.green() > 100);
-    // They are clearly different in blue channel — the
-    // accidental's blue is higher.
-    REQUIRE(accidentalPx.blue() > naturalPx.blue() + 30);
-}
-
-TEST_CASE("StaffWidget: empty-space click clears any active note selection",
-          "[staff-widget][gui][notes]") {
-    // MEMO: load-bearing rule — a click on the waveform / staff at a
-    // location that doesn't hit any artifact (the "plain seek" path)
-    // clears the current note selection. Mirrors the DAW convention
-    // and — critically — prevents the "stack on previous" trap:
-    // after editing a note's pitch, the user clicks the waveform to
-    // browse, and the dock's note property page closes so the next
-    // Add Note is unambiguous. See onMousePressEvent's empty-space
-    // branch.
-    qtApp();
-    StaffWidget w;
-    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
-    auto notes = installNotes(w);
-    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    // Add a note WAY ABOVE A4 so the click target row sits in empty
+    // grid (no artifact overlap, no note hit).
+    REQUIRE(notes->add(1000, 1400, 88) != 0);
     const auto id = *notes->idAt(0);
     w.setSelectedNoteId(id);
     REQUIRE(w.selectedNoteId() == id);
 
-    QSignalSpy selSpy(&w, &StaffWidget::noteSelectionChanged);
-    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
+    QSignalSpy selSpy  (&w, &StaffWidget::noteSelectionChanged);
+    QSignalSpy seekSpy (&w, &StaffWidget::seekRequested);
+    QSignalSpy placeSpy(&w, &StaffWidget::placeNoteRequested);
 
-    // Click far from the note (x=600 ≈ 3000 ms) — no barline / marker /
-    // loop hit either, so the plain-seek branch runs.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier, QPoint(600, 40));
+    // Click on the A4 (midi 69) row at ~3000 ms — far from any
+    // barline / marker / loop / existing note.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(3000), rowYForMidiTest(69)));
 
     REQUIRE_FALSE(w.selectedNoteId().has_value());
-    REQUIRE(selSpy.count() == 1);
-    REQUIRE(seekSpy.count() == 1);
+    REQUIRE(selSpy.count()   == 1);
+    REQUIRE(seekSpy.count()  == 1);
+    REQUIRE(placeSpy.count() == 1);
+    REQUIRE(placeSpy.takeFirst().at(1).toInt() == 69);
+}
+
+// ---------------------------------------------------------------------------
+// Piano-roll geometry + placement gesture (Step 6.2)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("StaffWidget: click in the keyboard column is ignored",
+          "[staff-widget][gui][piano-roll]") {
+    // MEMO[#step6.2]: a click anywhere inside the leftmost
+    // kKeyboardWidth pixels is reserved (future preview-tone work).
+    // It must NOT seek, NOT place a note, NOT change selection.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+
+    QSignalSpy seekSpy (&w, &StaffWidget::seekRequested);
+    QSignalSpy placeSpy(&w, &StaffWidget::placeNoteRequested);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(kKeyboardWidth / 2, rowYForMidiTest(69)));
+
+    REQUIRE(seekSpy.count()  == 0);
+    REQUIRE(placeSpy.count() == 0);
+}
+
+TEST_CASE("StaffWidget: click on the grid emits placeNoteRequested(ms, midi)",
+          "[staff-widget][gui][piano-roll]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+
+    QSignalSpy placeSpy(&w, &StaffWidget::placeNoteRequested);
+
+    // Click on E4's row (midi 64) at 2000 ms — no artifacts, no
+    // notes, so this is a pure place-on-empty-cell case.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(2000), rowYForMidiTest(64)));
+
+    REQUIRE(placeSpy.count() == 1);
+    const auto args = placeSpy.takeFirst();
+    REQUIRE(std::abs(args.at(0).toLongLong() - 2000) < 10);
+    REQUIRE(args.at(1).toInt() == 64);
+}
+
+TEST_CASE("StaffWidget: click on an existing note bar selects it (does not place)",
+          "[staff-widget][gui][piano-roll][notes]") {
+    // MEMO[#step6.2]: a click that lands inside an existing note
+    // bar's rect must SELECT that note — not fall through to the
+    // empty-space placement branch. Without this guard, clicking a
+    // bar would add a second overlapping note on the same row.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);   // E4
+    const auto id = *notes->idAt(0);
+
+    QSignalSpy noteSelSpy(&w, &StaffWidget::noteSelectionChanged);
+    QSignalSpy placeSpy  (&w, &StaffWidget::placeNoteRequested);
+    QSignalSpy seekSpy   (&w, &StaffWidget::seekRequested);
+
+    // Click on the bar's centre — well inside the [200, 280) range,
+    // on the E4 row.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(barMidXTest(1000, 1400), rowYForMidiTest(64)));
+
+    REQUIRE(w.selectedNoteId() == id);
+    REQUIRE(noteSelSpy.count() == 1);
+    REQUIRE(placeSpy.count()   == 0);     // NO new note
+    REQUIRE(seekSpy.count()    == 1);
+    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
+    REQUIRE(notes->size() == 1);          // still exactly one note
+}
+
+TEST_CASE("StaffWidget: click above or below the chromatic grid does not place",
+          "[staff-widget][gui][piano-roll]") {
+    // Top margin (tune-type banner) and bottom margin (loop labels)
+    // sit outside the chromatic rows. A click there should seek
+    // but NOT emit placeNoteRequested — there is no row to map.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+
+    QSignalSpy placeSpy(&w, &StaffWidget::placeNoteRequested);
+    QSignalSpy seekSpy (&w, &StaffWidget::seekRequested);
+
+    // Click in the top banner (y < kGridTopMargin).
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(2000), 4));
+    REQUIRE(seekSpy.count()  == 1);
+    REQUIRE(placeSpy.count() == 0);
 }

@@ -478,7 +478,16 @@ void MainWindow::buildCentralWidget() {
                          std::int64_t toMs) {
                 commitLoopDrag(id, isStart, fromMs, toMs, "waveform");
             });
-    layout->addWidget(waveform_, /*stretch=*/1);
+    // MEMO[#step6.2]: indent the waveform by the staff's piano-keyboard
+    // column width so its left edge lines up with the staff's chromatic
+    // grid. The playhead cursor on both widgets then lands at the same
+    // x for the same source-ms, drawing one unbroken vertical line
+    // across the waveform AND the staff at the playback position.
+    auto* waveformRow = new QHBoxLayout();
+    waveformRow->setContentsMargins(0, 0, 0, 0);
+    waveformRow->addSpacing(StaffWidget::kKeyboardWidthPx);
+    waveformRow->addWidget(waveform_, /*stretch=*/1);
+    layout->addLayout(waveformRow, /*stretch=*/1);
 
     // Staff: the lower view. Fixed-ish height (its sizeHint), shares
     // the same models and source-time axis as the waveform.
@@ -514,6 +523,10 @@ void MainWindow::buildCentralWidget() {
             this, [this]() {
                 if (projectViewerDock_) projectViewerDock_->exitNoteMode();
             });
+    // Click on a chromatic row commits a note immediately at the
+    // clicked (ms, midi). Step 6.2 piano-roll gesture.
+    connect(staff_, &StaffWidget::placeNoteRequested,
+            this, &MainWindow::onStaffPlaceNoteRequested);
     connect(staff_, &ScoreOverlayBase::viewportChanged,
             this, &MainWindow::onViewportChanged);
     connect(staff_, &ScoreOverlayBase::userScrolled,
@@ -540,6 +553,18 @@ void MainWindow::buildCentralWidget() {
             });
     layout->addWidget(staff_);
 
+    // Mirror the zoom-anchor guide across both widgets so the
+    // dashed amber line is continuous from waveform into staff.
+    // The OWNER widget (the one under the mouse with Ctrl held)
+    // emits zoomAnchorGuideChanged; the sister widget receives
+    // setMirroredZoomAnchorMs and paints the guide at the same
+    // source-ms. The receiver does not re-emit — see the slot's
+    // comment for the no-loop guarantee.
+    connect(waveform_, &ScoreOverlayBase::zoomAnchorGuideChanged,
+            staff_,    &ScoreOverlayBase::setMirroredZoomAnchorAxisX);
+    connect(staff_,    &ScoreOverlayBase::zoomAnchorGuideChanged,
+            waveform_, &ScoreOverlayBase::setMirroredZoomAnchorAxisX);
+
     // Viewport scrollbar (#49). Visible only when the user has
     // zoomed in (waveform_->isZoomed() == true); hidden otherwise
     // so the layout doesn't sprout a permanent inert band. Maps
@@ -561,7 +586,12 @@ void MainWindow::buildCentralWidget() {
                 // Manual scroll during playback breaks follow.
                 setFollowPlayback(false);
             });
-    layout->addWidget(viewportScrollBar_);
+    // Indent to match the waveform / staff time axis (see waveformRow).
+    auto* scrollBarRow = new QHBoxLayout();
+    scrollBarRow->setContentsMargins(0, 0, 0, 0);
+    scrollBarRow->addSpacing(StaffWidget::kKeyboardWidthPx);
+    scrollBarRow->addWidget(viewportScrollBar_);
+    layout->addLayout(scrollBarRow);
 
     positionSlider_ = new QSlider(Qt::Horizontal, central);
     positionSlider_->setObjectName("positionSlider");
@@ -578,7 +608,12 @@ void MainWindow::buildCentralWidget() {
                            "seek ms={} via=position-slider", ms);
                 onSeek(ms);
             });
-    layout->addWidget(positionSlider_);
+    // Indent to match the waveform / staff time axis (see waveformRow).
+    auto* positionRow = new QHBoxLayout();
+    positionRow->setContentsMargins(0, 0, 0, 0);
+    positionRow->addSpacing(StaffWidget::kKeyboardWidthPx);
+    positionRow->addWidget(positionSlider_);
+    layout->addLayout(positionRow);
 
     auto* tempoRow = new QHBoxLayout();
     tempoLabel_ = new QLabel(tr("Tempo: 100%"), central);
@@ -2301,6 +2336,66 @@ void MainWindow::onDockNoteCommitNewRequested(std::int64_t startMs,
     FLOG_DEBUG("ui.score",
                "commit-new-note id={} start={} end={} midi={} size={}",
                id, startMs, endMs, midi, noteModel_->size());
+}
+
+void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
+    // Step 6.2 piano-roll click-to-place. The interval defaults to
+    // the armed loop's range if one is armed (chord-building in a
+    // region), otherwise [ms − 200, ms + 200] centred on the click.
+    constexpr std::int64_t kDefaultHalfDurationMs = 200;
+    std::int64_t startMs;
+    std::int64_t endMs;
+    const char*  source;
+    if (armedLoopId_.has_value() && loopModel_) {
+        const auto idx = loopModel_->indexOf(*armedLoopId_);
+        if (idx) {
+            const auto& l = loopModel_->loops()[*idx];
+            startMs = l.startMs;
+            endMs   = l.endMs;
+            source  = "armed-loop";
+        } else {
+            startMs = std::max<std::int64_t>(0, ms - kDefaultHalfDurationMs);
+            endMs   = startMs + kDefaultHalfDurationMs * 2;
+            source  = "loop-stale";
+        }
+    } else {
+        startMs = std::max<std::int64_t>(0, ms - kDefaultHalfDurationMs);
+        endMs   = startMs + kDefaultHalfDurationMs * 2;
+        source  = "staff-click";
+    }
+    // MEMO[#step6.2]: avoid the "phantom snap" trap. The hit-test in
+    // StaffWidget is pixel-exact, so a click slightly outside an
+    // existing bar falls through here. But the default 200 ms half-
+    // width is in source-time, so at deep zoom-in the new note's
+    // interval still overlaps the existing bar — the freshly-placed
+    // bar then sits visually on top of the existing one, and the
+    // user perceives it as "the bar got selected when I clicked
+    // near it." Detect that case and select the existing note
+    // instead of stacking a second bar on the same row.
+    for (const auto& n : noteModel_->notes()) {
+        if (n.midi != midi) continue;
+        if (n.endMs <= startMs || n.startMs >= endMs) continue;
+        if (staff_) staff_->setSelectedNoteId(n.id);
+        FLOG_DEBUG("ui.score",
+                   "place-note coerced-to-select id={} reason=overlap "
+                   "click-ms={} midi={} existing=[{}..{}] proposed=[{}..{}]",
+                   n.id, ms, midi, n.startMs, n.endMs, startMs, endMs);
+        return;
+    }
+    const auto id = noteModel_->add(startMs, endMs, midi);
+    if (id == 0) {
+        FLOG_WARN("ui.score",
+                  "place-note rejected ms={} midi={} via={} start={} end={}",
+                  ms, midi, source, startMs, endMs);
+        return;
+    }
+    pushUndoEntry(undo::AddNote{id});
+    // Select the new note so the dock's property page shows it and
+    // the user can refine pitch / interval via Apply Changes.
+    if (staff_) staff_->setSelectedNoteId(id);
+    FLOG_DEBUG("ui.score",
+               "place-note id={} ms={} midi={} via={} start={} end={} size={}",
+               id, ms, midi, source, startMs, endMs, noteModel_->size());
 }
 
 void MainWindow::onDockNoteCommitChangesRequested(std::int64_t id,

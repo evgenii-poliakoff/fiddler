@@ -3571,6 +3571,51 @@ TEST_CASE("MainWindow: New Note → Add Note with armed loop inherits the loop's
     REQUIRE(n.endMs   == 1500);
 }
 
+TEST_CASE("MainWindow: piano-roll click near an existing bar selects it (no overlap)",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#step6.2]: at deep zoom-in a click slightly outside an
+    // existing note bar would still propose an interval (the click
+    // ms ± 200 ms default) that overlaps the existing bar in
+    // source-time. Without a guard, a second bar would land on the
+    // same row visually atop the existing one, looking like the
+    // existing got selected. Guard: when the proposed interval
+    // overlaps an existing note on the same row, select the
+    // existing note instead of stacking a duplicate.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+    REQUIRE(staff != nullptr);
+
+    // Seed an existing note at A4 spanning [1000, 1400] ms via the
+    // place-gesture signal. MainWindow's handler turns this into an
+    // add + select.
+    emit staff->placeNoteRequested(1200, 69);
+    REQUIRE(window->noteModel().size() == 1);
+    const auto firstId = window->noteModel().notes()[0].id;
+    const auto firstStart = window->noteModel().notes()[0].startMs;
+    const auto firstEnd   = window->noteModel().notes()[0].endMs;
+
+    // Now click "near" that bar on the same row at a ms whose
+    // ±200 ms window overlaps the existing interval. Without the
+    // guard this would add a second note; with the guard it
+    // selects the existing one and the model stays at size 1.
+    const std::int64_t nearMs = firstEnd - 50;   // overlaps via -200 default
+    emit staff->placeNoteRequested(nearMs, 69);
+
+    REQUIRE(window->noteModel().size() == 1);
+    REQUIRE(staff->selectedNoteId() == firstId);
+    REQUIRE(window->noteModel().notes()[0].startMs == firstStart);
+    REQUIRE(window->noteModel().notes()[0].endMs   == firstEnd);
+}
+
 TEST_CASE("MainWindow: Ctrl+Z undoes a note placement and a note delete",
           "[main-window][gui][integration][notes][undo]") {
     qtApp();
