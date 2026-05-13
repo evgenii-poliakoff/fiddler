@@ -527,6 +527,12 @@ void MainWindow::buildCentralWidget() {
     // clicked (ms, midi). Step 6.2 piano-roll gesture.
     connect(staff_, &StaffWidget::placeNoteRequested,
             this, &MainWindow::onStaffPlaceNoteRequested);
+    // Drag gestures (issue #60): move + resize on existing notes,
+    // and drag-to-create on the empty grid.
+    connect(staff_, &StaffWidget::noteDragCommitted,
+            this, &MainWindow::onStaffNoteDragCommitted);
+    connect(staff_, &StaffWidget::noteCreateCommitted,
+            this, &MainWindow::onStaffNoteCreateCommitted);
     connect(staff_, &ScoreOverlayBase::viewportChanged,
             this, &MainWindow::onViewportChanged);
     connect(staff_, &ScoreOverlayBase::userScrolled,
@@ -2396,6 +2402,106 @@ void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
     FLOG_DEBUG("ui.score",
                "place-note id={} ms={} midi={} via={} start={} end={} size={}",
                id, ms, midi, source, startMs, endMs, noteModel_->size());
+}
+
+void MainWindow::onStaffNoteDragCommitted(std::int64_t id,
+                                          std::int64_t fromStartMs,
+                                          std::int64_t fromEndMs,
+                                          int          fromMidi,
+                                          std::int64_t toStartMs,
+                                          std::int64_t toEndMs,
+                                          int          toMidi) {
+    // MEMO[#60]: single from→to commit on release. The model was
+    // untouched mid-drag (paint uses noteDragGhost_ via the staff's
+    // effectiveNoteRange / effectiveNoteMidi helpers), so we apply
+    // the gesture's net effect here.
+    if (!noteModel_) return;
+    if (!noteModel_->indexOf(id).has_value()) {
+        FLOG_WARN("ui.score",
+                  "note-drag id={} skipped reason=stale-id", id);
+        return;
+    }
+    const bool intervalChanged =
+        (fromStartMs != toStartMs) || (fromEndMs != toEndMs);
+    const bool pitchChanged = (fromMidi != toMidi);
+    if (!intervalChanged && !pitchChanged) {
+        // Zero-distance drag (threshold crossed but no net delta).
+        return;
+    }
+    // Overlap guard — same rule as click-to-place (#59): a move /
+    // resize that would put this note on top of another existing
+    // note on the SAME ROW is rejected; the gesture rolls back to
+    // the model's untouched state by simply not writing.
+    const int finalMidi = pitchChanged ? toMidi : fromMidi;
+    for (const auto& n : noteModel_->notes()) {
+        if (n.id == id) continue;
+        if (n.midi != finalMidi) continue;
+        if (n.endMs <= toStartMs || n.startMs >= toEndMs) continue;
+        FLOG_DEBUG("ui.score",
+                   "note-drag id={} rejected reason=overlap "
+                   "would-collide-with-id={} on-midi={} "
+                   "proposed=[{}..{}]",
+                   id, n.id, finalMidi, toStartMs, toEndMs);
+        return;
+    }
+    // Push undo entries BEFORE writing, so the snapshots reflect
+    // the pre-drag state. Two entries (interval + pitch) when both
+    // changed — Ctrl+Z reverses them one at a time. QUndoStack
+    // grouping is #44.
+    if (pitchChanged) {
+        pushUndoEntry(undo::EditNotePitch{id, fromMidi});
+    }
+    if (intervalChanged) {
+        pushUndoEntry(undo::EditNoteInterval{id, fromStartMs, fromEndMs});
+    }
+    if (intervalChanged) {
+        noteModel_->setInterval(id, toStartMs, toEndMs);
+    }
+    if (pitchChanged) {
+        noteModel_->setPitch(id, toMidi);
+    }
+    FLOG_DEBUG("ui.score",
+               "note-drag id={} from=[{}..{}]@{} to=[{}..{}]@{}",
+               id, fromStartMs, fromEndMs, fromMidi,
+               toStartMs, toEndMs, toMidi);
+}
+
+void MainWindow::onStaffNoteCreateCommitted(std::int64_t startMs,
+                                            std::int64_t endMs,
+                                            int          midi) {
+    // MEMO[#60]: drag-to-create on the empty grid. Same overlap
+    // guard as click-to-place — a drag that would land on top of
+    // an existing same-row note selects the existing one instead.
+    if (!noteModel_) return;
+    if (endMs <= startMs) {
+        FLOG_WARN("ui.score",
+                  "note-create-drag rejected reason=degenerate "
+                  "start={} end={}",
+                  startMs, endMs);
+        return;
+    }
+    for (const auto& n : noteModel_->notes()) {
+        if (n.midi != midi) continue;
+        if (n.endMs <= startMs || n.startMs >= endMs) continue;
+        if (staff_) staff_->setSelectedNoteId(n.id);
+        FLOG_DEBUG("ui.score",
+                   "note-create-drag coerced-to-select id={} reason=overlap "
+                   "midi={} existing=[{}..{}] proposed=[{}..{}]",
+                   n.id, midi, n.startMs, n.endMs, startMs, endMs);
+        return;
+    }
+    const auto id = noteModel_->add(startMs, endMs, midi);
+    if (id == 0) {
+        FLOG_WARN("ui.score",
+                  "note-create-drag rejected start={} end={} midi={}",
+                  startMs, endMs, midi);
+        return;
+    }
+    pushUndoEntry(undo::AddNote{id});
+    if (staff_) staff_->setSelectedNoteId(id);
+    FLOG_DEBUG("ui.score",
+               "note-create-drag id={} start={} end={} midi={} size={}",
+               id, startMs, endMs, midi, noteModel_->size());
 }
 
 void MainWindow::onDockNoteCommitChangesRequested(std::int64_t id,

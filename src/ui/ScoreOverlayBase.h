@@ -123,6 +123,12 @@ public:
     // get the time-axis x.
     [[nodiscard]] virtual int leftMarginPx() const noexcept { return 0; }
 
+    // Hit-test tolerance in pixels for "near an edge" gestures —
+    // loop-band edges (#11), note bar edges (#60), etc. Exposed
+    // here so subclass hit-tests (StaffWidget::hitNoteEdge) match
+    // the base's internal value without re-declaring.
+    static constexpr int kEdgeTolerancePx = 6;
+
     // ---- viewport / zoom (#49) ----------------------------------
     //
     // The viewport is the source-time range [start, end) the widget
@@ -280,6 +286,21 @@ signals:
                            std::int64_t fromMs,
                            std::int64_t toMs);
 
+    // Note drag commits (issue #60). All three fire exactly once on
+    // release, after a drag has crossed the click-vs-drag threshold.
+    // MainWindow turns these into single setInterval / setPitch /
+    // add() calls plus one undo entry per gesture. No per-move
+    // live signals — the source widget owns the ghost locally
+    // because the waveform doesn't paint notes.
+    void noteDragCommitted(std::int64_t id,
+                           std::int64_t fromStartMs, std::int64_t fromEndMs,
+                           int          fromMidi,
+                           std::int64_t toStartMs,   std::int64_t toEndMs,
+                           int          toMidi);
+    void noteCreateCommitted(std::int64_t startMs,
+                             std::int64_t endMs,
+                             int          midi);
+
 protected:
     void mousePressEvent  (QMouseEvent* event) override;
     void mouseMoveEvent   (QMouseEvent* event) override;
@@ -342,6 +363,48 @@ protected:
                            std::int64_t modelStartMs,
                            std::int64_t modelEndMs) const noexcept;
 
+    // Drag ghost overrides for note bars (issue #60). Per-axis
+    // because move + resize change different fields; readers stay
+    // simple. Sister widget doesn't paint notes today so there's no
+    // cross-widget mirror — the ghost is owned by the source side.
+    [[nodiscard]] std::pair<std::int64_t, std::int64_t>
+        effectiveNoteRange(std::int64_t id,
+                           std::int64_t modelStartMs,
+                           std::int64_t modelEndMs) const noexcept;
+    [[nodiscard]] int effectiveNoteMidi(std::int64_t id,
+                                        int modelMidi) const noexcept;
+    // The drag-to-create "phantom" bar — visible only while the
+    // user is mid-drag on an empty grid cell, before any model
+    // write. nullopt when no NoteCreate drag is in flight.
+    struct PhantomNote {
+        std::int64_t startMs;
+        std::int64_t endMs;
+        int          midi;
+    };
+    [[nodiscard]] std::optional<PhantomNote>
+        phantomNoteGhost() const noexcept;
+
+    // Y-axis pitch hit-test for NoteMove (so the base can map the
+    // mouse-y to a chromatic row without knowing the staff's
+    // layout). Returns -1 when the y doesn't map to a valid row.
+    // Default = -1 (waveform / non-piano-roll widgets).
+    [[nodiscard]] virtual int pixelToMidi(int /*y*/) const { return -1; }
+
+    // Note-edge hit-test (issue #60). Within kEdgeTolerancePx of a
+    // bar's left / right edge on its row → resize candidate. Body
+    // hit (between edges) → covered by hitNote. Default returns
+    // nullopt — only the piano-roll staff implements this.
+    struct NoteEdgeHit { std::int64_t id; bool isStart; };
+    [[nodiscard]] virtual std::optional<NoteEdgeHit>
+        hitNoteEdge(int /*x*/, int /*y*/) const { return std::nullopt; }
+
+    // Does this widget-local (x, y) sit on a chromatic row that
+    // could host a new note? Used by mousePressEvent to decide
+    // whether an empty-space press arms a NoteCreate drag. Returns
+    // the midi value if so, -1 otherwise. Default: -1.
+    [[nodiscard]] virtual int chromaticRowAt(int /*x*/,
+                                             int /*y*/) const { return -1; }
+
 private slots:
     void onBarlineModelChanged();
     void onMarkerModelChanged();
@@ -354,12 +417,35 @@ private:
     // crossed it yet. `dragOriginalMs_` snapshots the artifact's
     // position at press so the mouseRelease commit signal can report
     // a meaningful from→to pair.
-    enum class DragKind { None, Marker, LoopStart, LoopEnd };
+    enum class DragKind {
+        None,
+        Marker,
+        LoopStart,
+        LoopEnd,
+        // Issue #60 — note gestures.
+        NoteMove,         // body of an existing bar → move in time + pitch
+        NoteResizeStart,  // left edge → resize note start
+        NoteResizeEnd,    // right edge → resize note end
+        NoteCreate        // empty grid cell → drag to draw a new note
+    };
     DragKind     dragKind_       = DragKind::None;
     std::int64_t dragId_         = 0;
     QPoint       dragPressPos_;
     bool         dragActive_     = false;
     std::int64_t dragOriginalMs_ = 0;
+
+    // Note-drag press-time snapshot. Only populated when dragKind_
+    // is one of the Note* kinds. `startMs` / `endMs` / `midi` are
+    // the model's values at press time — used as the from-side of
+    // the from→to commit signal and as the immutable reference
+    // while a drag is in flight (mouseMove computes deltas relative
+    // to these, not to the model which never changes mid-drag).
+    struct NoteDragOrigin {
+        std::int64_t startMs = 0;
+        std::int64_t endMs   = 0;
+        int          midi    = 69;
+    };
+    NoteDragOrigin noteDragOrigin_;
 
     // Per-move snapshot of the dragged artifact's "where would it
     // land if released right now" position. Set on press (with
@@ -377,6 +463,28 @@ private:
         std::int64_t ms   = 0;
     };
     std::optional<DragGhost> dragGhost_;
+
+    // Note-drag ghost (issue #60). Carries the full (start, end,
+    // midi) triple because move/resize change different fields.
+    // Source-side only — waveform doesn't paint notes so we don't
+    // mirror this to the sister widget. NoteCreate uses id=0 to
+    // signal "phantom" (no model entry yet).
+    struct NoteDragGhost {
+        DragKind     kind    = DragKind::None;
+        std::int64_t id      = 0;
+        std::int64_t startMs = 0;
+        std::int64_t endMs   = 0;
+        int          midi    = 69;
+    };
+    std::optional<NoteDragGhost> noteDragGhost_;
+
+    // True when the user pressed an empty grid cell that maps to a
+    // chromatic row — i.e. NoteCreate was armed. On release, this
+    // tells us whether to fall through to onEmptySpaceClick
+    // (plain click, default-span placement) or to commit the
+    // dragged range via noteCreateCommitted (the drag-to-create
+    // gesture). The flag clears on every press.
+    bool noteCreateDeferred_ = false;
 
     // Cache of the last seekRequested value so a per-move drag
     // doesn't keep firing identical seeks (mouse-move events can

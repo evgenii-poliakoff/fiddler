@@ -95,6 +95,21 @@ protected:
     [[nodiscard]] std::optional<std::int64_t>
         hitNote(int xWidget, int yWidget) const override;
 
+    // Note-edge hit-test (issue #60): a click within
+    // kEdgeTolerancePx of a bar's left / right x AND on the bar's
+    // row arms a NoteResize drag. Edge zones may extend slightly
+    // outside the bar so very short bars are still resizable.
+    [[nodiscard]] std::optional<NoteEdgeHit>
+        hitNoteEdge(int xWidget, int yWidget) const override;
+
+    // Returns the midi value of the chromatic row at y, or -1 if
+    // y is outside the grid. Used both by the click-to-place
+    // gesture (decides whether to arm NoteCreate) and by the
+    // NoteMove drag (live pitch follow on mouse-y).
+    [[nodiscard]] int pixelToMidi(int yWidget) const override;
+    [[nodiscard]] int chromaticRowAt(int xWidget,
+                                     int yWidget) const override;
+
 signals:
     // Fired when the user clicks an empty cell on the chromatic
     // grid. `ms` is the click's source-time; `midi` is the row's

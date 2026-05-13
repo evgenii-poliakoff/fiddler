@@ -1341,3 +1341,198 @@ TEST_CASE("StaffWidget: click above or below the chromatic grid does not place",
     REQUIRE(seekSpy.count()  == 1);
     REQUIRE(placeSpy.count() == 0);
 }
+
+// ---------------------------------------------------------------------------
+// Note drag / resize / drag-to-create (issue #60)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Drive a press → move-near-press → move-to-end → release sequence
+// on the staff. Mirrors the dragSequence helper above but lets the
+// caller pass the y coordinate per gesture (note drags are y-bound
+// to the chromatic row, not arbitrary as for markers / loops).
+void noteDragSequence(StaffWidget&             w,
+                      QPoint                   press,
+                      QPoint                   release,
+                      Qt::KeyboardModifiers    mods = Qt::NoModifier)
+{
+    QTest::mousePress(&w, Qt::LeftButton, mods, press);
+    QMouseEvent mvNear(QEvent::MouseMove,
+                       QPointF{press + QPoint{2, 0}},
+                       Qt::NoButton, Qt::LeftButton, mods);
+    QApplication::sendEvent(&w, &mvNear);
+    QMouseEvent mvFinal(QEvent::MouseMove,
+                       QPointF{release},
+                       Qt::NoButton, Qt::LeftButton, mods);
+    QApplication::sendEvent(&w, &mvFinal);
+    QTest::mouseRelease(&w, Qt::LeftButton, mods, release);
+}
+
+} // namespace
+
+TEST_CASE("StaffWidget: drag note body moves it in time and pitch",
+          "[staff-widget][gui][notes][drag]") {
+    // E4 bar at [1000..1400]. Drag the body 800 ms right and one
+    // row up (E4 → F4). The commit signal carries the post-clamp
+    // post-row final values; the model is untouched here — tests
+    // pin the SIGNAL contract, MainWindow tests pin the model
+    // write.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+    const auto id = *notes->idAt(0);
+
+    QSignalSpy spy(&w, &StaffWidget::noteDragCommitted);
+
+    const QPoint press  (barMidXTest(1000, 1400), rowYForMidiTest(64));
+    const QPoint release(barMidXTest(1800, 2200), rowYForMidiTest(65));
+    noteDragSequence(w, press, release);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(0).toLongLong() == id);
+    REQUIRE(args.at(1).toLongLong() == 1000);   // from start
+    REQUIRE(args.at(2).toLongLong() == 1400);   // from end
+    REQUIRE(args.at(3).toInt()       == 64);    // from midi
+    REQUIRE(std::abs(args.at(4).toLongLong() - 1800) <= 6);  // to start
+    REQUIRE(std::abs(args.at(5).toLongLong() - 2200) <= 6);  // to end
+    REQUIRE(args.at(6).toInt()       == 65);    // to midi (F4)
+}
+
+TEST_CASE("StaffWidget: Shift+drag locks the note to its original row",
+          "[staff-widget][gui][notes][drag]") {
+    // Same setup but Shift held → vertical movement ignored.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+
+    QSignalSpy spy(&w, &StaffWidget::noteDragCommitted);
+
+    const QPoint press  (barMidXTest(1000, 1400), rowYForMidiTest(64));
+    const QPoint release(barMidXTest(1800, 2200), rowYForMidiTest(70));
+    noteDragSequence(w, press, release, Qt::ShiftModifier);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(6).toInt() == 64);   // midi unchanged
+}
+
+TEST_CASE("StaffWidget: drag the right edge resizes endMs only",
+          "[staff-widget][gui][notes][drag]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+
+    QSignalSpy spy(&w, &StaffWidget::noteDragCommitted);
+
+    const QPoint press  (xForMsTest(1400), rowYForMidiTest(64));
+    const QPoint release(xForMsTest(1800), rowYForMidiTest(64));
+    noteDragSequence(w, press, release);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(1).toLongLong() == 1000);
+    REQUIRE(args.at(2).toLongLong() == 1400);
+    REQUIRE(std::abs(args.at(4).toLongLong() - 1000) <= 1);  // start untouched
+    REQUIRE(std::abs(args.at(5).toLongLong() - 1800) <= 6);  // end → 1800
+    REQUIRE(args.at(6).toInt() == 64);
+}
+
+TEST_CASE("StaffWidget: drag the left edge resizes startMs only",
+          "[staff-widget][gui][notes][drag]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(1000, 1400, 64) != 0);
+
+    QSignalSpy spy(&w, &StaffWidget::noteDragCommitted);
+
+    // Press on the start edge; drag right by 200 ms.
+    const QPoint press  (xForMsTest(1000), rowYForMidiTest(64));
+    const QPoint release(xForMsTest(1200), rowYForMidiTest(64));
+    noteDragSequence(w, press, release);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(1).toLongLong() == 1000);
+    REQUIRE(args.at(2).toLongLong() == 1400);
+    REQUIRE(std::abs(args.at(4).toLongLong() - 1200) <= 6);  // start → 1200
+    REQUIRE(args.at(5).toLongLong() == 1400);                // end untouched
+}
+
+TEST_CASE("StaffWidget: drag on empty grid creates a note of the dragged length",
+          "[staff-widget][gui][notes][drag][piano-roll]") {
+    // Empty grid → drag-to-create. Signal carries press-ms / release-ms
+    // and the press-row's midi. MainWindow turns it into a model add.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+
+    QSignalSpy createSpy(&w, &StaffWidget::noteCreateCommitted);
+    QSignalSpy placeSpy (&w, &StaffWidget::placeNoteRequested);
+
+    const QPoint press  (xForMsTest(2000), rowYForMidiTest(72));
+    const QPoint release(xForMsTest(2600), rowYForMidiTest(72));
+    noteDragSequence(w, press, release);
+
+    REQUIRE(createSpy.count() == 1);
+    REQUIRE(placeSpy.count()  == 0);   // drag overrides click-to-place
+    const auto args = createSpy.takeFirst();
+    REQUIRE(std::abs(args.at(0).toLongLong() - 2000) <= 6);
+    REQUIRE(std::abs(args.at(1).toLongLong() - 2600) <= 6);
+    REQUIRE(args.at(2).toInt() == 72);
+}
+
+TEST_CASE("StaffWidget: plain click on empty grid still emits placeNoteRequested "
+          "(no drag-create)",
+          "[staff-widget][gui][notes][piano-roll]") {
+    // Regression check for the press → release deferral added with
+    // drag-to-create. A press + release at the same point (no drag
+    // past threshold) must still fire placeNoteRequested — the
+    // default-span placement path is preserved.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+
+    QSignalSpy createSpy(&w, &StaffWidget::noteCreateCommitted);
+    QSignalSpy placeSpy (&w, &StaffWidget::placeNoteRequested);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(2000), rowYForMidiTest(72)));
+
+    REQUIRE(placeSpy.count()  == 1);
+    REQUIRE(createSpy.count() == 0);
+}
+
+TEST_CASE("StaffWidget: resize past partner edge clamps to partner − 1",
+          "[staff-widget][gui][notes][drag]") {
+    // End-edge drag past startMs (going leftward) must NOT collapse
+    // the note to zero or negative duration. The ghost (and the
+    // committed value) clamps to startMs + 1 instead.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    auto notes = installNotes(w);
+    REQUIRE(notes->add(2000, 2400, 64) != 0);
+
+    QSignalSpy spy(&w, &StaffWidget::noteDragCommitted);
+
+    const QPoint press  (xForMsTest(2400), rowYForMidiTest(64));
+    const QPoint release(xForMsTest(1500), rowYForMidiTest(64));  // way past start
+    noteDragSequence(w, press, release);
+
+    REQUIRE(spy.count() == 1);
+    const auto args = spy.takeFirst();
+    REQUIRE(args.at(4).toLongLong() == 2000);                 // start untouched
+    REQUIRE(args.at(5).toLongLong() == 2001);                 // end clamped
+}

@@ -29,10 +29,9 @@ namespace {
 // before the refactor (#12) so user feel is unchanged.
 constexpr int kHitTolerancePx = 5;
 
-// Loop-edge hit-test tolerance — slightly larger than the marker /
-// barline tolerance because edges are 1-px lines (not flagged ticks)
-// and benefit from a more generous catch radius. Issue #11.
-constexpr int kEdgeTolerancePx = 6;
+// Loop-edge hit-test tolerance: ScoreOverlayBase::kEdgeTolerancePx
+// (public so subclass hit-tests can match). The literal lives on
+// the header — issue #11.
 
 // Snap-to-anchor tolerance for loop-edge dragging — same value as
 // the edge hit radius so the affordances match: if you can grab the
@@ -701,20 +700,61 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         return;
     }
 
-    // 4. Note bar hit? (step 6.2 — piano-roll). The subclass
-    // overrides hitNote() to consult its chromatic-row geometry
-    // and the NoteModel. On hit we behave like the barline /
-    // marker branches: select + seek to the note's startMs.
-    // Important: this branch must beat the empty-space placement
-    // below — otherwise a click on an existing bar would add a
-    // second overlapping note instead of selecting the first.
+    // 4a. Note bar EDGE hit? (issue #60 — drag-to-resize). Edges
+    // win before bodies so the user can grab a thin edge zone of
+    // a wide bar to resize it; a press in the middle is a move
+    // candidate, handled by 4b.
+    if (noteModel_ && noteModel_->size() > 0) {
+        if (const auto edgeHit = hitNoteEdge(x, event->pos().y())) {
+            const auto idx = noteModel_->indexOf(edgeHit->id);
+            if (idx) {
+                const auto& n = noteModel_->notes()[*idx];
+                prepareClickStateChange();
+                setSelectedNoteId(edgeHit->id);
+                emit seekRequested(n.startMs);
+                if (!ctrlHeld) {
+                    dragKind_ = edgeHit->isStart
+                                ? DragKind::NoteResizeStart
+                                : DragKind::NoteResizeEnd;
+                    dragId_         = edgeHit->id;
+                    dragPressPos_   = event->pos();
+                    dragActive_     = false;
+                    dragOriginalMs_ = edgeHit->isStart ? n.startMs : n.endMs;
+                    noteDragOrigin_ = NoteDragOrigin{n.startMs, n.endMs, n.midi};
+                }
+                event->accept();
+                return;
+            }
+        }
+    }
+
+    // 4b. Note bar BODY hit? (issue #60 — drag-to-move; existing
+    // behaviour from #59: also select + seek). On non-Ctrl press,
+    // arm a NoteMove drag candidate; on release without a drag
+    // it stays a plain selection click.
     if (noteModel_ && noteModel_->size() > 0) {
         if (const auto noteId = hitNote(x, event->pos().y())) {
             const auto idx = noteModel_->indexOf(*noteId);
             if (idx) {
+                const auto& n = noteModel_->notes()[*idx];
                 prepareClickStateChange();
                 setSelectedNoteId(*noteId);
-                emit seekRequested(noteModel_->notes()[*idx].startMs);
+                emit seekRequested(n.startMs);
+                if (!ctrlHeld) {
+                    dragKind_       = DragKind::NoteMove;
+                    dragId_         = *noteId;
+                    dragPressPos_   = event->pos();
+                    dragActive_     = false;
+                    // MEMO[#60]: NoteMove uses press-cursor-ms as the
+                    // anchor so the per-move delta (cursorMs − ms)
+                    // gives the user's drag distance, NOT the bar's
+                    // start position. Grabbing the middle of a bar
+                    // and dragging 100 ms right shifts the whole
+                    // interval 100 ms; without this we'd snap the
+                    // start to the cursor's x instead.
+                    dragOriginalMs_ = ms;
+                    noteDragOrigin_ = NoteDragOrigin{n.startMs, n.endMs, n.midi};
+                }
                 event->accept();
                 return;
             }
@@ -779,12 +819,30 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     // sides are already null), so this dedicated signal is the only
     // way to propagate the "discard draft" intent on plain seeks.
     emit emptySpaceClicked();
-    // MEMO[#step6.2]: additive subclass hook. The piano-roll
-    // StaffWidget uses it to emit placeNoteRequested(ms, midi) —
-    // turning a click on the empty grid into a note placement
-    // alongside the seek. Base default is no-op so WaveformWidget
-    // keeps the plain-seek behaviour unchanged.
-    onEmptySpaceClick(x, event->pos().y(), ms);
+    // MEMO[#step6.2/#60]: additive subclass hook. On the staff,
+    // chromaticRowAt(x, y) returns the midi of the row under the
+    // press — non-negative means "this empty-grid press could
+    // become either a click-to-place OR a drag-to-create". We arm
+    // a NoteCreate candidate and defer onEmptySpaceClick to
+    // mouseReleaseEvent so the user can drag past the click-vs-
+    // drag threshold to specify an explicit length, or not drag
+    // and get the default-span placement on release.
+    //
+    // Other widgets (WaveformWidget) return -1 here, so the call
+    // falls through to onEmptySpaceClick immediately — the
+    // pre-#60 behaviour.
+    const int rowMidi = chromaticRowAt(x, event->pos().y());
+    if (rowMidi >= 0) {
+        dragKind_       = DragKind::NoteCreate;
+        dragId_         = 0;
+        dragPressPos_   = event->pos();
+        dragActive_     = false;
+        dragOriginalMs_ = ms;
+        noteDragOrigin_ = NoteDragOrigin{ms, ms, rowMidi};
+        noteCreateDeferred_ = true;
+    } else {
+        onEmptySpaceClick(x, event->pos().y(), ms);
+    }
     event->accept();
 }
 
@@ -860,6 +918,112 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
         return;
     }
 
+    // Note drags (issue #60). All four kinds (Move / ResizeStart /
+    // ResizeEnd / Create) share the same shape: update the local
+    // ghost, repaint, no model write. Commit fires exactly once
+    // on release.
+    if (dragKind_ == DragKind::NoteMove
+        || dragKind_ == DragKind::NoteResizeStart
+        || dragKind_ == DragKind::NoteResizeEnd
+        || dragKind_ == DragKind::NoteCreate)
+    {
+        const std::int64_t dur = durationMs();
+
+        if (dragKind_ == DragKind::NoteMove) {
+            // Bail if the note vanished mid-drag.
+            if (!noteModel_ || !noteModel_->indexOf(dragId_).has_value()) {
+                dragKind_   = DragKind::None;
+                dragActive_ = false;
+                noteDragGhost_.reset();
+                emit dragEnded();
+                event->accept();
+                return;
+            }
+            // dms is the time-axis offset from press-x.
+            const std::int64_t dms = cursorMs - dragOriginalMs_;
+            std::int64_t newStart =
+                noteDragOrigin_.startMs + dms;
+            std::int64_t newEnd =
+                noteDragOrigin_.endMs + dms;
+            // Clamp by SHIFTING (don't crush the note's length).
+            if (newStart < 0) {
+                newEnd -= newStart;
+                newStart = 0;
+            }
+            if (dur > 0 && newEnd > dur) {
+                newStart -= (newEnd - dur);
+                newEnd = dur;
+            }
+            // Shift held → lock to the original row (time-only).
+            // Else follow the cursor's y to a chromatic row.
+            const bool shiftHeld =
+                QApplication::keyboardModifiers() & Qt::ShiftModifier;
+            int newMidi = noteDragOrigin_.midi;
+            if (!shiftHeld) {
+                const int rowMidi = pixelToMidi(event->pos().y());
+                if (rowMidi >= 0) newMidi = rowMidi;
+            }
+            noteDragGhost_ = NoteDragGhost{
+                DragKind::NoteMove, dragId_, newStart, newEnd, newMidi};
+        }
+        else if (dragKind_ == DragKind::NoteResizeStart) {
+            if (!noteModel_ || !noteModel_->indexOf(dragId_).has_value()) {
+                dragKind_   = DragKind::None;
+                dragActive_ = false;
+                noteDragGhost_.reset();
+                emit dragEnded();
+                event->accept();
+                return;
+            }
+            std::int64_t snapped = cursorMs;
+            if (const auto snap = findSnapAnchor(cursorMs)) snapped = *snap;
+            if (snapped < 0) snapped = 0;
+            // Pin strictly below the partner edge so the note keeps
+            // a positive duration; the kept value is the cursor's
+            // intent, just clamped one ms inside.
+            if (snapped >= noteDragOrigin_.endMs) {
+                snapped = noteDragOrigin_.endMs - 1;
+            }
+            noteDragGhost_ = NoteDragGhost{
+                DragKind::NoteResizeStart, dragId_,
+                snapped, noteDragOrigin_.endMs, noteDragOrigin_.midi};
+        }
+        else if (dragKind_ == DragKind::NoteResizeEnd) {
+            if (!noteModel_ || !noteModel_->indexOf(dragId_).has_value()) {
+                dragKind_   = DragKind::None;
+                dragActive_ = false;
+                noteDragGhost_.reset();
+                emit dragEnded();
+                event->accept();
+                return;
+            }
+            std::int64_t snapped = cursorMs;
+            if (const auto snap = findSnapAnchor(cursorMs)) snapped = *snap;
+            if (dur > 0 && snapped > dur) snapped = dur;
+            if (snapped <= noteDragOrigin_.startMs) {
+                snapped = noteDragOrigin_.startMs + 1;
+            }
+            noteDragGhost_ = NoteDragGhost{
+                DragKind::NoteResizeEnd, dragId_,
+                noteDragOrigin_.startMs, snapped, noteDragOrigin_.midi};
+        }
+        else {  // NoteCreate
+            // Press defined startMs (= dragOriginalMs_) on the
+            // press-row. End follows the cursor — but never goes
+            // before the start (we reject reverse drags by pinning
+            // end one ms past start). Pitch stays on the press row.
+            std::int64_t end = cursorMs;
+            if (end <= dragOriginalMs_) end = dragOriginalMs_ + 1;
+            if (dur > 0 && end > dur) end = dur;
+            noteDragGhost_ = NoteDragGhost{
+                DragKind::NoteCreate, 0,
+                dragOriginalMs_, end, noteDragOrigin_.midi};
+        }
+        update();
+        event->accept();
+        return;
+    }
+
     // Loop edge drag — pull the loop's CURRENT range from the
     // model so the partner edge stays put even after a previous
     // mouse-move in this gesture mutated the loop.
@@ -914,6 +1078,7 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
         return;
     }
 
+    const bool wasNoteCreate = (dragKind_ == DragKind::NoteCreate);
     if (dragActive_) {
         // MEMO[#22]: read the artifact's final ms from the GHOST,
         // not the model. Under the unified ghost flow the model
@@ -935,7 +1100,39 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
             const bool isStart = (dragKind_ == DragKind::LoopStart);
             emit loopDragCommitted(dragId_, isStart,
                                    dragOriginalMs_, toMs);
+        } else if (noteDragGhost_
+                   && (dragKind_ == DragKind::NoteMove
+                       || dragKind_ == DragKind::NoteResizeStart
+                       || dragKind_ == DragKind::NoteResizeEnd)
+                   && noteModel_
+                   && noteModel_->indexOf(dragId_).has_value())
+        {
+            // Single from→to commit for the whole gesture. MainWindow
+            // applies it as one setInterval + (maybe) setPitch + one
+            // undo entry. The ghost holds the post-clamp values.
+            emit noteDragCommitted(
+                dragId_,
+                noteDragOrigin_.startMs, noteDragOrigin_.endMs,
+                noteDragOrigin_.midi,
+                noteDragGhost_->startMs, noteDragGhost_->endMs,
+                noteDragGhost_->midi);
+        } else if (noteDragGhost_
+                   && dragKind_ == DragKind::NoteCreate
+                   && noteDragGhost_->endMs > noteDragGhost_->startMs)
+        {
+            emit noteCreateCommitted(noteDragGhost_->startMs,
+                                     noteDragGhost_->endMs,
+                                     noteDragGhost_->midi);
         }
+    } else if (wasNoteCreate && noteCreateDeferred_) {
+        // Plain click on empty grid (no drag threshold crossed) —
+        // fall through to the deferred default-span placement.
+        // Mirror what mousePressEvent used to do before #60 deferred
+        // the call. We use the current cursor's ms (release point);
+        // press point would also work since no drag occurred, but
+        // release-point matches QTest::mouseClick semantics.
+        const std::int64_t ms = xToMs(event->pos().x());
+        onEmptySpaceClick(event->pos().x(), event->pos().y(), ms);
     }
 
     const bool wasActive = dragActive_;
@@ -944,6 +1141,8 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
     dragId_         = 0;
     dragOriginalMs_ = 0;
     dragGhost_.reset();
+    noteDragGhost_.reset();
+    noteCreateDeferred_ = false;
     lastSeekMs_.reset();
     if (wasActive) {
         emit dragEnded();
@@ -1011,6 +1210,45 @@ ScoreOverlayBase::effectiveLoopRange(std::int64_t id,
         }
     }
     return { modelStartMs, modelEndMs };
+}
+
+std::pair<std::int64_t, std::int64_t>
+ScoreOverlayBase::effectiveNoteRange(std::int64_t id,
+                                     std::int64_t modelStartMs,
+                                     std::int64_t modelEndMs) const noexcept
+{
+    if (noteDragGhost_ && noteDragGhost_->id == id
+        && (noteDragGhost_->kind == DragKind::NoteMove
+            || noteDragGhost_->kind == DragKind::NoteResizeStart
+            || noteDragGhost_->kind == DragKind::NoteResizeEnd))
+    {
+        return { noteDragGhost_->startMs, noteDragGhost_->endMs };
+    }
+    return { modelStartMs, modelEndMs };
+}
+
+int ScoreOverlayBase::effectiveNoteMidi(std::int64_t id,
+                                        int modelMidi) const noexcept
+{
+    if (noteDragGhost_ && noteDragGhost_->id == id
+        && (noteDragGhost_->kind == DragKind::NoteMove
+            || noteDragGhost_->kind == DragKind::NoteResizeStart
+            || noteDragGhost_->kind == DragKind::NoteResizeEnd))
+    {
+        return noteDragGhost_->midi;
+    }
+    return modelMidi;
+}
+
+std::optional<ScoreOverlayBase::PhantomNote>
+ScoreOverlayBase::phantomNoteGhost() const noexcept
+{
+    if (noteDragGhost_ && noteDragGhost_->kind == DragKind::NoteCreate) {
+        return PhantomNote{noteDragGhost_->startMs,
+                           noteDragGhost_->endMs,
+                           noteDragGhost_->midi};
+    }
+    return std::nullopt;
 }
 
 std::optional<ScoreOverlayBase::LoopEdgeHit>
