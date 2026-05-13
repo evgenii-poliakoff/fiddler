@@ -143,13 +143,19 @@ A *loop* is a region of the recording that plays back repeatedly. Use loops to d
 
 ### Build a loop
 
-A loop is built from two anchors — a *primary* anchor and a *secondary* anchor. Each anchor can be any artifact already in the recording: a barline, a marker, or another loop's edge.
+Two ways:
 
-1. Click an artifact to make it the primary anchor.
-2. Hold **Ctrl** and click another artifact to attach it as the secondary anchor.
-3. Press **L**.
+- *Drag on the waveform.* Press an empty point on the waveform and drag horizontally to the end — release to commit. A new translucent band appears on both the waveform and the staff. The drag end snaps to the nearest barline / marker / other loop edge within a few pixels, so loops line up cleanly with the landmarks you've placed. Plain click (no drag) still seeks.
+- *Two-anchor recipe.* If you'd rather build a loop from existing artifacts: click an artifact on the waveform to make it the primary anchor, hold **Ctrl** and click another artifact for the secondary anchor, then press **L**. The new loop spans from the smaller anchor to the larger.
 
-A new loop spans the source-time range from the smaller of the two anchor positions to the larger. The loop appears as a translucent band across the waveform and the staff, and as a row in the *Loops* category of the dock.
+The loop appears as a translucent band across the waveform and the staff, and as a row in the *Loops* category of the dock.
+
+### Move or resize a loop
+
+- *Move.* Drag the body of the loop band on the waveform. Both edges shift together — the loop's duration is preserved. Snap-to-nearest-anchor lets the loop land precisely on a barline / marker.
+- *Resize.* Drag either edge on the waveform. Only that edge moves; the partner edge stays put. Snap applies.
+
+Loop editing lives on the waveform; the staff displays the band for visual context but stays a pure note editor — clicks inside a loop band on the staff place a note rather than moving the loop.
 
 ### Arm and play
 
