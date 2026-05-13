@@ -4,7 +4,6 @@
 #include "score/LoopModel.h"
 #include "score/MarkerModel.h"
 #include "score/NoteModel.h"
-#include "score/Pitch.h"
 #include "util/Log.h"
 
 #include <QFont>
@@ -21,34 +20,51 @@ namespace fiddler::ui {
 
 namespace {
 
-// Visual layout constants. Pulled out as named constants so the
-// numbers in the paint code mean something at a glance.
+// ============================================================
+// Piano-roll layout (step 6.2)
+// ============================================================
 //
-// MEMO[#step6.1]: kStaffTopMarginPx grew from 18 → 72 to leave
-// vertical room ABOVE the staff for note ledger lines. The violin
-// range goes up to E7 (top of range — see NoteModel::isAcceptedPitch).
-// E7's diatonic step is 21 above E4 (the bottom staff line), so it
-// sits at staffBottomY − 21*(kStaffSpacingPx/2) = staffBottomY − 84
-// pixels. With staffBottomY = 72 + 32 = 104, E7 lands at y = 20 —
-// safely inside the widget.
-constexpr int kStaffLineCount      = 5;
-constexpr int kStaffSpacingPx      = 8;     // gap between adjacent staff lines
-constexpr int kStaffTopMarginPx    = 72;    // room above for tune-type label + marker flags + ledger lines up to E7
-constexpr int kStaffBottomMarginPx = 28;    // room below for ledger lines down to G3 (5 dia steps below E4)
+// The widget has two columns:
+//
+//   1. A piano keyboard on the left (kKeyboardWidthPx). White keys
+//      occupy their row fully; black keys are narrower, right-aligned
+//      and darker. C notes carry a small "C{octave}" label so the
+//      user can locate themselves on the keyboard.
+//   2. A chromatic grid on the right. Each row spans one semitone in
+//      midi. The y axis is INVERTED: top of grid = highest pitch
+//      (E7), bottom = lowest pitch (G3). White-key rows are tinted
+//      slightly lighter than black-key rows so the keyboard's
+//      colouration extends across the grid.
+//
+// Total visible range: G3 (midi 55) to E7 (midi 100) — the violin's
+// playable span (kept in lockstep with NoteModel::isAcceptedPitch).
 
-constexpr int kTimeSigLeftMarginPx = 6;
-constexpr int kTimeSigPointSize    = 14;
+constexpr int kRowMidiLow            = 55;     // G3 — open G string
+constexpr int kRowMidiHigh           = 100;    // E7 — top of standard range
+constexpr int kSemitoneRowHeightPx   = 8;
+constexpr int kRowCount              = kRowMidiHigh - kRowMidiLow + 1;  // 46
+constexpr int kGridTopMarginPx       = 18;     // tune-type + marker flag banner
+constexpr int kGridBottomMarginPx    = 18;     // loop labels
+constexpr int kGridHeightPx          = kRowCount * kSemitoneRowHeightPx; // 368
 
-// Marker label flag — same shape as WaveformWidget's, sits in the
-// top margin band above the staff lines.
+// MEMO: must stay in lockstep with StaffWidget::kKeyboardWidthPx in
+// the header — the constant is duplicated here so the paint code in
+// this TU stays a plain `constexpr int`, while MainWindow gets a
+// public class member to read.
+constexpr int kKeyboardWidthPx       = StaffWidget::kKeyboardWidthPx;
+constexpr int kBlackKeyWidthRatio    = 65;     // black key spans 65 % of kbWidth, right-aligned
+
+// Tune-type label sits in the top margin, over the keyboard column.
+constexpr int kTuneTypeLabelPointSz  = 10;
+constexpr int kTuneTypeLabelLeftPx   = 6;
+
+// Marker label flag — sits in the top margin band above the grid.
 constexpr int kMarkerFlagHeightPx     = 12;
 constexpr int kMarkerFlagPaddingPx    = 4;
 constexpr int kMarkerFlagFontPointSz  = 8;
 constexpr int kMarkerFlagMaxWidthPx   = 120;
 
 // Loop band visuals — same palette and rules as WaveformWidget.
-// Comment intentionally short here; canonical rationale lives in
-// WaveformWidget.cpp's matching block.
 constexpr int kLoopBandAlphaUnselected = 35;
 constexpr int kLoopBandAlphaSelected   = 90;
 constexpr int kLoopLabelHeightPx       = 12;
@@ -56,36 +72,28 @@ constexpr int kLoopLabelPaddingPx      = 4;
 constexpr int kLoopLabelFontPointSz    = 8;
 constexpr int kLoopLabelMaxWidthPx     = 120;
 
-// Note bar (piano-roll style — see project_step6_plan.md memory).
-// The bar is centred vertically on the diatonic-step y so a note ON
-// a line straddles it symmetrically, and a note IN a space sits
-// neatly between two lines. Height is one staff spacing minus a
-// hair of slack so adjacent diatonic steps don't visually touch.
-constexpr int kNoteBarHeightPx       = kStaffSpacingPx - 2;     // 6 px
-// Ledger lines: short horizontal marks every diatonic LINE position
-// (i.e. every other step) between the note and the staff body. The
-// stub extends a hair past the bar on either side so the note head
-// reads as ON the ledger, not just near it.
-constexpr int kLedgerHalfWidthPx     = 8;
-constexpr int kLedgerLineThicknessPx = 1;
-
-// Selection edge highlight — drawn around any selected note so the
-// note property page in the dock has visible feedback in the staff.
+// Note bar — single colour. Each accidental gets its own chromatic
+// row, so the bar's row position alone communicates the pitch. The
+// tint-vs-natural distinction from step 6.1 retires.
+constexpr int kNoteBarHeightPx       = kSemitoneRowHeightPx - 2;   // 6 px
 constexpr int kNoteSelectionWidthPx  = 2;
 
-// Accidental tint — sharps and flats render in a slightly bluer /
-// teal-shifted green so they're visually distinct from naturals
-// without needing a per-note ♯ glyph. Matches the convention every
-// surveyed piano-roll editor follows: no per-note accidental
-// glyphs; pitch is communicated by row position + colour. The
-// engraving convention of "♯ in front of the note head" assumes
-// round note heads and isolated whitespace between notes, neither
-// of which fits a contiguous-rectangle layout. See the
-// project_step6_plan memory entry for the research notes.
-//
-// Same green family so the tier is recognisable (Rule: progressive
-// visual weight in the memory) — accidentals lean cool, naturals
-// lean warm.
+// Black-key chroma classes: C# (1), D# (3), F# (6), G# (8), A# (10).
+[[nodiscard]] bool isBlackKey(int midi) noexcept {
+    const int chroma = midi % 12;
+    return chroma == 1 || chroma == 3 || chroma == 6
+        || chroma == 8 || chroma == 10;
+}
+
+// True iff this midi value is a "C" — for octave labels on the
+// keyboard.
+[[nodiscard]] bool isC(int midi) noexcept {
+    return (midi % 12) == 0;
+}
+
+[[nodiscard]] int octaveOf(int midi) noexcept {
+    return midi / 12 - 1;
+}
 
 } // namespace
 
@@ -113,34 +121,41 @@ bool StaffWidget::hasContent() const noexcept {
 
 // ---- coordinate transforms ----------------------------------------------
 
-// MEMO[#step6.1]: height grew 100 → 132 so the violin range
-// (G3 to E7, see NoteModel::isAcceptedPitch) fits with ledger
-// lines: top margin (72) + 5 staff lines × 8 spacing (32) +
-// bottom margin (28) = 132.
-QSize StaffWidget::sizeHint()        const { return QSize(800, 132); }
-QSize StaffWidget::minimumSizeHint() const { return QSize(120, 132); }
-
-int StaffWidget::staffTopY()    const noexcept { return kStaffTopMarginPx; }
-int StaffWidget::staffBottomY() const noexcept {
-    return staffTopY() + (kStaffLineCount - 1) * kStaffSpacingPx;
+// MEMO[#step6.2]: height = top margin (18) + grid (46 rows × 8 px =
+// 368) + bottom margin (18) = 404 px. The grid fits the full violin
+// range (G3 to E7) chromatically — every semitone gets its own row.
+QSize StaffWidget::sizeHint()        const {
+    return QSize(800, kGridTopMarginPx + kGridHeightPx + kGridBottomMarginPx);
+}
+QSize StaffWidget::minimumSizeHint() const {
+    return QSize(120, kGridTopMarginPx + kGridHeightPx + kGridBottomMarginPx);
 }
 
-int StaffWidget::staffYForPitch(int midi) const noexcept {
-    // Bottom staff line E4 (midi 64) anchors the y axis. Each
-    // diatonic step is half the staff-line spacing — the same
-    // metric a line→space→line→space sequence uses.
-    constexpr int kE4DiatonicStep   = 30;
-    constexpr int kPxPerDiatonicStep = kStaffSpacingPx / 2;   // 4
-    int dia = score::diatonicStep(midi);
-    if (dia < 0) {
-        // Accidental — sharp spelling pins the note to the natural
-        // one semitone BELOW (A#4 sits at A4's line, with a ♯ glyph
-        // drawn to the left in paintNotes). Try midi-1 (the natural
-        // counterpart for any sharp).
-        dia = score::diatonicStep(midi - 1);
-    }
-    if (dia < 0) return INT_MIN;
-    return staffBottomY() - (dia - kE4DiatonicStep) * kPxPerDiatonicStep;
+int StaffWidget::leftMarginPx() const noexcept {
+    return kKeyboardWidthPx;
+}
+
+int StaffWidget::gridTopY()    const noexcept { return kGridTopMarginPx; }
+int StaffWidget::gridBottomY() const noexcept {
+    return kGridTopMarginPx + kGridHeightPx;
+}
+
+int StaffWidget::rowYForMidi(int midi) const noexcept {
+    if (midi < kRowMidiLow || midi > kRowMidiHigh) return INT_MIN;
+    // Top of widget = highest pitch (kRowMidiHigh). Each row's
+    // CENTRE y lies at gridTopY + rowIndex × rowHeight + rowHeight/2.
+    const int rowIndex = kRowMidiHigh - midi;
+    return gridTopY()
+         + rowIndex * kSemitoneRowHeightPx
+         + kSemitoneRowHeightPx / 2;
+}
+
+int StaffWidget::midiForRowY(int y) const noexcept {
+    const int top = gridTopY();
+    if (y < top) return -1;
+    const int rowIndex = (y - top) / kSemitoneRowHeightPx;
+    if (rowIndex < 0 || rowIndex >= kRowCount) return -1;
+    return kRowMidiHigh - rowIndex;
 }
 
 // ---- painting ------------------------------------------------------------
@@ -149,80 +164,142 @@ void StaffWidget::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     painter.fillRect(rect(), QColor(20, 20, 24));   // matches WaveformWidget
 
-    // One paint helper per visual concern keeps each method short
-    // and easy to follow. Order matters: things drawn later sit on
-    // top, so the cursor is last. Loops paint first so the
-    // translucent bands sit at the lowest z-order.
+    // Paint order (low z-order first):
+    //   1. Grid background (chromatic row tint).
+    //   2. Piano keyboard column on the left.
+    //   3. Tune-type banner in the top margin (over the keyboard column).
+    //   4. Loop bands (translucent, full-height across the grid).
+    //   5. Barlines (vertical ticks in the grid).
+    //   6. Note bars at their chromatic rows.
+    //   7. Markers (vertical ticks + label flags in the top margin).
+    //   8. Selected loop edges re-drawn so they sit on top of any
+    //      coincident markers / barlines (issue #11).
+    //   9. Cursor (red playhead).
+    //  10. Secondary anchor (dashed) — after the cursor so the dashes
+    //      pierce through the cursor when both share an x.
+    //  11. Zoom-anchor guide (Ctrl+wheel preview).
+    paintGridBackground(painter);
+    paintPianoKeyboard(painter);
+    paintTuneTypeBanner(painter);
     paintLoops(painter);
-    paintStaffLines(painter);
-    paintTimeSignature(painter);
     paintBarlines(painter);
     paintNotes(painter);
     paintMarkers(painter);
-    // Selected loop's edges re-drawn ON TOP so the user can see
-    // (and drag) the edge even when a marker tick or barline sits
-    // at exactly the same x. Mirrors the hit-test rule in
-    // ScoreOverlayBase::mousePressEvent. Issue #11.
     paintSelectedLoopEdges(painter);
-    // Cursor must paint BEFORE the secondary anchor's dashed
-    // indicator so that, when both are at the same x (e.g. right
-    // after a tap-place when the cursor seeks to the new artifact),
-    // the dashing pierces through the cursor. Otherwise the cursor
-    // would cover the artifact-as-dashed paint and the user would
-    // only see the red cursor at that x. See WaveformWidget for the
-    // canonical comment.
     paintCursor(painter);
     paintSecondaryAnchor(painter);
-    // Zoom-anchor guide (#49) — painted last so it sits on top of
-    // every other overlay. No-op when Ctrl isn't held.
     paintZoomAnchorGuide(painter);
-    (void)kStaffBottomMarginPx;   // reserved for step 6 ledger lines
 }
 
-void StaffWidget::paintStaffLines(QPainter& painter) const {
-    painter.setPen(QPen(QColor(180, 180, 180), 1.0));
-    const int top = staffTopY();
-    for (int i = 0; i < kStaffLineCount; ++i) {
-        const int y = top + i * kStaffSpacingPx;
-        painter.drawLine(0, y, width(), y);
+void StaffWidget::paintGridBackground(QPainter& painter) const {
+    // Two-tone row fill — white-key rows are a touch lighter than
+    // black-key rows, matching the keyboard's colouration to the
+    // right. Octave separators (1-px lines at every C row's top)
+    // make octaves countable at a glance.
+    const QColor whiteRowCol(34, 34, 38);
+    const QColor blackRowCol(26, 26, 30);
+    const QColor octaveLineCol(52, 52, 58);
+
+    const int gridLeft  = leftMarginPx();
+    const int gridRight = width();
+    if (gridRight <= gridLeft) return;
+    const int gridW = gridRight - gridLeft;
+
+    for (int midi = kRowMidiLow; midi <= kRowMidiHigh; ++midi) {
+        const int yCenter = rowYForMidi(midi);
+        if (yCenter == INT_MIN) continue;
+        const int rowTop = yCenter - kSemitoneRowHeightPx / 2;
+        const QRect rowRect(gridLeft, rowTop, gridW, kSemitoneRowHeightPx);
+        painter.fillRect(rowRect,
+                         isBlackKey(midi) ? blackRowCol : whiteRowCol);
+        // Octave separator drawn at the TOP of each C row (i.e.
+        // between B (midi-1) below and C above). Looks like a faint
+        // horizontal divider every 12 rows.
+        if (isC(midi)) {
+            painter.setPen(QPen(octaveLineCol, 1.0));
+            painter.drawLine(gridLeft, rowTop, gridRight - 1, rowTop);
+        }
     }
 }
 
-void StaffWidget::paintTimeSignature(QPainter& painter) const {
+void StaffWidget::paintPianoKeyboard(QPainter& painter) const {
+    const int kbLeft  = 0;
+    const int kbRight = leftMarginPx();
+    if (kbRight <= kbLeft) return;
+
+    const QColor whiteKeyCol(230, 230, 224);
+    const QColor whiteKeyBorder(150, 150, 145);
+    const QColor blackKeyCol(28, 28, 30);
+    const QColor cLabelCol(80, 80, 90);
+
+    // Fill the keyboard background first — same tone as a piano's
+    // white-key bed, so any gap between keys reads as white-keyboard.
+    painter.fillRect(QRect(kbLeft, gridTopY(),
+                           kbRight - kbLeft, kGridHeightPx),
+                     whiteKeyCol);
+
+    // Walk every chromatic row. White keys outline the full kbWidth;
+    // black keys are narrower rectangles overlaid on the right side.
+    QFont labelFont = painter.font();
+    labelFont.setPointSize(7);
+    labelFont.setBold(false);
+    painter.setFont(labelFont);
+    const QFontMetrics labelFm(labelFont);
+
+    for (int midi = kRowMidiLow; midi <= kRowMidiHigh; ++midi) {
+        const int yCenter = rowYForMidi(midi);
+        if (yCenter == INT_MIN) continue;
+        const int rowTop = yCenter - kSemitoneRowHeightPx / 2;
+
+        if (isBlackKey(midi)) {
+            // Black key: narrower rectangle, right-aligned in the
+            // keyboard column. Spans the full row height.
+            const int blackW = kKeyboardWidthPx * kBlackKeyWidthRatio / 100;
+            const QRect blackRect(kbRight - blackW, rowTop,
+                                  blackW, kSemitoneRowHeightPx);
+            painter.fillRect(blackRect, blackKeyCol);
+        } else {
+            // White key: thin grey hairline at the top of each row
+            // (separator between adjacent keys). The row's fill
+            // already happened (white-key colour above).
+            painter.setPen(QPen(whiteKeyBorder, 0.5));
+            painter.drawLine(kbLeft, rowTop, kbRight - 1, rowTop);
+
+            // C-note label sits in the leftmost few pixels of the C
+            // row. Other naturals stay unlabelled — labelling every
+            // white key clutters the column.
+            if (isC(midi)) {
+                painter.setPen(cLabelCol);
+                const QString label = QString("C%1").arg(octaveOf(midi));
+                painter.drawText(
+                    kbLeft + 3,
+                    yCenter + labelFm.ascent() / 2 - 1,
+                    label);
+            }
+        }
+    }
+
+    // Right border separating the keyboard from the grid.
+    painter.setPen(QPen(whiteKeyBorder, 1.0));
+    painter.drawLine(kbRight - 1, gridTopY(),
+                     kbRight - 1, gridBottomY());
+}
+
+void StaffWidget::paintTuneTypeBanner(QPainter& painter) const {
     const auto barModel = barlineModel();
     if (!barModel) return;
-    const auto ts = barModel->timeSignature();
+    const auto& ts = barModel->timeSignature();
+    if (ts.tuneType.isEmpty()) return;
 
-    // Numerator + denominator stacked, left of the first barline.
-    // A future engraving pass would use proper SMuFL glyphs from a
-    // music font; this is good enough for an empty-staff prototype.
-    QFont digitFont = painter.font();
-    digitFont.setPointSize(kTimeSigPointSize);
-    digitFont.setBold(true);
-    painter.setFont(digitFont);
-    painter.setPen(QColor(230, 230, 230));
-
-    const QFontMetrics fm(digitFont);
-    const int top    = staffTopY();
-    const int bottom = staffBottomY();
-    const int upperCentreY = top    + (bottom - top) / 4;
-    const int lowerCentreY = bottom - (bottom - top) / 4;
-    const int leftX        = kTimeSigLeftMarginPx;
-
-    painter.drawText(leftX, upperCentreY + fm.ascent() / 2,
-                     QString::number(ts.numerator));
-    painter.drawText(leftX, lowerCentreY + fm.ascent() / 2,
-                     QString::number(ts.denominator));
-
-    // Optional tune-type label above the staff (handbook hint —
-    // "Reel", "Jig", etc. — see project_handbook_for_self_taught.md).
-    if (!ts.tuneType.isEmpty()) {
-        QFont labelFont = painter.font();
-        labelFont.setPointSize(10);
-        labelFont.setBold(false);
-        painter.setFont(labelFont);
-        painter.drawText(leftX, top - 4, ts.tuneType);
-    }
+    QFont labelFont = painter.font();
+    labelFont.setPointSize(kTuneTypeLabelPointSz);
+    labelFont.setBold(false);
+    painter.setFont(labelFont);
+    painter.setPen(QColor(220, 220, 220));
+    const QFontMetrics fm(labelFont);
+    // Centred vertically in the top margin band.
+    const int y = (gridTopY() + fm.ascent()) / 2 + 1;
+    painter.drawText(kTuneTypeLabelLeftPx, y, ts.tuneType);
 }
 
 void StaffWidget::paintLoops(QPainter& painter) const {
@@ -288,8 +365,8 @@ void StaffWidget::paintBarlines(QPainter& painter) const {
     const auto bars       = barModel->barlines();
     const auto selBar     = selectedBarline();
     const auto secAnchor  = secondaryAnchorMs();
-    const int  topY       = staffTopY();
-    const int  bottomY    = staffBottomY();
+    const int  topY       = gridTopY();
+    const int  bottomY    = gridBottomY();
     const QPen normalPen{ QColor(210, 170, 60), 1.0 };
     const QPen selectedPen{ QColor(255, 200, 90), 2.0 };
 
@@ -384,51 +461,31 @@ void StaffWidget::paintNotes(QPainter& painter) const {
                notes.size(), selId.value_or(-1),
                durationMs(), width());
 
-    // Visual layers per bar, painted in order:
-    //   1. Ledger stubs (under the note so the bar rides ON the
-    //      ledger).
-    //   2. The bar fill + border.
-    //   3. The selection ring (only on the selected note).
-    //
-    // Naturals lean warm-green; accidentals lean cool-teal. Both in
-    // the same hue family for clarity. See the constant block above.
-    const QColor fillNaturalCol     (180, 220, 140, 200);
-    const QColor borderNaturalCol   (140, 200, 100);
-    const QColor fillAccidentalCol  (140, 200, 195, 200);
-    const QColor borderAccidentalCol(100, 180, 165);
-    const QColor selectionCol       (220, 255, 160);
-
-    // Treble-staff geometry — same constants as staffYForPitch.
-    // E4 (dia 30) sits on the bottom line, F5 (dia 38) on top.
-    // Ledger LINES live at every even diatonic step outside [30,38]
-    // (e.g. C4=28 → middle-C ledger below, A5=40 → first ledger above).
-    constexpr int kE4DiatonicStep    = 30;
-    constexpr int kF5DiatonicStep    = 38;
-    constexpr int kPxPerDiatonicStep = kStaffSpacingPx / 2;     // 4
-
-    const int bottomY = staffBottomY();
-
-    // y of an even-diatonic-step line position. Used for ledgers.
-    const auto yForLineDia = [&](int dia) {
-        return bottomY - (dia - kE4DiatonicStep) * kPxPerDiatonicStep;
-    };
+    // Single colour for every note bar — the chromatic row's y is
+    // what disambiguates pitch (no tint distinction needed since
+    // each accidental gets its own row, unlike the 6.1 diatonic
+    // staff). Selection ring stays for visible feedback.
+    const QColor fillCol    (180, 220, 140, 215);
+    const QColor borderCol  (140, 200, 100);
+    const QColor selectionCol(220, 255, 160);
+    const int    kbWidth = leftMarginPx();
 
     int paintedCount = 0;
-    int skippedAccidental = 0;
+    int skippedOutOfRange = 0;
     int skippedClipped = 0;
     for (const auto& n : notes) {
-        const int y = staffYForPitch(n.midi);
+        const int y = rowYForMidi(n.midi);
         if (y == INT_MIN) {
-            ++skippedAccidental;
+            ++skippedOutOfRange;
             FLOG_TRACE("ui.staff",
-                       "paint-note id={} midi={} skipped=accidental",
+                       "paint-note id={} midi={} skipped=out-of-range",
                        n.id, n.midi);
-            continue;   // accidental — model forbids in 6.1
+            continue;
         }
 
         const int xStart = msToX(n.startMs);
         const int xEnd   = msToX(n.endMs);
-        if (xEnd <= 0 || xStart >= width()) {
+        if (xEnd <= kbWidth || xStart >= width()) {
             ++skippedClipped;
             FLOG_TRACE("ui.staff",
                        "paint-note id={} midi={} startMs={} endMs={} "
@@ -443,48 +500,11 @@ void StaffWidget::paintNotes(QPainter& painter) const {
                    "xStart={} xEnd={}",
                    n.id, n.midi, n.startMs, n.endMs, y, xStart, xEnd);
 
-        // Diatonic step for ledger logic. For accidentals (sharp
-        // spelling), use the natural-below's step — the bar is
-        // already at that y via staffYForPitch. The bar is tinted
-        // accordingly, so the accidental is visible without a
-        // separate ♯ glyph.
-        const bool isAccidental = (score::diatonicStep(n.midi) < 0);
-        const int  dia = isAccidental
-            ? score::diatonicStep(n.midi - 1)
-            : score::diatonicStep(n.midi);
-
-        const QColor& fillCol   = isAccidental
-            ? fillAccidentalCol   : fillNaturalCol;
-        const QColor& borderCol = isAccidental
-            ? borderAccidentalCol : borderNaturalCol;
-
-        const int xLeft  = std::max(0, xStart);
+        const int xLeft  = std::max(kbWidth, xStart);
         const int xRight = std::min(width(), xEnd);
         const int barW   = std::max(1, xRight - xLeft);
         const int barTop = y - kNoteBarHeightPx / 2;
         const QRect barRect(xLeft, barTop, barW, kNoteBarHeightPx);
-        const int barMidX = (xLeft + xRight) / 2;
-
-        // Ledger stubs — every even-dia line position between the
-        // staff body and the note (inclusive of the note's line if
-        // it's a line position).
-        if (dia > kF5DiatonicStep) {
-            painter.setPen(QPen(borderCol, kLedgerLineThicknessPx));
-            for (int probeDia = kF5DiatonicStep + 2;
-                 probeDia <= dia; probeDia += 2) {
-                const int ly = yForLineDia(probeDia);
-                painter.drawLine(barMidX - kLedgerHalfWidthPx, ly,
-                                 barMidX + kLedgerHalfWidthPx, ly);
-            }
-        } else if (dia < kE4DiatonicStep) {
-            painter.setPen(QPen(borderCol, kLedgerLineThicknessPx));
-            for (int probeDia = kE4DiatonicStep - 2;
-                 probeDia >= dia; probeDia -= 2) {
-                const int ly = yForLineDia(probeDia);
-                painter.drawLine(barMidX - kLedgerHalfWidthPx, ly,
-                                 barMidX + kLedgerHalfWidthPx, ly);
-            }
-        }
 
         painter.fillRect(barRect, fillCol);
         painter.setPen(QPen(borderCol, 1.0));
@@ -495,6 +515,57 @@ void StaffWidget::paintNotes(QPainter& painter) const {
             painter.drawRect(barRect.adjusted(-1, -1, 1, 1));
         }
     }
+}
+
+std::optional<std::int64_t>
+StaffWidget::hitNote(int xWidget, int yWidget) const {
+    // Hit-test the click against every note bar. A bar covers
+    //   x ∈ [msToX(startMs), msToX(endMs))
+    //   y ∈ [rowYForMidi(midi) - barHeight/2, +barHeight/2)
+    // Walk the notes in REVERSE so the visually-topmost bar wins
+    // on overlap — the loop in paintNotes paints earlier entries
+    // first, so later entries draw over them.
+    const auto noteM = noteModel();
+    if (!noteM) return std::nullopt;
+    if (xWidget < leftMarginPx()) return std::nullopt;
+
+    const auto notes = noteM->notes();
+    for (std::size_t i = notes.size(); i-- > 0;) {
+        const auto& n = notes[i];
+        const int rowY = rowYForMidi(n.midi);
+        if (rowY == INT_MIN) continue;
+        const int barTop    = rowY - kNoteBarHeightPx / 2;
+        const int barBottom = barTop + kNoteBarHeightPx;
+        if (yWidget < barTop || yWidget >= barBottom) continue;
+        const int xStart = msToX(n.startMs);
+        const int xEnd   = msToX(n.endMs);
+        if (xWidget < xStart || xWidget >= xEnd) continue;
+        FLOG_TRACE("ui.staff",
+                   "hit-note id={} midi={} startMs={} endMs={} "
+                   "click=({},{})",
+                   n.id, n.midi, n.startMs, n.endMs, xWidget, yWidget);
+        return n.id;
+    }
+    return std::nullopt;
+}
+
+// MEMO[#step6.2]: extends the base's plain-seek branch — when the
+// click lands on a valid chromatic row, emit placeNoteRequested so
+// MainWindow can add a note at (ms, midi). Clicks above the grid
+// (top margin) or below it just stay as a seek.
+void StaffWidget::onEmptySpaceClick(int /*xWidget*/,
+                                    int yWidget,
+                                    std::int64_t ms) {
+    const int midi = midiForRowY(yWidget);
+    if (midi < 0) {
+        FLOG_TRACE("ui.staff",
+                   "empty-space-click y={} ms={} no-row hit", yWidget, ms);
+        return;
+    }
+    FLOG_DEBUG("ui.staff",
+               "empty-space-click ms={} midi={} emit=place-note",
+               ms, midi);
+    emit placeNoteRequested(ms, midi);
 }
 
 void StaffWidget::paintSecondaryAnchor(QPainter& painter) const {

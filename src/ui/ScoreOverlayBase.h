@@ -114,6 +114,15 @@ public:
     // `setDurationMs` setter the GUI calls on every load.
     [[nodiscard]] virtual std::int64_t durationMs() const noexcept = 0;
 
+    // Width in pixels of a non-time region on the LEFT edge that the
+    // time axis must skip. Used by the piano-roll StaffWidget (step
+    // 6.2) which reserves the leftmost column for the keyboard.
+    // WaveformWidget has no such margin so the base returns 0.
+    // xToMs and msToX honour this transparently — paint and click
+    // code work in widget-x, and the math subtracts the margin to
+    // get the time-axis x.
+    [[nodiscard]] virtual int leftMarginPx() const noexcept { return 0; }
+
     // ---- viewport / zoom (#49) ----------------------------------
     //
     // The viewport is the source-time range [start, end) the widget
@@ -185,7 +194,25 @@ public slots:
     void setLoopDragGhost  (std::int64_t id, bool isStart, std::int64_t ms);
     void clearDragGhost();
 
+    // Mirror the zoom-anchor guide from the sister widget. The
+    // value is in TIME-AXIS pixels (widget-x minus leftMarginPx)
+    // so the cross-widget copy stays integer-exact at deep zoom —
+    // a round-trip through source-ms would truncate sub-ms info
+    // and the dashed line would visibly desync by several pixels.
+    // Both widgets share the same time-axis pixel width by layout
+    // (MainWindow indents the waveform by kbWidth so the staff's
+    // grid and the waveform line up 1:1), so a plain int copy
+    // works. Receiver does NOT re-emit — no loop.
+    void setMirroredZoomAnchorAxisX(std::optional<int> axisX);
+
 signals:
+    // Time-axis x of the zoom-anchor guide (widget-x minus
+    // leftMarginPx) when the widget is OWNING the guide, or nullopt
+    // when the guide is hidden. Axis-x — not ms — to keep the
+    // cross-widget mirror integer-exact at deep zoom; see the
+    // matching slot comment.
+    void zoomAnchorGuideChanged(std::optional<int> axisX);
+
     void seekRequested(std::int64_t ms);
     // MEMO[#step6.1]: emitted by the plain-seek branch (when the
     // user clicks on the widget at a location that doesn't hit any
@@ -277,6 +304,24 @@ protected:
     // processed". Without content the base treats clicks as
     // QWidget defaults (no seek, no select).
     [[nodiscard]] virtual bool hasContent() const noexcept = 0;
+
+    // Additive hook called inside the plain-seek branch of
+    // mousePressEvent (after seekRequested + emptySpaceClicked
+    // fire). The piano-roll StaffWidget overrides this to emit
+    // placeNoteRequested(ms, midi). Base default is no-op so
+    // WaveformWidget keeps the existing plain-seek behaviour.
+    virtual void onEmptySpaceClick(int /*xWidget*/,
+                                   int /*yWidget*/,
+                                   std::int64_t /*ms*/) {}
+
+    // Hit-test for note bars, called by mousePressEvent BEFORE the
+    // plain-seek branch. The piano-roll StaffWidget overrides this
+    // to consult NoteModel + chromatic-row geometry; on a hit it
+    // returns the note's id, the base then selects + seeks. Default
+    // returns nullopt so WaveformWidget keeps falling through (it
+    // doesn't paint notes today).
+    [[nodiscard]] virtual std::optional<std::int64_t>
+        hitNote(int /*xWidget*/, int /*yWidget*/) const { return std::nullopt; }
 
     // Pixel-distance → source-ms helper, used by the mouse hit-test.
     // Computed via xToMs so it scales with whatever zoom / viewport
@@ -385,6 +430,19 @@ private:
     // refreshed by enterEvent so a Ctrl-down-then-enter case
     // doesn't miss it.
     std::optional<int> zoomAnchorGuideX_;
+
+    // Mirrored value from the sister widget, in TIME-AXIS pixels
+    // (widget-x minus the sister's leftMarginPx). Both widgets
+    // share the same time-axis pixel width, so paint converts via
+    // `leftMarginPx() + *mirroredZoomAnchorAxisX_`. Integer copy
+    // keeps the dashed line exactly aligned even at deep zoom
+    // where ms-quantised round-trips would drift several pixels.
+    std::optional<int> mirroredZoomAnchorAxisX_;
+
+    // Replace any direct write to zoomAnchorGuideX_ with this so
+    // the matching ms-form signal goes out and MainWindow can
+    // mirror to the sister widget.
+    void updateZoomAnchorGuide(std::optional<int> newX);
 };
 
 } // namespace fiddler::ui
