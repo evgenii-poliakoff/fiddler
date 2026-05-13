@@ -194,6 +194,17 @@ The new note's interval is the currently *armed* loop when one is armed; otherwi
 
 The piano keyboard column itself is **not** clickable — it labels the rows and is reserved for a future preview-tone gesture. Clicks land only on the grid.
 
+### Drag a note
+
+Direct-manipulation gestures on the staff, the same vocabulary every DAW piano roll uses:
+
+- *Move.* Press the body of a bar and drag. Horizontal motion shifts the interval in time; vertical motion re-pitches the note to the row under the cursor. Hold **Shift** while dragging to lock to the original row (time-only). The bar glides as a live ghost; release commits.
+- *Resize end.* Press within a few pixels of the bar's right edge and drag. Only the end moves; the start stays put.
+- *Resize start.* Symmetric: press near the left edge, drag to move the start.
+- *Draw.* Press on an empty grid cell and drag horizontally to draw a new note of arbitrary length. The press position is the start, the release position is the end, and the row is the pitch. A plain click — no drag — still places a default-span note as before.
+
+Drags that would put a bar on top of another note on the *same row* are rejected; the model rolls back to the pre-drag state. **Ctrl+Z** undoes the last drag.
+
 ### Edit a note from the property page
 
 Click a bar on the staff to select it. The dock's property page shows the note's Pitch, Start, End, and Duration; edits commit live on Enter / Tab / focus-loss, the same way marker and loop fields work. Clicking the waveform or the staff in an empty area deselects the note.
