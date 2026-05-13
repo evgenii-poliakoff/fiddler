@@ -596,8 +596,17 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         }
     };
 
+    // MEMO[#62]: on the staff (piano roll) `artifactsClickable()`
+    // returns false — markers / barlines / loop edges / loop bodies
+    // STILL PAINT for visual context and serve as snap anchors,
+    // but they don't catch clicks. The user clicks anywhere on the
+    // grid (including ON TOP of these artifacts) and gets a note
+    // placement / selection. Universal DAW convention: region UI
+    // on the timeline, note UI on the piano roll, no overlap.
+    const bool artifactsHittable = artifactsClickable();
+
     // 0. Selected loop's edges win first (see exception above).
-    if (selectedLoopId_.has_value() && loopModel_) {
+    if (artifactsHittable && selectedLoopId_.has_value() && loopModel_) {
         const auto idx = loopModel_->indexOf(*selectedLoopId_);
         if (idx) {
             const auto& loop = loopModel_->loops()[*idx];
@@ -630,7 +639,7 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     }
 
     // 1. Marker hit?
-    if (markerModel_ && markerModel_->size() > 0 && tolMs >= 0) {
+    if (artifactsHittable && markerModel_ && markerModel_->size() > 0 && tolMs >= 0) {
         if (const auto markerHit = markerModel_->nearest(ms, tolMs)) {
             const auto idx = markerModel_->indexOf(*markerHit);
             if (idx) {
@@ -658,7 +667,7 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     }
 
     // 2. Barline hit?
-    if (barlineModel_ && barlineModel_->size() > 0 && tolMs >= 0) {
+    if (artifactsHittable && barlineModel_ && barlineModel_->size() > 0 && tolMs >= 0) {
         if (const auto barHit = barlineModel_->nearest(ms, tolMs)) {
             prepareClickStateChange();
             setSelectedBarline(*barHit);
@@ -675,29 +684,31 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     // priority — a marker sitting at a loop's startMs should be the
     // hit target, not the edge. Only check loop edges if neither
     // anchor kind matched.
-    if (const auto edgeHit = hitLoopEdge(x)) {
-        prepareClickStateChange();
-        setSelectedLoopId(edgeHit->id);
-        // Loop-edge selection deliberately does NOT seek — the user
-        // is editing region geometry, not navigating playback.
-        // Loops never had a hit-test before this PR, so there's no
-        // prior behaviour to preserve here.
-        if (!ctrlHeld && loopModel_) {
-            const auto idx = loopModel_->indexOf(edgeHit->id);
-            if (idx) {
-                const auto& loop = loopModel_->loops()[*idx];
-                dragKind_     = edgeHit->isStart
-                                ? DragKind::LoopStart
-                                : DragKind::LoopEnd;
-                dragId_       = edgeHit->id;
-                dragPressPos_ = event->pos();
-                dragActive_   = false;
-                dragOriginalMs_ = edgeHit->isStart
-                                  ? loop.startMs : loop.endMs;
+    if (artifactsHittable) {
+        if (const auto edgeHit = hitLoopEdge(x)) {
+            prepareClickStateChange();
+            setSelectedLoopId(edgeHit->id);
+            // Loop-edge selection deliberately does NOT seek — the user
+            // is editing region geometry, not navigating playback.
+            // Loops never had a hit-test before this PR, so there's no
+            // prior behaviour to preserve here.
+            if (!ctrlHeld && loopModel_) {
+                const auto idx = loopModel_->indexOf(edgeHit->id);
+                if (idx) {
+                    const auto& loop = loopModel_->loops()[*idx];
+                    dragKind_     = edgeHit->isStart
+                                    ? DragKind::LoopStart
+                                    : DragKind::LoopEnd;
+                    dragId_       = edgeHit->id;
+                    dragPressPos_ = event->pos();
+                    dragActive_   = false;
+                    dragOriginalMs_ = edgeHit->isStart
+                                      ? loop.startMs : loop.endMs;
+                }
             }
+            event->accept();
+            return;
         }
-        event->accept();
-        return;
     }
 
     // 4a. Note bar EDGE hit? (issue #60 — drag-to-resize). Edges
@@ -754,6 +765,38 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
                     // start to the cursor's x instead.
                     dragOriginalMs_ = ms;
                     noteDragOrigin_ = NoteDragOrigin{n.startMs, n.endMs, n.midi};
+                }
+                event->accept();
+                return;
+            }
+        }
+    }
+
+    // 4c. Loop band BODY hit? (issue #62 — drag-to-move whole loop).
+    // Note hits (4a/4b) win first so a note bar painted ON TOP of a
+    // loop band still goes to the note. Body hit zone excludes the
+    // edge tolerance — edges are claimed by step 3.
+    if (artifactsHittable && loopModel_ && loopModel_->size() > 0) {
+        if (const auto loopId = hitLoopBody(x)) {
+            const auto idx = loopModel_->indexOf(*loopId);
+            if (idx) {
+                const auto& l = loopModel_->loops()[*idx];
+                prepareClickStateChange();
+                setSelectedLoopId(*loopId);
+                // Loop-body click does NOT seek — the user is
+                // editing region geometry, same convention the
+                // loop-edge branch (#11) follows.
+                if (!ctrlHeld) {
+                    dragKind_       = DragKind::LoopMove;
+                    dragId_         = *loopId;
+                    dragPressPos_   = event->pos();
+                    dragActive_     = false;
+                    // Press-cursor-ms as the anchor for delta math
+                    // (mirrors NoteMove). loopDragOrigin_ keeps the
+                    // pre-drag range so per-move can shift relative
+                    // to it without re-reading the model.
+                    dragOriginalMs_ = ms;
+                    loopDragOrigin_ = LoopDragOrigin{l.startMs, l.endMs};
                 }
                 event->accept();
                 return;
@@ -840,6 +883,18 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
         dragOriginalMs_ = ms;
         noteDragOrigin_ = NoteDragOrigin{ms, ms, rowMidi};
         noteCreateDeferred_ = true;
+    } else if (armsLoopCreate(x, event->pos().y())) {
+        // Empty waveform — arm a LoopCreate drag (issue #62). Like
+        // NoteCreate, mouseReleaseEvent decides drag-vs-click. On
+        // release without drag we fall through to plain seek (no
+        // model write); with drag we emit loopCreateCommitted.
+        dragKind_       = DragKind::LoopCreate;
+        dragId_         = 0;
+        dragPressPos_   = event->pos();
+        dragActive_     = false;
+        dragOriginalMs_ = ms;
+        loopDragOrigin_ = LoopDragOrigin{ms, ms};
+        loopCreateDeferred_ = true;
     } else {
         onEmptySpaceClick(x, event->pos().y(), ms);
     }
@@ -945,6 +1000,16 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
                 noteDragOrigin_.startMs + dms;
             std::int64_t newEnd =
                 noteDragOrigin_.endMs + dms;
+            // Snap-to-anchor on the START edge (#62). The end
+            // shifts by the same delta so the note's duration is
+            // preserved — if start snaps, end follows. Lets the
+            // user drop a note's onset exactly on a marker / loop
+            // boundary / barline.
+            if (const auto snap = findSnapAnchor(newStart)) {
+                const auto delta = *snap - newStart;
+                newStart += delta;
+                newEnd   += delta;
+            }
             // Clamp by SHIFTING (don't crush the note's length).
             if (newStart < 0) {
                 newEnd -= newStart;
@@ -1012,13 +1077,84 @@ void ScoreOverlayBase::mouseMoveEvent(QMouseEvent* event) {
             // press-row. End follows the cursor — but never goes
             // before the start (we reject reverse drags by pinning
             // end one ms past start). Pitch stays on the press row.
+            // Snap the end to nearby barlines / markers / loop
+            // edges so the new note lines up with the recording's
+            // landmarks (#62).
             std::int64_t end = cursorMs;
+            if (const auto snap = findSnapAnchor(cursorMs)) end = *snap;
             if (end <= dragOriginalMs_) end = dragOriginalMs_ + 1;
             if (dur > 0 && end > dur) end = dur;
             noteDragGhost_ = NoteDragGhost{
                 DragKind::NoteCreate, 0,
                 dragOriginalMs_, end, noteDragOrigin_.midi};
         }
+        update();
+        event->accept();
+        return;
+    }
+
+    // Loop body / create drags (issue #62). LoopMove translates
+    // both edges by the cursor delta; LoopCreate paints a phantom
+    // band from press-ms to current-ms. Both update the source
+    // widget's ghost AND emit a live signal so MainWindow can
+    // mirror to the sister widget.
+    if (dragKind_ == DragKind::LoopMove) {
+        if (!loopModel_ || !loopModel_->indexOf(dragId_).has_value()) {
+            dragKind_   = DragKind::None;
+            dragActive_ = false;
+            dragGhost_.reset();
+            emit dragEnded();
+            event->accept();
+            return;
+        }
+        const std::int64_t dms = cursorMs - dragOriginalMs_;
+        std::int64_t newStart = loopDragOrigin_.startMs + dms;
+        std::int64_t newEnd   = loopDragOrigin_.endMs   + dms;
+        // Snap whichever edge is closer to an anchor. If only one
+        // edge has a candidate, take that one; if both do, prefer
+        // the one with the smaller distance.
+        const auto snapStart = findSnapAnchor(newStart);
+        const auto snapEnd   = findSnapAnchor(newEnd);
+        std::int64_t delta = 0;
+        if (snapStart && snapEnd) {
+            const auto dStart = std::abs(*snapStart - newStart);
+            const auto dEnd   = std::abs(*snapEnd   - newEnd);
+            delta = (dStart <= dEnd) ? (*snapStart - newStart)
+                                     : (*snapEnd   - newEnd);
+        } else if (snapStart) {
+            delta = *snapStart - newStart;
+        } else if (snapEnd) {
+            delta = *snapEnd - newEnd;
+        }
+        newStart += delta;
+        newEnd   += delta;
+        const std::int64_t dur = durationMs();
+        // Shift-clamp inside [0, dur] so the loop's duration is
+        // preserved (same convention as NoteMove).
+        if (newStart < 0) {
+            newEnd -= newStart;
+            newStart = 0;
+        }
+        if (dur > 0 && newEnd > dur) {
+            newStart -= (newEnd - dur);
+            newEnd = dur;
+        }
+        dragGhost_ = DragGhost{DragKind::LoopMove, dragId_, newStart, newEnd};
+        emit loopDragRequested(dragId_, newStart, newEnd);
+        update();
+        event->accept();
+        return;
+    }
+    if (dragKind_ == DragKind::LoopCreate) {
+        std::int64_t end = cursorMs;
+        if (const auto snap = findSnapAnchor(cursorMs)) end = *snap;
+        if (end <= dragOriginalMs_) end = dragOriginalMs_ + 1;
+        const std::int64_t dur = durationMs();
+        if (dur > 0 && end > dur) end = dur;
+        phantomLoopGhost_ = PhantomLoopGhost{dragOriginalMs_, end};
+        // Mirror to sister widget so the phantom band glides on
+        // both surfaces.
+        emit loopCreateDragRequested(dragOriginalMs_, end);
         update();
         event->accept();
         return;
@@ -1123,6 +1259,23 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
             emit noteCreateCommitted(noteDragGhost_->startMs,
                                      noteDragGhost_->endMs,
                                      noteDragGhost_->midi);
+        } else if (dragKind_ == DragKind::LoopMove
+                   && dragGhost_
+                   && loopModel_
+                   && loopModel_->indexOf(dragId_).has_value())
+        {
+            // Single from→to commit. The ghost holds the post-clamp
+            // shifted range.
+            emit loopMoveCommitted(
+                dragId_,
+                loopDragOrigin_.startMs, loopDragOrigin_.endMs,
+                dragGhost_->ms,          dragGhost_->ms2);
+        } else if (dragKind_ == DragKind::LoopCreate
+                   && phantomLoopGhost_
+                   && phantomLoopGhost_->endMs > phantomLoopGhost_->startMs)
+        {
+            emit loopCreateCommitted(phantomLoopGhost_->startMs,
+                                     phantomLoopGhost_->endMs);
         }
     } else if (wasNoteCreate && noteCreateDeferred_) {
         // Plain click on empty grid (no drag threshold crossed) —
@@ -1142,7 +1295,9 @@ void ScoreOverlayBase::mouseReleaseEvent(QMouseEvent* event) {
     dragOriginalMs_ = 0;
     dragGhost_.reset();
     noteDragGhost_.reset();
+    phantomLoopGhost_.reset();
     noteCreateDeferred_ = false;
+    loopCreateDeferred_ = false;
     lastSeekMs_.reset();
     if (wasActive) {
         emit dragEnded();
@@ -1163,14 +1318,35 @@ void ScoreOverlayBase::setLoopDragGhost(std::int64_t id,
                                         bool isStart,
                                         std::int64_t ms) {
     dragGhost_ = DragGhost{
-        isStart ? DragKind::LoopStart : DragKind::LoopEnd, id, ms };
+        isStart ? DragKind::LoopStart : DragKind::LoopEnd, id, ms, 0 };
+    update();
+}
+
+void ScoreOverlayBase::setLoopMoveDragGhost(std::int64_t id,
+                                            std::int64_t startMs,
+                                            std::int64_t endMs) {
+    dragGhost_ = DragGhost{ DragKind::LoopMove, id, startMs, endMs };
+    update();
+}
+
+void ScoreOverlayBase::setPhantomLoopGhost(
+    std::optional<std::int64_t> startMs,
+    std::optional<std::int64_t> endMs)
+{
+    if (startMs.has_value() && endMs.has_value()) {
+        phantomLoopGhost_ = PhantomLoopGhost{*startMs, *endMs};
+    } else {
+        phantomLoopGhost_.reset();
+    }
     update();
 }
 
 void ScoreOverlayBase::clearDragGhost() {
-    if (!dragGhost_) return;
+    const bool had = dragGhost_.has_value()
+                  || phantomLoopGhost_.has_value();
     dragGhost_.reset();
-    update();
+    phantomLoopGhost_.reset();
+    if (had) update();
 }
 
 // ---- test seam ----------------------------------------------------------
@@ -1207,6 +1383,11 @@ ScoreOverlayBase::effectiveLoopRange(std::int64_t id,
         }
         if (dragGhost_->kind == DragKind::LoopEnd) {
             return { modelStartMs, dragGhost_->ms };
+        }
+        // LoopMove (issue #62) — both edges shifted; ms holds the
+        // new start, ms2 the new end.
+        if (dragGhost_->kind == DragKind::LoopMove) {
+            return { dragGhost_->ms, dragGhost_->ms2 };
         }
     }
     return { modelStartMs, modelEndMs };
@@ -1251,6 +1432,16 @@ ScoreOverlayBase::phantomNoteGhost() const noexcept
     return std::nullopt;
 }
 
+std::optional<ScoreOverlayBase::PhantomLoop>
+ScoreOverlayBase::phantomLoopGhost() const noexcept
+{
+    if (phantomLoopGhost_) {
+        return PhantomLoop{phantomLoopGhost_->startMs,
+                           phantomLoopGhost_->endMs};
+    }
+    return std::nullopt;
+}
+
 std::optional<ScoreOverlayBase::LoopEdgeHit>
 ScoreOverlayBase::hitLoopEdge(int x) const noexcept {
     if (!loopModel_) return std::nullopt;
@@ -1277,6 +1468,31 @@ ScoreOverlayBase::hitLoopEdge(int x) const noexcept {
 }
 
 std::optional<std::int64_t>
+ScoreOverlayBase::hitLoopBody(int x) const noexcept {
+    // Walk loops in REVERSE so the most-recently-added (visually-
+    // topmost — same draw order as paintLoops) wins on overlap.
+    // "Body" = strictly INSIDE the band, away from the edge-zone
+    // that hitLoopEdge already claims.
+    if (!loopModel_) return std::nullopt;
+    const auto& loops = loopModel_->loops();
+    for (std::size_t i = loops.size(); i-- > 0;) {
+        const auto& l = loops[i];
+        const int xStart = msToX(l.startMs);
+        const int xEnd   = msToX(l.endMs);
+        // Body extends only between edges; the edge bands (±tolerance)
+        // belong to hitLoopEdge. If the loop is so narrow that the
+        // two edge zones overlap (xEnd − xStart ≤ 2*tol), there is
+        // no body to grab — only edges. The user can still edit via
+        // the dock or by widening the loop first.
+        if (xEnd - xStart <= 2 * kEdgeTolerancePx) continue;
+        const int bodyLeft  = xStart + kEdgeTolerancePx;
+        const int bodyRight = xEnd   - kEdgeTolerancePx;
+        if (x >= bodyLeft && x < bodyRight) return l.id;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int64_t>
 ScoreOverlayBase::findSnapAnchor(std::int64_t cursorMs) const noexcept {
     const auto tolMs = pixelsToMs(kSnapTolerancePx);
     if (tolMs <= 0) return std::nullopt;
@@ -1298,6 +1514,21 @@ ScoreOverlayBase::findSnapAnchor(std::int64_t cursorMs) const noexcept {
             if (dist <= tolMs && dist < bestDist) {
                 bestMs = m.sourceMs;
                 bestDist = dist;
+            }
+        }
+    }
+    // MEMO[#62]: loop edges as snap anchors too. The user wants
+    // note edges to line up with loop boundaries on the piano roll
+    // — "this note belongs to this loop region" — and loop edges
+    // are themselves valid anchor positions on the timeline.
+    if (loopModel_) {
+        for (const auto& l : loopModel_->loops()) {
+            for (const auto edgeMs : { l.startMs, l.endMs }) {
+                const auto dist = std::abs(edgeMs - cursorMs);
+                if (dist <= tolMs && dist < bestDist) {
+                    bestMs = edgeMs;
+                    bestDist = dist;
+                }
             }
         }
     }

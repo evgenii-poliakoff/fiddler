@@ -110,6 +110,14 @@ protected:
     [[nodiscard]] int chromaticRowAt(int xWidget,
                                      int yWidget) const override;
 
+    // Piano roll is the note editor (issue #62) — markers /
+    // barlines / loop edges / loop bodies all fall through on
+    // click so the user can place / select notes anywhere on the
+    // grid, including ON TOP of these artifacts. The artifacts
+    // still PAINT for visual context (and serve as snap anchors
+    // when notes are dragged), they just don't catch clicks.
+    [[nodiscard]] bool artifactsClickable() const override { return false; }
+
 signals:
     // Fired when the user clicks an empty cell on the chromatic
     // grid. `ms` is the click's source-time; `midi` is the row's

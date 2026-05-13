@@ -64,6 +64,16 @@ bool WaveformWidget::hasContent() const noexcept {
     return overview_ != nullptr;
 }
 
+bool WaveformWidget::armsLoopCreate(int xWidget, int /*yWidget*/) const {
+    // Any in-grid x on a loaded waveform can start a LoopCreate
+    // drag. The base checks "no other artifact hit" before calling
+    // us, so by the time we're asked the press has already been
+    // routed past barlines / markers / loop edges / loop body.
+    if (!hasContent()) return false;
+    if (xWidget < leftMarginPx() || xWidget >= width()) return false;
+    return true;
+}
+
 std::int64_t WaveformWidget::durationMs() const noexcept {
     return overview_ ? overview_->duration().count() : 0;
 }
@@ -189,6 +199,27 @@ void WaveformWidget::paintEvent(QPaintEvent*) {
                              Qt::AlignVCenter | Qt::AlignLeft,
                              fm.elidedText(l.name, Qt::ElideRight,
                                            textWidth));
+        }
+    }
+
+    // Phantom loop band drawn live during a LoopCreate drag (issue
+    // #62). No model entry yet; translucent fill + dashed outline so
+    // it reads as a draft. On release MainWindow turns it into a
+    // real loop.
+    if (const auto phantom = phantomLoopGhost()) {
+        const int xStart = msToX(phantom->startMs);
+        const int xEnd   = msToX(phantom->endMs);
+        if (xEnd > 0 && xStart < width()) {
+            const int xLeft  = std::max(0, xStart);
+            const int xRight = std::min(width(), xEnd);
+            const int bandW  = std::max(1, xRight - xLeft);
+            const QColor draftBand(120, 200, 140, 70);
+            painter.fillRect(QRect(xLeft, 0, bandW, height()), draftBand);
+            QPen draftPen(QColor(140, 220, 160, 200), 1.0);
+            draftPen.setStyle(Qt::DashLine);
+            painter.setPen(draftPen);
+            painter.drawLine(xLeft,      0, xLeft,      height());
+            painter.drawLine(xRight - 1, 0, xRight - 1, height());
         }
     }
 

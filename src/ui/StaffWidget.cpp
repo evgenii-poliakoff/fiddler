@@ -356,6 +356,26 @@ void StaffWidget::paintLoops(QPainter& painter) const {
                          Qt::AlignVCenter | Qt::AlignLeft,
                          fm.elidedText(l.name, Qt::ElideRight, textWidth));
     }
+
+    // Phantom loop band drawn live during a LoopCreate drag on the
+    // sister widget (issue #62). Mirrors the waveform's phantom so
+    // the user sees the new band glide on both surfaces.
+    if (const auto phantom = phantomLoopGhost()) {
+        const int xStart = msToX(phantom->startMs);
+        const int xEnd   = msToX(phantom->endMs);
+        if (xEnd > leftMarginPx() && xStart < width()) {
+            const int xLeft  = std::max(leftMarginPx(), xStart);
+            const int xRight = std::min(width(), xEnd);
+            const int bandW  = std::max(1, xRight - xLeft);
+            const QColor draftBand(120, 200, 140, 70);
+            painter.fillRect(QRect(xLeft, 0, bandW, height()), draftBand);
+            QPen draftPen(QColor(140, 220, 160, 200), 1.0);
+            draftPen.setStyle(Qt::DashLine);
+            painter.setPen(draftPen);
+            painter.drawLine(xLeft,      0, xLeft,      height());
+            painter.drawLine(xRight - 1, 0, xRight - 1, height());
+        }
+    }
 }
 
 void StaffWidget::paintBarlines(QPainter& painter) const {

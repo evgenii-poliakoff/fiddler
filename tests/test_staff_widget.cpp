@@ -186,32 +186,24 @@ TEST_CASE("StaffWidget: out-of-range x and ms clamp to file bounds",
 // Click → select + seek
 // ---------------------------------------------------------------------------
 
-TEST_CASE("StaffWidget: click on a barline selects it and seeks to its ms",
-          "[staff-widget][gui][barlines]") {
+TEST_CASE("StaffWidget: click on a barline does NOT select on the staff",
+          "[staff-widget][gui][barlines][piano-roll]") {
+    // MEMO[#62]: on the piano roll, timeline artifacts (markers /
+    // barlines / loop edges / loop bodies) are not click-targets.
+    // The press falls through to note placement. Bar / marker /
+    // loop selection happens on the waveform.
     qtApp();
     StaffWidget w;
-    // 4 s file, 800 px wide; the time axis starts after the keyboard
-    // column so a barline at 1000 ms maps to x = xForMsTest(1000).
     const std::int64_t stamps[] = { 1000 };
     setUpWidget(w, makeModel(std::span<const std::int64_t>{stamps}));
 
-    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
-    QSignalSpy selSpy (&w, &StaffWidget::barlineSelectionChanged);
+    QSignalSpy selSpy(&w, &StaffWidget::barlineSelectionChanged);
 
-    // Click 2 px right of the tick — within the 5 px hit tolerance.
     QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
                       QPoint(xForMsTest(1000) + 2, 50));
 
-    REQUIRE(w.selectedBarline() == 0);
-
-    // The seek emission carries the barline's exact ms (1000), not
-    // the click's ms (~1010), so the cursor lands on the tick.
-    REQUIRE(seekSpy.count() == 1);
-    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
-
-    REQUIRE(selSpy.count() == 1);
-    REQUIRE(selSpy.takeFirst().at(0).value<std::optional<std::size_t>>()
-            == std::optional<std::size_t>{0});
+    REQUIRE_FALSE(w.selectedBarline().has_value());
+    REQUIRE(selSpy.count() == 0);
 }
 
 TEST_CASE("StaffWidget: click far from any barline seeks without selecting",
@@ -238,16 +230,20 @@ TEST_CASE("StaffWidget: click far from any barline seeks without selecting",
     REQUIRE(selSpy.count() == 0);
 }
 
-TEST_CASE("StaffWidget: clicking elsewhere clears an existing selection",
+TEST_CASE("StaffWidget: clicking elsewhere clears an existing barline selection",
           "[staff-widget][gui][barlines]") {
+    // MEMO[#62]: pre-select via the API (the staff doesn't
+    // click-select barlines anymore — that's a waveform gesture).
+    // The plain-seek branch on the staff still clears barline
+    // selection, mirroring the waveform's behaviour, so a stale
+    // selection set from another widget vanishes when the user
+    // clicks empty grid here.
     qtApp();
     StaffWidget w;
     const std::int64_t stamps[] = { 1000 };
     setUpWidget(w, makeModel(std::span<const std::int64_t>{stamps}));
 
-    // Pre-select via a click on the bar.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
-                      QPoint(xForMsTest(1000), 50));
+    w.setSelectedBarline(0);
     REQUIRE(w.selectedBarline() == 0);
 
     QSignalSpy selSpy(&w, &StaffWidget::barlineSelectionChanged);
@@ -256,8 +252,6 @@ TEST_CASE("StaffWidget: clicking elsewhere clears an existing selection",
 
     REQUIRE_FALSE(w.selectedBarline().has_value());
     REQUIRE(selSpy.count() == 1);
-    REQUIRE(selSpy.takeFirst().at(0).value<std::optional<std::size_t>>()
-            == std::optional<std::size_t>{});
 }
 
 TEST_CASE("StaffWidget: right click does not emit any signals",
@@ -292,13 +286,14 @@ TEST_CASE("StaffWidget: arrow keys navigate selection between barlines",
     w.setFocus();
     (void)QTest::qWaitForWindowExposed(&w);
 
-    // Pre-select the second barline at 1500 ms.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
-                      QPoint(xForMsTest(1500), 50));
+    // Pre-select via the API (#62: the staff doesn't click-select
+    // barlines anymore — selection mirrors from the waveform / dock).
+    // Keyboard nav still works on the staff: arrow keys cycle the
+    // selected artifact regardless of which widget has focus.
+    w.setSelectedBarline(1);
     REQUIRE(w.selectedBarline() == 1);
 
     QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
-    seekSpy.clear();
 
     QTest::keyClick(&w, Qt::Key_Right);
     REQUIRE(w.selectedBarline() == 2);
@@ -490,47 +485,22 @@ TEST_CASE("StaffWidget: paints marker ticks + label flags without crashing",
 }
 
 TEST_CASE("StaffWidget: click on a marker selects by ID and seeks",
-          "[staff-widget][gui][markers]") {
-    // 4 s file across 800 px — marker at 1000 ms is at xForMsTest(1000).
+          "[staff-widget][gui][markers][piano-roll]") {
+    // MEMO[#62]: on the piano roll the marker is not click-selectable;
+    // a click on its x falls through to note placement instead.
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel());
     const std::int64_t stamps[] = { 1000 };
-    auto model = installMarkers(w, std::span<const std::int64_t>{stamps});
+    installMarkers(w, std::span<const std::int64_t>{stamps});
 
-    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
-    QSignalSpy selSpy (&w, &StaffWidget::markerSelectionChanged);
+    QSignalSpy selSpy(&w, &StaffWidget::markerSelectionChanged);
 
     QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
                       QPoint(xForMsTest(1000) + 2, 40));
 
-    REQUIRE(w.selectedMarkerId() == *model->idAt(0));
-    REQUIRE(seekSpy.count() == 1);
-    REQUIRE(seekSpy.takeFirst().at(0).toLongLong() == 1000);
-    REQUIRE(selSpy.count() == 1);
-}
-
-TEST_CASE("StaffWidget: marker click clears barline selection (mutual exclusion)",
-          "[staff-widget][gui][markers]") {
-    qtApp();
-    StaffWidget w;
-    const std::int64_t bars[] = { 500 };
-    auto barModel = makeModel(std::span<const std::int64_t>{bars});
-    setUpWidget(w, barModel);
-    const std::int64_t markers[] = { 2000 };
-    installMarkers(w, std::span<const std::int64_t>{markers});
-
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
-                      QPoint(xForMsTest(500) + 2, 40));
-    REQUIRE(w.selectedBarline() == 0);
-
-    QSignalSpy barSelSpy(&w, &StaffWidget::barlineSelectionChanged);
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
-                      QPoint(xForMsTest(2000) + 2, 40));
-
-    REQUIRE(w.selectedMarkerId().has_value());
-    REQUIRE_FALSE(w.selectedBarline().has_value());
-    REQUIRE(barSelSpy.count() == 1);
+    REQUIRE_FALSE(w.selectedMarkerId().has_value());
+    REQUIRE(selSpy.count() == 0);
 }
 
 TEST_CASE("StaffWidget: Del with marker selection fires markerDeleteRequested",
@@ -743,26 +713,11 @@ TEST_CASE("StaffWidget: setLoopModel(nullptr) detaches and clears selection",
 // shortcut.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("StaffWidget: Ctrl+click on a marker promotes prior primary to secondary",
-          "[staff-widget][gui][secondary-anchor]") {
-    qtApp();
-    StaffWidget w;
-    setUpWidget(w, makeModel());
-    const std::int64_t stamps[] = { 1000, 3000 };
-    installMarkers(w, std::span<const std::int64_t>{stamps});
-
-    // 4-second file, 800-pixel widget: time axis starts after the
-    // keyboard column; xForMsTest maps ms → widget-x.
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
-                      QPoint(xForMsTest(1000), 50));
-    REQUIRE(w.primaryAnchorMs() == 1000);
-    REQUIRE_FALSE(w.secondaryAnchorMs().has_value());
-
-    QTest::mouseClick(&w, Qt::LeftButton, Qt::ControlModifier,
-                      QPoint(xForMsTest(3000), 50));
-    REQUIRE(w.primaryAnchorMs() == 3000);
-    REQUIRE(w.secondaryAnchorMs() == 1000);
-}
+// MEMO[#62]: removed "StaffWidget: Ctrl+click on a marker promotes
+// prior primary to secondary" — Ctrl+click on a marker on the staff
+// no longer fires (artifactsClickable() is false). The waveform
+// version of this test still covers the gesture in
+// test_waveform_widget.cpp.
 
 TEST_CASE("StaffWidget: Esc clears the secondary anchor",
           "[staff-widget][gui][secondary-anchor]") {
@@ -808,63 +763,47 @@ void dragSequence(StaffWidget& w, int xPress, int xRelease) {
 
 } // namespace
 
-TEST_CASE("StaffWidget: dragging a marker emits live + commit signals",
-          "[staff-widget][gui][drag]") {
+// MEMO[#62]: removed "dragging a marker emits live + commit signals"
+// — markers on the staff are no longer draggable. Equivalent test
+// on the waveform covers the marker drag.
+TEST_CASE("StaffWidget: pressing a marker does NOT arm a drag",
+          "[staff-widget][gui][drag][piano-roll]") {
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel());
 
     const std::int64_t stamps[] = { 1000 };
-    auto markers = installMarkers(
-        w, std::span<const std::int64_t>{stamps});
-    QObject::connect(&w, &StaffWidget::markerDragRequested,
-                     &w, [&markers](std::int64_t id,
-                                    std::int64_t newMs) {
-                         markers->setPosition(id, newMs);
-                     });
+    installMarkers(w, std::span<const std::int64_t>{stamps});
 
     QSignalSpy commitSpy(&w, &StaffWidget::markerDragCommitted);
 
+    // Drag from the marker's x — should NOT emit markerDragCommitted.
     const int xStart = w.msToX(1000);
     const int xEnd   = w.msToX(2000);
     dragSequence(w, xStart, xEnd);
 
-    REQUIRE(commitSpy.count() == 1);
-    const auto args = commitSpy.takeFirst();
-    REQUIRE(args[1].toLongLong() == 1000);
-    REQUIRE(std::abs(args[2].toLongLong() - 2000) < 5);
+    REQUIRE(commitSpy.count() == 0);
 }
 
-TEST_CASE("StaffWidget: dragging a loop's left edge updates startMs",
-          "[staff-widget][gui][drag][loops]") {
+// MEMO[#62]: removed "dragging a loop's left edge updates startMs"
+// — loop edges on the staff are no longer draggable. Equivalent
+// test on the waveform.
+TEST_CASE("StaffWidget: pressing a loop edge does NOT arm a drag",
+          "[staff-widget][gui][drag][loops][piano-roll]") {
     qtApp();
     StaffWidget w;
     setUpWidget(w, makeModel());
 
     const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
-    auto loops = installLoops(
-        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
-    QObject::connect(&w, &StaffWidget::loopDragRequested,
-                     &w, [&loops](std::int64_t id,
-                                  std::int64_t newStart,
-                                  std::int64_t newEnd) {
-                         loops->setRange(id, newStart, newEnd);
-                     });
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
     QSignalSpy commitSpy(&w, &StaffWidget::loopDragCommitted);
 
     const int xLeftEdge  = w.msToX(1000);
     const int xLeftFinal = w.msToX(1300);
     dragSequence(w, xLeftEdge, xLeftFinal);
 
-    REQUIRE(commitSpy.count() == 1);
-    const auto args = commitSpy.takeFirst();
-    REQUIRE(args[1].toBool() == true);          // isStartEdge
-    REQUIRE(loops->loops()[0].endMs == 2000);   // partner intact
-    // ±6 ms slack: the chromatic grid loses ~56 px to the keyboard
-    // column, so 1 px ≈ 5.37 ms (vs. 5 ms on the keyboard-less
-    // WaveformWidget). A single pixel of integer-truncation slop in
-    // msToX → xToMs round-trip can land just past 5 ms here.
-    REQUIRE(std::abs(loops->loops()[0].startMs - 1300) <= 6);
+    REQUIRE(commitSpy.count() == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,6 +1451,36 @@ TEST_CASE("StaffWidget: plain click on empty grid still emits placeNoteRequested
 
     REQUIRE(placeSpy.count()  == 1);
     REQUIRE(createSpy.count() == 0);
+}
+
+TEST_CASE("StaffWidget: click inside a loop band still places / selects a note "
+          "(loop-move is waveform-only)",
+          "[staff-widget][gui][drag][loops][piano-roll]") {
+    // MEMO[#62]: click inside an existing loop band on the staff
+    // must NOT arm a LoopMove drag — every top-app keeps loop
+    // editing off the note editor. The click falls through to
+    // note hit / NoteCreate as if the loop wasn't there. Loops
+    // still PAINT on the staff for visual context.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    installNotes(w);
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {500, 3500} };
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QSignalSpy moveSpy (&w, &StaffWidget::loopMoveCommitted);
+    QSignalSpy placeSpy(&w, &StaffWidget::placeNoteRequested);
+    QSignalSpy seekSpy (&w, &StaffWidget::seekRequested);
+
+    // Click on a chromatic row INSIDE the loop band (anywhere between
+    // 500 ms and 3500 ms). On the waveform this same press would
+    // arm LoopMove; on the staff it falls through to NoteCreate.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(xForMsTest(2000), rowYForMidiTest(64)));
+
+    REQUIRE(moveSpy.count()  == 0);   // no LoopMove ever armed
+    REQUIRE(placeSpy.count() == 1);   // note placement reached release
+    REQUIRE(seekSpy.count()  >= 1);   // seek fires at press as usual
 }
 
 TEST_CASE("StaffWidget: resize past partner edge clamps to partner − 1",
