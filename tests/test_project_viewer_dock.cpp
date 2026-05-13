@@ -145,12 +145,11 @@ TEST_CASE("ProjectViewerDock: with no model, tree is empty and 'no selection' sh
     ProjectViewerDock dock;
     auto* tree = treeOf(dock);
 
-    // Three top-level category headers: Markers + Loops + Notes.
-    // All empty.
-    REQUIRE(tree->topLevelItemCount() == 3);
+    // Two top-level category headers: Markers + Loops. Notes have
+    // no tree row (step 6.2) — selection happens via the staff.
+    REQUIRE(tree->topLevelItemCount() == 2);
     REQUIRE(tree->topLevelItem(0)->childCount() == 0);
     REQUIRE(tree->topLevelItem(1)->childCount() == 0);
-    REQUIRE(tree->topLevelItem(2)->childCount() == 0);
 
     // The "no selection" page is index 0 in the property stack.
     REQUIRE(stackOf(dock)->currentIndex() == 0);
@@ -991,8 +990,14 @@ TEST_CASE("ProjectViewerDock: disabling pre-roll mid-countdown cancels the widge
 // Notes section (Step 6.1)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ProjectViewerDock: setNoteModel adds Notes category and rows",
+TEST_CASE("ProjectViewerDock: setNoteModel does NOT add a tree row "
+          "(notes live on the staff in step 6.2)",
           "[project-viewer-dock][gui][notes]") {
+    // MEMO[#step6.2]: notes are anonymous (pitch + interval, no
+    // name), and the staff already paints every one as a bar. A
+    // tabular list would just duplicate that. The dock keeps only
+    // the Note property page (driven by the staff selection) and
+    // the keyboard-fallback "New Note ..." button.
     qtApp();
     ProjectViewerDock dock;
     auto* tree = treeOf(dock);
@@ -1003,14 +1008,10 @@ TEST_CASE("ProjectViewerDock: setNoteModel adds Notes category and rows",
 
     dock.setNoteModel(notes);
 
-    // Notes category is the third top-level item (after Markers, Loops).
-    REQUIRE(tree->topLevelItemCount() == 3);
-    auto* notesCategory = tree->topLevelItem(2);
-    REQUIRE(notesCategory->text(0) == "Notes");
-    REQUIRE(notesCategory->childCount() == 2);
-    // Row label includes the SPN spelling.
-    REQUIRE(notesCategory->child(0)->text(0).contains("E4"));
-    REQUIRE(notesCategory->child(1)->text(0).contains("A4"));
+    // Markers + Loops only. No "Notes" category.
+    REQUIRE(tree->topLevelItemCount() == 2);
+    REQUIRE(tree->topLevelItem(0)->text(0) == "Markers");
+    REQUIRE(tree->topLevelItem(1)->text(0) == "Loops");
 }
 
 TEST_CASE("ProjectViewerDock: Add Note button is disabled without a NoteModel",
@@ -1040,10 +1041,11 @@ TEST_CASE("ProjectViewerDock: Add Note button emits noteAddRequested",
 TEST_CASE("ProjectViewerDock: selecting a note enters Editing mode "
           "and shows note property page",
           "[project-viewer-dock][gui][notes]") {
-    // MEMO: state machine — clicking a note row puts the dock into
-    // Editing mode. Property page reflects buffered values (mirror
-    // of the model). No per-note Name field exists in the dock —
-    // names are an internal-only future-compat slot.
+    // MEMO[#step6.2]: clicking a note row puts the dock into
+    // Editing mode. Property page reflects the model's current
+    // values; edits commit live (per-field). The Add-Note button
+    // is hidden in Editing mode — the property page is the whole
+    // UI, same as markers / loops. No per-note Name field exists.
     qtApp();
     ProjectViewerDock dock;
     auto* stack = stackOf(dock);
@@ -1059,6 +1061,7 @@ TEST_CASE("ProjectViewerDock: selecting a note enters Editing mode "
     REQUIRE(endBox    != nullptr);
     REQUIRE(durLabel  != nullptr);
     REQUIRE(button    != nullptr);
+    dock.show();    // needed so isVisible() reflects setVisible()
 
     auto notes = std::make_shared<NoteModel>();
     const auto id = notes->add(1000, 1400, 64);   // E4, 400 ms
@@ -1073,23 +1076,36 @@ TEST_CASE("ProjectViewerDock: selecting a note enters Editing mode "
     REQUIRE(startBox->value() == 1000);
     REQUIRE(endBox->value() == 1400);
     REQUIRE(durLabel->text().startsWith("400"));
-    REQUIRE(button->text() == "Apply Changes to Note");
+    REQUIRE_FALSE(button->isVisible());   // Editing → button hidden
 }
 
-TEST_CASE("ProjectViewerDock: invalid pitch input reverts to the buffered value",
+TEST_CASE("ProjectViewerDock: invalid pitch input reverts; valid input commits live",
           "[project-viewer-dock][gui][notes]") {
-    // MEMO: range + parse validation in NoteModel::isAcceptedPitch
-    // is what the dock defers to. In the new state machine, edits
-    // update an in-memory buffer (not the model directly), so an
-    // out-of-range or unparseable entry reverts the line edit to
-    // the buffer's value. The model is only touched on button
-    // click — so no notePitchEditRequested signal is emitted from
-    // typing.
+    // MEMO[#step6.2]: range + parse validation in
+    // NoteModel::isAcceptedPitch is what the dock defers to. In the
+    // live-commit Editing mode, an out-of-range or unparseable
+    // entry reverts the line edit to the buffer's current value
+    // and the model stays unchanged. A valid entry commits live
+    // via noteCommitChangesRequested → MainWindow → setPitch.
     qtApp();
     ProjectViewerDock dock;
     auto notes = std::make_shared<NoteModel>();
     const auto id = notes->add(1000, 1400, 64);
     dock.setNoteModel(notes);
+
+    // Mirror the dock's commit-changes signal through to the model
+    // so the test sees real-world live-commit behaviour (this
+    // wiring lives in MainWindow in production).
+    QObject::connect(&dock,
+        &ProjectViewerDock::noteCommitChangesRequested,
+        &dock, [&notes](std::int64_t cid,
+                        std::int64_t startMs,
+                        std::int64_t endMs,
+                        int          midi) {
+            (void)startMs; (void)endMs;
+            notes->setPitch(cid, midi);
+        });
+
     dock.setSelectedNoteId(id);
 
     auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
@@ -1111,13 +1127,13 @@ TEST_CASE("ProjectViewerDock: invalid pitch input reverts to the buffered value"
 
     pitchEdit->setText("C#5");                      // accidental — accepted
     emit pitchEdit->editingFinished();
-    REQUIRE(pitchEdit->text() == "C#5");            // buffer updated
-    REQUIRE(notes->notes()[0].midi == 64);          // model still untouched
+    REQUIRE(pitchEdit->text() == "C#5");
+    REQUIRE(notes->notes()[0].midi == 73);          // live-commit reached model
 
     pitchEdit->setText("A4");                       // valid natural
     emit pitchEdit->editingFinished();
     REQUIRE(pitchEdit->text() == "A4");
-    REQUIRE(notes->notes()[0].midi == 64);
+    REQUIRE(notes->notes()[0].midi == 69);
 }
 
 TEST_CASE("ProjectViewerDock: state machine — button label cycles Empty → "
@@ -1142,8 +1158,8 @@ TEST_CASE("ProjectViewerDock: state machine — button label cycles Empty → "
     REQUIRE(notes->empty());
 }
 
-TEST_CASE("ProjectViewerDock: state machine — selecting a note enters Editing, "
-          "button label = 'Apply Changes to Note'",
+TEST_CASE("ProjectViewerDock: state machine — selecting a note hides the "
+          "Add-Note button (Editing has no button)",
           "[project-viewer-dock][gui][notes][state-machine]") {
     qtApp();
     ProjectViewerDock dock;
@@ -1151,11 +1167,13 @@ TEST_CASE("ProjectViewerDock: state machine — selecting a note enters Editing,
     const auto id = notes->add(1000, 1400, 64);
     dock.setNoteModel(notes);
     auto* button = dock.findChild<QPushButton*>("addNoteButton");
+    dock.show();
 
     dock.setSelectedNoteId(id);
-    REQUIRE(button->text() == "Apply Changes to Note");
+    REQUIRE_FALSE(button->isVisible());
 
     dock.setSelectedNoteId(std::nullopt);
+    REQUIRE(button->isVisible());
     REQUIRE(button->text() == "New Note ...");
 }
 
@@ -1191,9 +1209,13 @@ TEST_CASE("ProjectViewerDock: draft-mode field edits update buffer, "
     REQUIRE(button->text() == "New Note ...");
 }
 
-TEST_CASE("ProjectViewerDock: Editing-mode edits buffered, "
-          "'Apply Changes to Note' emits commit signal",
+TEST_CASE("ProjectViewerDock: Editing-mode pitch edit emits commit-changes "
+          "signal live (no Apply button)",
           "[project-viewer-dock][gui][notes][state-machine]") {
+    // MEMO[#step6.2]: switched from buffered "Apply Changes" to
+    // live commit per field — pitchEdit::editingFinished now fires
+    // noteCommitChangesRequested directly. The button is hidden in
+    // Editing mode; no click-to-commit gesture exists.
     qtApp();
     ProjectViewerDock dock;
     auto notes = std::make_shared<NoteModel>();
@@ -1205,23 +1227,14 @@ TEST_CASE("ProjectViewerDock: Editing-mode edits buffered, "
         &ProjectViewerDock::noteCommitChangesRequested);
 
     auto* pitchEdit = dock.findChild<QLineEdit*>("notePitchEdit");
-    auto* button    = dock.findChild<QPushButton*>("addNoteButton");
 
-    // Edit pitch. Model untouched until commit.
     pitchEdit->setText("F5");
     emit pitchEdit->editingFinished();
-    REQUIRE(notes->notes()[0].midi == 64);
 
-    // Click "Apply Changes to Note" — commit signal carries id +
-    // buffered values.
-    button->click();
     REQUIRE(commitSpy.count() == 1);
     auto args = commitSpy.takeFirst();
     REQUIRE(args.at(0).value<std::int64_t>() == id);
     REQUIRE(args.at(3).toInt()              == 77);   // F5
-
-    // Exits to Empty (button label back to "New Note ...").
-    REQUIRE(button->text() == "New Note ...");
 }
 
 TEST_CASE("ProjectViewerDock: selecting a row while in NewDraft discards "
@@ -1233,14 +1246,16 @@ TEST_CASE("ProjectViewerDock: selecting a row while in NewDraft discards "
     const auto id = notes->add(2000, 2400, 71);
     dock.setNoteModel(notes);
     auto* button = dock.findChild<QPushButton*>("addNoteButton");
+    dock.show();
 
     dock.enterNoteDraftMode(500, 900, 60);
+    REQUIRE(button->isVisible());
     REQUIRE(button->text() == "Add Note");
 
-    // Clicking the existing note's row (programmatic select) should
-    // discard the draft and switch to Editing.
+    // Selecting the existing note's row discards the draft and
+    // switches to Editing — button hides (live-commit, no Apply).
     dock.setSelectedNoteId(id);
-    REQUIRE(button->text() == "Apply Changes to Note");
+    REQUIRE_FALSE(button->isVisible());
 }
 
 TEST_CASE("ProjectViewerDock: selecting a note clears marker / loop selection",

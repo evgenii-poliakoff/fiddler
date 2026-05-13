@@ -40,7 +40,6 @@ namespace {
 // kLoopIdRole.
 constexpr int kMarkerIdRole = Qt::UserRole + 1;
 constexpr int kLoopIdRole   = Qt::UserRole + 2;
-constexpr int kNoteIdRole   = Qt::UserRole + 3;
 
 // Property-stack page indices.
 constexpr int kPageNoSelection = 0;
@@ -97,10 +96,13 @@ void ProjectViewerDock::buildUi() {
     loopsCategory_->setFlags(Qt::ItemIsEnabled);     // not selectable
     loopsCategory_->setExpanded(true);
 
-    notesCategory_ = new QTreeWidgetItem(tree_);
-    notesCategory_->setText(0, tr("Notes"));
-    notesCategory_->setFlags(Qt::ItemIsEnabled);     // not selectable
-    notesCategory_->setExpanded(true);
+    // MEMO[#step6.2]: no Notes category in the dock tree. Notes
+    // are selected and navigated via the staff (piano-roll bars),
+    // not via a list — they're anonymous (pitch + interval, no
+    // name) so a tabular row carries no information the staff
+    // doesn't already show. Markers and loops are NAMED, hence
+    // the tree rows. The note property page still exists and is
+    // driven by the staff's selectedNoteId.
 
     connect(tree_, &QTreeWidget::currentItemChanged,
             this,  &ProjectViewerDock::onTreeCurrentItemChanged);
@@ -295,7 +297,19 @@ void ProjectViewerDock::buildUi() {
         propertyStack_->insertWidget(kPageNote, page);
     }
 
-    propertyStack_->setCurrentIndex(kPageNoSelection);
+    // Section caption above the property page. Bold so it reads as
+    // a heading; hidden when nothing is selected (the no-selection
+    // page has its own dimmed hint text).
+    propertyCaption_ = new QLabel(root);
+    propertyCaption_->setObjectName("projectViewerPropertyCaption");
+    QFont captionFont = propertyCaption_->font();
+    captionFont.setBold(true);
+    propertyCaption_->setFont(captionFont);
+    propertyCaption_->setContentsMargins(4, 6, 4, 2);
+    propertyCaption_->setVisible(false);
+    layout->addWidget(propertyCaption_);
+
+    setPropertyPage(kPageNoSelection);
     layout->addWidget(propertyStack_);
 
     // Single multi-mode button for note placement / editing. Its
@@ -419,7 +433,6 @@ void ProjectViewerDock::setNoteModel(
     if (addNoteButton_) {
         addNoteButton_->setEnabled(noteModel_ != nullptr);
     }
-    rebuildNoteSection();
     refreshPropertyPage();
 }
 
@@ -549,14 +562,12 @@ void ProjectViewerDock::setSelectedNoteId(
         noteBuffer_.reset();
     }
 
-    const QSignalBlocker treeBlock(tree_);
-    if (id.has_value()) {
-        if (auto* item = findNoteItem(*id)) {
-            tree_->setCurrentItem(item);
-        } else {
-            tree_->setCurrentItem(nullptr);
-        }
-    } else {
+    // MEMO[#step6.2]: clear the tree selection when a note is
+    // chosen. Notes have no tree row, but markers / loops do — and
+    // their selection must visually clear so the dock doesn't show
+    // a stale highlight from a different artifact kind.
+    {
+        const QSignalBlocker treeBlock(tree_);
         tree_->setCurrentItem(nullptr);
     }
 
@@ -671,7 +682,6 @@ void ProjectViewerDock::onNoteModelChanged() {
                    noteBuffer_->id);
         noteBuffer_.reset();
     }
-    rebuildNoteSection();
     refreshPropertyPage();
 }
 
@@ -752,57 +762,8 @@ void ProjectViewerDock::rebuildLoopSection() {
         if (auto* item = findMarkerItem(*selectedMarkerId_)) {
             tree_->setCurrentItem(item);
         }
-    } else if (selectedNoteId_.has_value()) {
-        if (auto* item = findNoteItem(*selectedNoteId_)) {
-            tree_->setCurrentItem(item);
-        }
     }
-}
-
-void ProjectViewerDock::rebuildNoteSection() {
-    const QSignalBlocker rebuildBlock(tree_);
-
-    const int prevChildCount = notesCategory_->childCount();
-    while (notesCategory_->childCount() > 0) {
-        delete notesCategory_->takeChild(0);
-    }
-    if (noteModel_) {
-        for (const auto& n : noteModel_->notes()) {
-            auto* item = new QTreeWidgetItem(notesCategory_);
-            // Row label: "<SPN>   (<startMs>–<endMs> ms)" — no
-            // "Note N" prefix, matching notation conventions
-            // (notes are anonymous; identity is pitch + time).
-            const QString spn = score::midiToSpn(n.midi);
-            item->setText(0, QString("%1   (%2–%3 ms)")
-                                .arg(spn)
-                                .arg(n.startMs)
-                                .arg(n.endMs));
-            item->setData(0, kNoteIdRole,
-                          QVariant::fromValue<std::int64_t>(n.id));
-        }
-        notesCategory_->setExpanded(true);
-    }
-    FLOG_DEBUG("ui.dock",
-               "rebuild-note-section prev-rows={} new-rows={} "
-               "selected-id={}",
-               prevChildCount,
-               notesCategory_->childCount(),
-               selectedNoteId_.value_or(-1));
-
-    // Same selection re-apply pattern as the other rebuild helpers.
-    if (selectedNoteId_.has_value()) {
-        if (auto* item = findNoteItem(*selectedNoteId_)) {
-            tree_->setCurrentItem(item);
-        }
-    } else if (selectedMarkerId_.has_value()) {
-        if (auto* item = findMarkerItem(*selectedMarkerId_)) {
-            tree_->setCurrentItem(item);
-        }
-    } else if (selectedLoopId_.has_value()) {
-        if (auto* item = findLoopItem(*selectedLoopId_)) {
-            tree_->setCurrentItem(item);
-        }
-    }
+    // Notes never appear in the dock tree (step 6.2) — staff selection.
 }
 
 void ProjectViewerDock::refreshPropertyPage() {
@@ -814,7 +775,7 @@ void ProjectViewerDock::refreshPropertyPage() {
             markerNameEdit_->setText(m.name);
             markerPositionBox_->setValue(static_cast<int>(m.sourceMs));
             updatingPropertyPage_ = false;
-            propertyStack_->setCurrentIndex(kPageMarker);
+            setPropertyPage(kPageMarker);
             return;
         }
     }
@@ -835,7 +796,7 @@ void ProjectViewerDock::refreshPropertyPage() {
             const bool isLoopArmed = (armedLoopId_ == l.id);
             loopArmedCheck_->setChecked(isLoopArmed);
             updatingPropertyPage_ = false;
-            propertyStack_->setCurrentIndex(kPageLoop);
+            setPropertyPage(kPageLoop);
             return;
         }
     }
@@ -854,7 +815,7 @@ void ProjectViewerDock::refreshPropertyPage() {
         noteDurationLabel_->setText(
             tr("%1 ms").arg(buf.endMs - buf.startMs));
         updatingPropertyPage_ = false;
-        propertyStack_->setCurrentIndex(kPageNote);
+        setPropertyPage(kPageNote);
         FLOG_DEBUG("ui.dock",
                    "refresh-property-page page=note buffer-id={} "
                    "midi={} spn='{}' start={} end={}",
@@ -864,21 +825,48 @@ void ProjectViewerDock::refreshPropertyPage() {
         updateAddNoteButtonLabel();
         return;
     }
-    propertyStack_->setCurrentIndex(kPageNoSelection);
+    setPropertyPage(kPageNoSelection);
     FLOG_DEBUG("ui.dock", "refresh-property-page page=no-selection");
     updateAddNoteButtonLabel();
 }
 
+void ProjectViewerDock::setPropertyPage(int pageIndex) {
+    propertyStack_->setCurrentIndex(pageIndex);
+    // Caption tracks the current page. Hide for no-selection so the
+    // dimmed hint on the page reads on its own.
+    switch (pageIndex) {
+    case kPageMarker:
+        propertyCaption_->setText(tr("Marker properties:"));
+        propertyCaption_->setVisible(true);
+        break;
+    case kPageLoop:
+        propertyCaption_->setText(tr("Loop properties:"));
+        propertyCaption_->setVisible(true);
+        break;
+    case kPageNote:
+        propertyCaption_->setText(tr("Note properties:"));
+        propertyCaption_->setVisible(true);
+        break;
+    default:
+        propertyCaption_->clear();
+        propertyCaption_->setVisible(false);
+        break;
+    }
+}
+
 void ProjectViewerDock::updateAddNoteButtonLabel() {
     if (!addNoteButton_) return;
-    QString label;
-    if (!noteBuffer_.has_value()) {
-        label = tr("New Note ...");
-    } else if (noteBuffer_->id == 0) {
-        label = tr("Add Note");
-    } else {
-        label = tr("Apply Changes to Note");
-    }
+    // Editing mode (existing note selected): hide the button —
+    // edits to the property page commit live, the inspector pattern
+    // every major DAW uses. The button cycles only between Empty
+    // and NewDraft for the keyboard-only "type a note in" flow.
+    const bool editingExisting =
+        noteBuffer_.has_value() && noteBuffer_->id > 0;
+    addNoteButton_->setVisible(!editingExisting);
+    if (editingExisting) return;
+    const QString label = noteBuffer_.has_value()
+        ? tr("Add Note")
+        : tr("New Note ...");
     if (addNoteButton_->text() != label) {
         FLOG_DEBUG("ui.dock",
                    "button-label change to='{}' buffer-id={}",
@@ -968,17 +956,6 @@ ProjectViewerDock::findLoopItem(std::int64_t id) const {
     return nullptr;
 }
 
-QTreeWidgetItem*
-ProjectViewerDock::findNoteItem(std::int64_t id) const {
-    for (int i = 0; i < notesCategory_->childCount(); ++i) {
-        auto* child = notesCategory_->child(i);
-        if (child->data(0, kNoteIdRole).toLongLong() == id) {
-            return child;
-        }
-    }
-    return nullptr;
-}
-
 // ---- ui → model ---------------------------------------------------------
 
 void ProjectViewerDock::onTreeCurrentItemChanged(
@@ -1030,34 +1007,6 @@ void ProjectViewerDock::onTreeCurrentItemChanged(
         }
         return;
     }
-    if (current && current->parent() == notesCategory_) {
-        std::optional<std::int64_t> newId =
-            current->data(0, kNoteIdRole).toLongLong();
-        FLOG_DEBUG("ui.dock",
-                   "tree-click row=note id={} prev-marker={} prev-loop={} "
-                   "prev-note={}",
-                   newId.value_or(-1),
-                   selectedMarkerId_.value_or(-1),
-                   selectedLoopId_.value_or(-1),
-                   selectedNoteId_.value_or(-1));
-        if (selectedMarkerId_.has_value()) {
-            selectedMarkerId_.reset();
-            emit markerSelectionChanged(selectedMarkerId_);
-        }
-        if (selectedLoopId_.has_value()) {
-            selectedLoopId_.reset();
-            emit loopSelectionChanged(selectedLoopId_);
-        }
-        if (selectedNoteId_ != newId) {
-            selectedNoteId_ = newId;
-            refreshPropertyPage();
-            emit noteSelectionChanged(selectedNoteId_);
-        } else {
-            refreshPropertyPage();
-        }
-        return;
-    }
-
     // Current is null or a category header — clear every kind.
     bool emittedAny = false;
     if (selectedMarkerId_.has_value()) {
@@ -1092,14 +1041,8 @@ void ProjectViewerDock::onTreeItemDoubleClicked(
         emit loopActivated(id);
         return;
     }
-    if (item->parent() == notesCategory_) {
-        const auto id = item->data(0, kNoteIdRole).toLongLong();
-        FLOG_DEBUG("ui.dock",
-                   "tree-double-click row=note id={} emit=note-activated",
-                   id);
-        emit noteActivated(id);
-        return;
-    }
+    // Notes have no tree row (step 6.2) — double-click only reaches
+    // markers / loops.
     // Category header double-click is a no-op (Qt's default
     // expand/collapse behaviour is what we want here).
 }
@@ -1212,6 +1155,17 @@ void ProjectViewerDock::onNotePitchEdited() {
     updatingPropertyPage_ = true;
     notePitchMidiLabel_->setText(tr("(MIDI %1)").arg(midi));
     updatingPropertyPage_ = false;
+    // Editing mode (buffer.id > 0): commit live so the model writes
+    // through immediately — same gesture markers and loops use. The
+    // model emits changed → refreshPropertyPage re-syncs the buffer.
+    // For drafts (id == 0), the field-mutation-only flow stays as
+    // before: nothing is in the model yet.
+    if (noteBuffer_->id > 0) {
+        emit noteCommitChangesRequested(noteBuffer_->id,
+                                        noteBuffer_->startMs,
+                                        noteBuffer_->endMs,
+                                        noteBuffer_->midi);
+    }
 }
 
 void ProjectViewerDock::onNoteStartEdited() {
@@ -1239,6 +1193,12 @@ void ProjectViewerDock::onNoteStartEdited() {
     noteDurationLabel_->setText(
         tr("%1 ms").arg(noteBuffer_->endMs - newStart));
     updatingPropertyPage_ = false;
+    if (noteBuffer_->id > 0) {
+        emit noteCommitChangesRequested(noteBuffer_->id,
+                                        noteBuffer_->startMs,
+                                        noteBuffer_->endMs,
+                                        noteBuffer_->midi);
+    }
 }
 
 void ProjectViewerDock::onNoteEndEdited() {
@@ -1266,6 +1226,12 @@ void ProjectViewerDock::onNoteEndEdited() {
     noteDurationLabel_->setText(
         tr("%1 ms").arg(newEnd - noteBuffer_->startMs));
     updatingPropertyPage_ = false;
+    if (noteBuffer_->id > 0) {
+        emit noteCommitChangesRequested(noteBuffer_->id,
+                                        noteBuffer_->startMs,
+                                        noteBuffer_->endMs,
+                                        noteBuffer_->midi);
+    }
 }
 
 void ProjectViewerDock::onAddNoteClicked() {
@@ -1284,23 +1250,13 @@ void ProjectViewerDock::onAddNoteClicked() {
         return;
     }
     const auto buf = *noteBuffer_;
-    if (buf.id == 0) {
-        // NewDraft mode: commit the draft to the model.
-        FLOG_DEBUG("ui.dock",
-                   "button-click mode=new-draft action=commit "
-                   "start={} end={} midi={}",
-                   buf.startMs, buf.endMs, buf.midi);
-        emit noteCommitNewRequested(buf.startMs, buf.endMs, buf.midi);
-        exitNoteMode();
-        return;
-    }
-    // Editing mode: commit buffered diffs to the model.
+    // NewDraft is the only mode that reaches this branch — Editing
+    // hides the button entirely (live-commit via per-field edits).
     FLOG_DEBUG("ui.dock",
-               "button-click mode=editing action=commit-changes "
-               "id={} start={} end={} midi={}",
-               buf.id, buf.startMs, buf.endMs, buf.midi);
-    emit noteCommitChangesRequested(buf.id, buf.startMs,
-                                    buf.endMs, buf.midi);
+               "button-click mode=new-draft action=commit "
+               "start={} end={} midi={}",
+               buf.startMs, buf.endMs, buf.midi);
+    emit noteCommitNewRequested(buf.startMs, buf.endMs, buf.midi);
     exitNoteMode();
 }
 

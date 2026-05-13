@@ -303,13 +303,18 @@ private:
     void buildUi();
     void rebuildMarkerSection();
     void rebuildLoopSection();
-    void rebuildNoteSection();
     void refreshPropertyPage();
 
-    // Update the single Add-Note button's label to match the current
-    // note-property-page mode (Empty → "New Note ..." / NewDraft →
-    // "Add Note" / Editing → "Apply Changes to Note"). The label is
-    // the user's primary cue for what the next click does.
+    // Switch the property stack to the given page AND update the
+    // caption label above it ("Marker properties:" / "Loop
+    // properties:" / "Note properties:" / hidden). Single
+    // entry-point so the caption and visible page never drift apart.
+    void setPropertyPage(int pageIndex);
+
+    // Update the single Add-Note button to match the current
+    // note-property-page mode. Empty → "New Note ...";
+    // NewDraft → "Add Note"; Editing → button is hidden (live-commit
+    // via per-field edits — same inspector pattern as markers/loops).
     void updateAddNoteButtonLabel();
 
     // Populate noteBuffer_ from an existing note's current model
@@ -327,8 +332,6 @@ private:
         findMarkerItem(std::int64_t id) const;
     [[nodiscard]] QTreeWidgetItem*
         findLoopItem(std::int64_t id) const;
-    [[nodiscard]] QTreeWidgetItem*
-        findNoteItem(std::int64_t id) const;
 
     std::shared_ptr<score::MarkerModel> markerModel_;
     std::shared_ptr<score::LoopModel>   loopModel_;
@@ -348,7 +351,6 @@ private:
     QTreeWidget*     tree_              = nullptr;
     QTreeWidgetItem* markersCategory_   = nullptr;
     QTreeWidgetItem* loopsCategory_     = nullptr;
-    QTreeWidgetItem* notesCategory_     = nullptr;
 
     // "Add Note" button — sits below the property stack, always
     // visible, enabled only when a NoteModel is attached.
@@ -356,6 +358,12 @@ private:
 
     // Property-page stack. Page indices live in the .cpp.
     QStackedWidget*  propertyStack_     = nullptr;
+
+    // Caption above the property stack — "Marker properties:",
+    // "Loop properties:", "Note properties:", or hidden when no
+    // artifact is selected. Updated together with the stack's
+    // current page via setPropertyPage().
+    QLabel*          propertyCaption_   = nullptr;
 
     // Marker page widgets.
     QLineEdit*       markerNameEdit_    = nullptr;
