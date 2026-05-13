@@ -413,6 +413,22 @@ private slots:
     // draft along the way.
     void onStaffPlaceNoteRequested(std::int64_t ms, int midi);
 
+    // Drag commits from the piano-roll staff (issue #60). One slot
+    // per gesture flavour; the from→to args carry the press-time
+    // and release-time values respectively. Each turns into a
+    // single model write + one or two undo entries (#44 will group
+    // them under QUndoStack later).
+    void onStaffNoteDragCommitted(std::int64_t id,
+                                  std::int64_t fromStartMs,
+                                  std::int64_t fromEndMs,
+                                  int          fromMidi,
+                                  std::int64_t toStartMs,
+                                  std::int64_t toEndMs,
+                                  int          toMidi);
+    void onStaffNoteCreateCommitted(std::int64_t startMs,
+                                    std::int64_t endMs,
+                                    int          midi);
+
     // Drag-to-nudge requests from the score widgets (issue #11).
     // Fired per mouse-move while the drag is in flight; we just
     // forward to the model. Logging happens on the *Committed slots

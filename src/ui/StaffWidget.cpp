@@ -474,23 +474,29 @@ void StaffWidget::paintNotes(QPainter& painter) const {
     int skippedOutOfRange = 0;
     int skippedClipped = 0;
     for (const auto& n : notes) {
-        const int y = rowYForMidi(n.midi);
+        // MEMO[#60]: read ghost-overridden values when this note is
+        // mid-drag. Move/Resize override range; Move also overrides
+        // midi. Otherwise model values pass through unchanged.
+        const auto [effStart, effEnd] =
+            effectiveNoteRange(n.id, n.startMs, n.endMs);
+        const int effMidi = effectiveNoteMidi(n.id, n.midi);
+        const int y = rowYForMidi(effMidi);
         if (y == INT_MIN) {
             ++skippedOutOfRange;
             FLOG_TRACE("ui.staff",
                        "paint-note id={} midi={} skipped=out-of-range",
-                       n.id, n.midi);
+                       n.id, effMidi);
             continue;
         }
 
-        const int xStart = msToX(n.startMs);
-        const int xEnd   = msToX(n.endMs);
+        const int xStart = msToX(effStart);
+        const int xEnd   = msToX(effEnd);
         if (xEnd <= kbWidth || xStart >= width()) {
             ++skippedClipped;
             FLOG_TRACE("ui.staff",
                        "paint-note id={} midi={} startMs={} endMs={} "
                        "xStart={} xEnd={} skipped=clipped (width={})",
-                       n.id, n.midi, n.startMs, n.endMs,
+                       n.id, effMidi, effStart, effEnd,
                        xStart, xEnd, width());
             continue;
         }
@@ -498,7 +504,7 @@ void StaffWidget::paintNotes(QPainter& painter) const {
         FLOG_TRACE("ui.staff",
                    "paint-note id={} midi={} startMs={} endMs={} y={} "
                    "xStart={} xEnd={}",
-                   n.id, n.midi, n.startMs, n.endMs, y, xStart, xEnd);
+                   n.id, effMidi, effStart, effEnd, y, xStart, xEnd);
 
         const int xLeft  = std::max(kbWidth, xStart);
         const int xRight = std::min(width(), xEnd);
@@ -513,6 +519,34 @@ void StaffWidget::paintNotes(QPainter& painter) const {
         if (selId == n.id) {
             painter.setPen(QPen(selectionCol, kNoteSelectionWidthPx));
             painter.drawRect(barRect.adjusted(-1, -1, 1, 1));
+        }
+    }
+
+    // Phantom note for the drag-to-create gesture (issue #60).
+    // No model entry yet; we draw a translucent outline so the user
+    // sees what's about to land. On release, MainWindow turns this
+    // into a real note via noteCreateCommitted.
+    if (const auto phantom = phantomNoteGhost()) {
+        const int y = rowYForMidi(phantom->midi);
+        if (y != INT_MIN) {
+            const int xStart = msToX(phantom->startMs);
+            const int xEnd   = msToX(phantom->endMs);
+            if (xEnd > kbWidth && xStart < width()) {
+                const int xLeft  = std::max(kbWidth, xStart);
+                const int xRight = std::min(width(), xEnd);
+                const int barW   = std::max(1, xRight - xLeft);
+                const int barTop = y - kNoteBarHeightPx / 2;
+                const QRect r(xLeft, barTop, barW, kNoteBarHeightPx);
+                // Lighter fill + dashed outline so the phantom reads
+                // as draft vs. the solid committed bars.
+                QColor draftFill = fillCol;
+                draftFill.setAlpha(120);
+                painter.fillRect(r, draftFill);
+                QPen draftPen(borderCol, 1.0);
+                draftPen.setStyle(Qt::DashLine);
+                painter.setPen(draftPen);
+                painter.drawRect(r);
+            }
         }
     }
 }
@@ -547,6 +581,47 @@ StaffWidget::hitNote(int xWidget, int yWidget) const {
         return n.id;
     }
     return std::nullopt;
+}
+
+std::optional<ScoreOverlayBase::NoteEdgeHit>
+StaffWidget::hitNoteEdge(int xWidget, int yWidget) const {
+    // Same y-row test as hitNote, but instead of checking the bar's
+    // body, check whether x is within kEdgeTolerancePx of either
+    // edge. The tolerance zone may extend slightly outside the bar,
+    // which is what makes very short bars still resizable. If both
+    // edges are within tolerance (a tiny bar), the start edge wins
+    // arbitrarily — same convention as loop edges (issue #11).
+    const auto noteM = noteModel();
+    if (!noteM) return std::nullopt;
+    if (xWidget < leftMarginPx()) return std::nullopt;
+
+    const auto notes = noteM->notes();
+    for (std::size_t i = notes.size(); i-- > 0;) {
+        const auto& n = notes[i];
+        const int rowY = rowYForMidi(n.midi);
+        if (rowY == INT_MIN) continue;
+        const int barTop    = rowY - kNoteBarHeightPx / 2;
+        const int barBottom = barTop + kNoteBarHeightPx;
+        if (yWidget < barTop || yWidget >= barBottom) continue;
+        const int xStart = msToX(n.startMs);
+        const int xEnd   = msToX(n.endMs);
+        if (std::abs(xWidget - xStart) <= kEdgeTolerancePx) {
+            return NoteEdgeHit{n.id, /*isStart=*/true};
+        }
+        if (std::abs(xWidget - xEnd) <= kEdgeTolerancePx) {
+            return NoteEdgeHit{n.id, /*isStart=*/false};
+        }
+    }
+    return std::nullopt;
+}
+
+int StaffWidget::pixelToMidi(int yWidget) const {
+    return midiForRowY(yWidget);
+}
+
+int StaffWidget::chromaticRowAt(int xWidget, int yWidget) const {
+    if (xWidget < leftMarginPx()) return -1;
+    return midiForRowY(yWidget);
 }
 
 // MEMO[#step6.2]: extends the base's plain-seek branch — when the
