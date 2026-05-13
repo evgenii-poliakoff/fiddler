@@ -1619,3 +1619,127 @@ TEST_CASE("WaveformWidget: loop edge drag past partner edge is rejected",
     REQUIRE(loops->loops()[0].startMs == 1000);
     REQUIRE(loops->loops()[0].endMs   == 2000);
 }
+
+// ---------------------------------------------------------------------------
+// Loop body drag-to-move + drag-to-create (issue #62)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("WaveformWidget: drag loop band BODY moves both edges by the delta",
+          "[waveform-widget][gui][drag][loops][move]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/8));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {2000, 4000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QSignalSpy commitSpy(&w, &WaveformWidget::loopMoveCommitted);
+
+    // Press in the middle of the band (3000 ms), drag 1000 ms right.
+    const int xMid     = w.msToX(3000);
+    const int xRelease = w.msToX(4000);
+    dragSequence(w, xMid, xRelease);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args.at(0).toLongLong() == loops->loops()[0].id);
+    REQUIRE(args.at(1).toLongLong() == 2000);   // fromStart
+    REQUIRE(args.at(2).toLongLong() == 4000);   // fromEnd
+    // ±5 ms slack for integer truncation.
+    REQUIRE(std::abs(args.at(3).toLongLong() - 3000) <= 5);  // toStart
+    REQUIRE(std::abs(args.at(4).toLongLong() - 5000) <= 5);  // toEnd
+}
+
+TEST_CASE("WaveformWidget: drag loop body that would push past file end clamps",
+          "[waveform-widget][gui][drag][loops][move]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));   // 4000 ms total
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {2000, 3000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QSignalSpy commitSpy(&w, &WaveformWidget::loopMoveCommitted);
+
+    // Drag the band way past the end of the file. The whole band
+    // shifts but stays inside [0, dur]; duration preserved.
+    const int xMid     = w.msToX(2500);
+    const int xRelease = w.msToX(99'000);
+    dragSequence(w, xMid, xRelease);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(args.at(4).toLongLong() == 4000);                 // toEnd clamped
+    REQUIRE(args.at(3).toLongLong() == 3000);                 // toStart shifted
+    REQUIRE(args.at(4).toLongLong() - args.at(3).toLongLong() == 1000);
+}
+
+TEST_CASE("WaveformWidget: drag on empty waveform emits loopCreateCommitted",
+          "[waveform-widget][gui][drag][loops][create]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{});
+
+    QSignalSpy commitSpy(&w, &WaveformWidget::loopCreateCommitted);
+    QSignalSpy seekSpy  (&w, &WaveformWidget::seekRequested);
+
+    // Press at 1000 ms, release at 2500 ms.
+    const int xPress   = w.msToX(1000);
+    const int xRelease = w.msToX(2500);
+    dragSequence(w, xPress, xRelease);
+
+    REQUIRE(commitSpy.count() == 1);
+    const auto args = commitSpy.takeFirst();
+    REQUIRE(std::abs(args.at(0).toLongLong() - 1000) <= 5);
+    REQUIRE(std::abs(args.at(1).toLongLong() - 2500) <= 5);
+    REQUIRE(seekSpy.count() >= 1);   // seek still fires at press time
+}
+
+TEST_CASE("WaveformWidget: plain click on empty waveform does NOT create a loop",
+          "[waveform-widget][gui][drag][loops][create]") {
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+    installLoops(w, std::span<const std::pair<std::int64_t, std::int64_t>>{});
+
+    QSignalSpy createSpy(&w, &WaveformWidget::loopCreateCommitted);
+    QSignalSpy seekSpy  (&w, &WaveformWidget::seekRequested);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(w.msToX(1500), 50));
+
+    REQUIRE(createSpy.count() == 0);     // no drag → no create
+    REQUIRE(seekSpy.count()   == 1);     // plain seek preserved
+}
+
+TEST_CASE("WaveformWidget: drag near a loop edge still resizes (edge wins over body)",
+          "[waveform-widget][gui][drag][loops][move]") {
+    // Hit-test priority: edge → body. A press within kEdgeTolerancePx
+    // of an edge arms a resize even if the press technically lies
+    // inside the band's x range.
+    qtApp();
+    WaveformWidget w;
+    w.setOverview(makeOverview(/*seconds=*/4));
+    w.resize(800, 100);
+
+    const std::pair<std::int64_t, std::int64_t> ranges[] = { {1000, 2000} };
+    auto loops = installLoops(
+        w, std::span<const std::pair<std::int64_t, std::int64_t>>{ranges});
+
+    QSignalSpy edgeSpy(&w, &WaveformWidget::loopDragCommitted);
+    QSignalSpy moveSpy(&w, &WaveformWidget::loopMoveCommitted);
+
+    const int xRightEdge  = w.msToX(2000);   // exactly at right edge
+    const int xRightFinal = w.msToX(2400);
+    dragSequence(w, xRightEdge, xRightFinal);
+
+    REQUIRE(edgeSpy.count() == 1);   // edge resize fired
+    REQUIRE(moveSpy.count() == 0);   // body move did NOT
+}

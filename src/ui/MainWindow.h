@@ -429,6 +429,19 @@ private slots:
                                     std::int64_t endMs,
                                     int          midi);
 
+    // Loop drag commits (issue #62). Either widget can drive these:
+    // the `via` string tags the source widget for the log line, the
+    // model write is the same regardless.
+    void commitLoopMoveDrag(std::int64_t id,
+                            std::int64_t fromStartMs,
+                            std::int64_t fromEndMs,
+                            std::int64_t toStartMs,
+                            std::int64_t toEndMs,
+                            const char*  via);
+    void onLoopCreateCommitted(std::int64_t startMs,
+                               std::int64_t endMs,
+                               const char*  via);
+
     // Drag-to-nudge requests from the score widgets (issue #11).
     // Fired per mouse-move while the drag is in flight; we just
     // forward to the model. Logging happens on the *Committed slots

@@ -53,6 +53,11 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     [[nodiscard]] bool hasContent() const noexcept override;
 
+    // Loop-create drag is a waveform-only gesture (issue #62). On
+    // the staff the empty-space press arms NoteCreate instead.
+    [[nodiscard]] bool armsLoopCreate(int xWidget,
+                                      int yWidget) const override;
+
 private:
     std::shared_ptr<const audio::WaveformOverview> overview_;
 };

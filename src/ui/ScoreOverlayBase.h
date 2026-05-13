@@ -198,6 +198,16 @@ public slots:
     // paint-only override; the model commits once on release.
     void setMarkerDragGhost(std::int64_t id, std::int64_t ms);
     void setLoopDragGhost  (std::int64_t id, bool isStart, std::int64_t ms);
+    // Sister-mirror for the LoopMove gesture (issue #62) — both
+    // edges of an existing loop shifted by the drag delta.
+    void setLoopMoveDragGhost(std::int64_t id,
+                              std::int64_t startMs,
+                              std::int64_t endMs);
+    // Sister-mirror for the LoopCreate gesture (issue #62) — the
+    // phantom band that exists only while the user is drawing on
+    // empty waveform. nullopt clears it.
+    void setPhantomLoopGhost(std::optional<std::int64_t> startMs,
+                             std::optional<std::int64_t> endMs);
     void clearDragGhost();
 
     // Mirror the zoom-anchor guide from the sister widget. The
@@ -301,6 +311,21 @@ signals:
                              std::int64_t endMs,
                              int          midi);
 
+    // Loop drag commits (issue #62). One slot per gesture flavour;
+    // MainWindow turns these into one setRange / add() call plus
+    // one undo entry.
+    void loopMoveCommitted(std::int64_t id,
+                           std::int64_t fromStartMs, std::int64_t fromEndMs,
+                           std::int64_t toStartMs,   std::int64_t toEndMs);
+    void loopCreateCommitted(std::int64_t startMs, std::int64_t endMs);
+
+    // Live signal during a LoopCreate drag (issue #62). MainWindow
+    // forwards to the sister widget's setPhantomLoopGhost slot so
+    // the phantom band glides on both surfaces. nullopt span means
+    // clear (release / cancel).
+    void loopCreateDragRequested(std::optional<std::int64_t> startMs,
+                                 std::optional<std::int64_t> endMs);
+
 protected:
     void mousePressEvent  (QMouseEvent* event) override;
     void mouseMoveEvent   (QMouseEvent* event) override;
@@ -384,6 +409,16 @@ protected:
     [[nodiscard]] std::optional<PhantomNote>
         phantomNoteGhost() const noexcept;
 
+    // Drag-to-create phantom for a LoopCreate gesture (issue #62).
+    // Visible only while the user is dragging on empty waveform;
+    // nullopt outside that window.
+    struct PhantomLoop {
+        std::int64_t startMs;
+        std::int64_t endMs;
+    };
+    [[nodiscard]] std::optional<PhantomLoop>
+        phantomLoopGhost() const noexcept;
+
     // Y-axis pitch hit-test for NoteMove (so the base can map the
     // mouse-y to a chromatic row without knowing the staff's
     // layout). Returns -1 when the y doesn't map to a valid row.
@@ -404,6 +439,29 @@ protected:
     // the midi value if so, -1 otherwise. Default: -1.
     [[nodiscard]] virtual int chromaticRowAt(int /*x*/,
                                              int /*y*/) const { return -1; }
+
+    // Should an empty-space press at this widget-local (x, y) arm
+    // a LoopCreate drag (issue #62)? WaveformWidget overrides to
+    // return true for any in-range x; StaffWidget defaults to
+    // false because empty-space on the staff arms NoteCreate
+    // instead. Both surfaces paint loops, but only one creates
+    // them via drag.
+    [[nodiscard]] virtual bool armsLoopCreate(int /*x*/,
+                                              int /*y*/) const { return false; }
+
+    // Should this widget treat markers / barlines / loop edges /
+    // loop bodies as interactive (click-to-select, drag-to-move)?
+    // WaveformWidget keeps the default (true) — the waveform is
+    // the timeline strip where region / marker editing lives.
+    // StaffWidget overrides to false: the piano roll is the note
+    // editor, so clicks anywhere on its grid go to note placement
+    // / selection. The artifacts STILL PAINT on the staff for
+    // visual context and act as snap anchors when notes are
+    // dragged; only the click hit-test is bypassed. Same convention
+    // as every major DAW (Logic, Pro Tools, Ableton, FL Studio,
+    // Cubase, GarageBand) — region UI on the timeline, note UI
+    // on the piano roll, no overlap.
+    [[nodiscard]] virtual bool artifactsClickable() const { return true; }
 
 private slots:
     void onBarlineModelChanged();
@@ -426,7 +484,10 @@ private:
         NoteMove,         // body of an existing bar → move in time + pitch
         NoteResizeStart,  // left edge → resize note start
         NoteResizeEnd,    // right edge → resize note end
-        NoteCreate        // empty grid cell → drag to draw a new note
+        NoteCreate,       // empty grid cell → drag to draw a new note
+        // Issue #62 — loop gestures.
+        LoopMove,         // body of an existing loop band → move whole loop
+        LoopCreate        // empty waveform → drag to draw a new loop
     };
     DragKind     dragKind_       = DragKind::None;
     std::int64_t dragId_         = 0;
@@ -447,6 +508,34 @@ private:
     };
     NoteDragOrigin noteDragOrigin_;
 
+    // Loop-drag press-time snapshot (issue #62). Only populated for
+    // LoopMove: stores the loop's range at press time so per-move
+    // can apply the cursor delta to BOTH edges without re-reading
+    // the model (which never changes mid-drag). LoopCreate uses
+    // dragOriginalMs_ for the press cursor ms instead — there's no
+    // pre-existing range.
+    struct LoopDragOrigin {
+        std::int64_t startMs = 0;
+        std::int64_t endMs   = 0;
+    };
+    LoopDragOrigin loopDragOrigin_;
+
+    // True when an empty-waveform press has been deferred for the
+    // drag-vs-click decision in mouseRelease (LoopCreate path,
+    // issue #62). On release without drag, fall back to plain seek.
+    bool loopCreateDeferred_ = false;
+
+    // Phantom loop-band drawn live during a LoopCreate drag — no
+    // model entry yet, so it can't ride on dragGhost_ (which keys
+    // by id). Source-side only (sister mirror via the
+    // setPhantomLoopGhost slot so the band glides on both
+    // widgets while the user drags on the waveform).
+    struct PhantomLoopGhost {
+        std::int64_t startMs;
+        std::int64_t endMs;
+    };
+    std::optional<PhantomLoopGhost> phantomLoopGhost_;
+
     // Per-move snapshot of the dragged artifact's "where would it
     // land if released right now" position. Set on press (with
     // `dragOriginalMs_`), updated on every mouseMove past the
@@ -460,7 +549,14 @@ private:
     struct DragGhost {
         DragKind     kind = DragKind::None;
         std::int64_t id   = 0;
+        // Primary ms: Marker = marker pos; LoopStart = new start;
+        // LoopEnd = new end; LoopMove (issue #62) = new start.
         std::int64_t ms   = 0;
+        // Secondary ms: LoopMove only, holds the new end. Unused for
+        // marker / loop-edge drags. Keeping it on the same struct
+        // means the existing sister-mirror slot can fit the new
+        // gesture with one extra field, no parallel ghost field.
+        std::int64_t ms2  = 0;
     };
     std::optional<DragGhost> dragGhost_;
 
@@ -499,6 +595,13 @@ private:
     struct LoopEdgeHit { std::int64_t id; bool isStart; };
     [[nodiscard]] std::optional<LoopEdgeHit>
         hitLoopEdge(int x) const noexcept;
+
+    // Hit-test the loop band BODY at pixel x (issue #62) — strictly
+    // INSIDE the band, away from the edges (those go to hitLoopEdge).
+    // On overlap the visually-topmost (last added) band wins, same
+    // convention as note hits. Returns the loop id, or nullopt.
+    [[nodiscard]] std::optional<std::int64_t>
+        hitLoopBody(int x) const noexcept;
 
     // Find the nearest barline OR marker to `cursorMs` within
     // `pixelsToMs(kSnapTolerancePx)`. Used by loop-edge drag to

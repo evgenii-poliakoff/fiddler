@@ -478,6 +478,25 @@ void MainWindow::buildCentralWidget() {
                          std::int64_t toMs) {
                 commitLoopDrag(id, isStart, fromMs, toMs, "waveform");
             });
+    // Loop body / create drags (issue #62).
+    connect(waveform_, &WaveformWidget::loopMoveCommitted,
+            this, [this](std::int64_t id,
+                         std::int64_t fromStart, std::int64_t fromEnd,
+                         std::int64_t toStart,   std::int64_t toEnd) {
+                commitLoopMoveDrag(id, fromStart, fromEnd,
+                                   toStart, toEnd, "waveform");
+            });
+    connect(waveform_, &WaveformWidget::loopCreateCommitted,
+            this, [this](std::int64_t startMs, std::int64_t endMs) {
+                onLoopCreateCommitted(startMs, endMs, "waveform");
+            });
+    connect(waveform_, &WaveformWidget::loopCreateDragRequested,
+            this, [this](std::optional<std::int64_t> startMs,
+                         std::optional<std::int64_t> endMs) {
+                // Sister-mirror: staff paints the phantom too while
+                // the user draws on the waveform.
+                if (staff_) staff_->setPhantomLoopGhost(startMs, endMs);
+            });
     // MEMO[#step6.2]: indent the waveform by the staff's piano-keyboard
     // column width so its left edge lines up with the staff's chromatic
     // grid. The playhead cursor on both widgets then lands at the same
@@ -557,6 +576,11 @@ void MainWindow::buildCentralWidget() {
                          std::int64_t toMs) {
                 commitLoopDrag(id, isStart, fromMs, toMs, "staff");
             });
+    // Loop body drag-move + drag-create are BOTH waveform-only
+    // (issue #62, conflict resolution). The staff's armsLoopMove
+    // returns false so it can't emit loopMoveCommitted; we leave
+    // no connect for it. Loops still paint on the staff for
+    // visual context — see paintLoops in StaffWidget.
     layout->addWidget(staff_);
 
     // Mirror the zoom-anchor guide across both widgets so the
@@ -2128,6 +2152,61 @@ void MainWindow::commitLoopDrag(std::int64_t id,
                id, isStart ? "start" : "end", fromMs, toMs, via);
 }
 
+void MainWindow::commitLoopMoveDrag(std::int64_t id,
+                                    std::int64_t fromStartMs,
+                                    std::int64_t fromEndMs,
+                                    std::int64_t toStartMs,
+                                    std::int64_t toEndMs,
+                                    const char*  via) {
+    // Zero-distance drag — defensive cleanup; no model write.
+    if (fromStartMs == toStartMs && fromEndMs == toEndMs) {
+        if (waveform_) waveform_->clearDragGhost();
+        if (staff_)    staff_->clearDragGhost();
+        return;
+    }
+    if (!loopModel_) return;
+    if (!loopModel_->indexOf(id).has_value()) return;
+    pushUndoEntry(undo::EditLoopRange{id, fromStartMs, fromEndMs});
+    loopModel_->setRange(id, toStartMs, toEndMs);
+    if (waveform_) waveform_->clearDragGhost();
+    if (staff_)    staff_->clearDragGhost();
+    FLOG_DEBUG("ui.score",
+               "loop-move-drag id={} from=[{}..{}] to=[{}..{}] via={}",
+               id, fromStartMs, fromEndMs, toStartMs, toEndMs, via);
+}
+
+void MainWindow::onLoopCreateCommitted(std::int64_t startMs,
+                                       std::int64_t endMs,
+                                       const char*  via) {
+    if (!loopModel_) return;
+    if (endMs <= startMs) {
+        FLOG_WARN("ui.score",
+                  "loop-create rejected reason=degenerate start={} end={}",
+                  startMs, endMs);
+        if (waveform_) waveform_->clearDragGhost();
+        if (staff_)    staff_->clearDragGhost();
+        return;
+    }
+    const auto id = loopModel_->add(startMs, endMs);
+    if (id == 0) {
+        FLOG_WARN("ui.score",
+                  "loop-create rejected start={} end={}", startMs, endMs);
+        if (waveform_) waveform_->clearDragGhost();
+        if (staff_)    staff_->clearDragGhost();
+        return;
+    }
+    pushUndoEntry(undo::AddLoop{id});
+    // Select the new loop so the dock's property page opens for
+    // immediate naming / edge tweak — same UX as note-create.
+    if (waveform_) waveform_->setSelectedLoopId(id);
+    if (staff_)    staff_->setSelectedLoopId(id);
+    if (waveform_) waveform_->clearDragGhost();
+    if (staff_)    staff_->clearDragGhost();
+    FLOG_DEBUG("ui.score",
+               "loop-create id={} start={} end={} via={} size={}",
+               id, startMs, endMs, via, loopModel_->size());
+}
+
 void MainWindow::onDockMarkerRenameRequested(std::int64_t id,
                                               QString      name) {
     const auto idx = markerModel_->indexOf(id);
@@ -2613,20 +2692,27 @@ void MainWindow::onMarkerDragRequested(std::int64_t id,
 void MainWindow::onLoopDragRequested(std::int64_t id,
                                      std::int64_t newStartMs,
                                      std::int64_t newEndMs) {
-    // Live drag forwarding (#22). Same pattern as
-    // onMarkerDragRequested — mirror the moving edge's ghost to
+    // Live drag forwarding (#22). Mirror the dragged edge(s) to
     // both widgets so the band glides on both. The source widget
     // already updated its own ghost in mouseMove; the
-    // setLoopDragGhost call there is idempotent. The single
-    // setRange happens on release.
+    // setLoopDragGhost / setLoopMoveDragGhost call here is
+    // idempotent on it. The single setRange happens on release.
     if (!loopModel_) return;
     const auto idx = loopModel_->indexOf(id);
     if (!idx) return;
     const auto& l = loopModel_->loops()[*idx];
-    // Whichever edge differs from the model's current value is
-    // the one the user is dragging. The widget always emits the
-    // partner edge unchanged, so this comparison is unambiguous.
-    const bool isStart = (newStartMs != l.startMs);
+    const bool startChanged = (newStartMs != l.startMs);
+    const bool endChanged   = (newEndMs   != l.endMs);
+    if (startChanged && endChanged) {
+        // BOTH edges differ → LoopMove (issue #62). Mirror via the
+        // dedicated slot that carries both endpoints.
+        if (waveform_) waveform_->setLoopMoveDragGhost(id, newStartMs, newEndMs);
+        if (staff_)    staff_->setLoopMoveDragGhost(id, newStartMs, newEndMs);
+        return;
+    }
+    // One edge differs → it's an edge drag (#11). Use the
+    // edge-mirror slot.
+    const bool isStart = startChanged;
     const std::int64_t ghostMs = isStart ? newStartMs : newEndMs;
     if (waveform_) waveform_->setLoopDragGhost(id, isStart, ghostMs);
     if (staff_)    staff_->setLoopDragGhost(id, isStart, ghostMs);
