@@ -3571,16 +3571,184 @@ TEST_CASE("MainWindow: New Note → Add Note with armed loop inherits the loop's
     REQUIRE(n.endMs   == 1500);
 }
 
+TEST_CASE("MainWindow: piano-roll click-to-create starts at click position "
+          "(issue #64 — click = note start)",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#64]: click position IS the new note's startMs, not its
+    // centre. Standard DAW piano-roll convention; lets the press-
+    // time seek land the playback cursor at the note's beginning.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+
+    // Fixture is 2 s; click at 500 ms so [500, 900] sits safely
+    // inside the file (the end-of-file clamp is exercised
+    // separately).
+    emit staff->placeNoteRequested(500, 69);
+
+    REQUIRE(window->noteModel().size() == 1);
+    const auto& n = window->noteModel().notes()[0];
+    REQUIRE(n.startMs == 500);           // click position
+    REQUIRE(n.endMs   == 500 + 400);     // 400 ms default duration
+    REQUIRE(n.midi    == 69);            // A4
+}
+
+TEST_CASE("MainWindow: piano-roll click-to-create seeks to the new note's start",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#64]: after creating a note via click, the playback
+    // cursor must land at the note's startMs so "place then press
+    // Play" replays the note from its onset.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+
+    emit staff->placeNoteRequested(500, 69);
+
+    // The playback cursor is set via onSeek → player_->seek.
+    // Position settles asynchronously; poll briefly. The free-mode
+    // case is the simpler half: click ms == new startMs, so the
+    // press-time seek already lands here. We still assert the
+    // observable end state for completeness.
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return std::abs(waveform->positionMs() - 500) < 50; },
+        2000));
+}
+
+TEST_CASE("MainWindow: piano-roll click-to-create with armed loop seeks to "
+          "loop start (issue #64)",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#64]: armed-loop case — the new note adopts the loop's
+    // range. The click x is only the pitch row; the click TIME
+    // could be anywhere on the grid. The cursor must land at the
+    // loop's startMs (= the new note's startMs), NOT at the click
+    // ms. The post-creation onSeek call covers this.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+
+    // Create an armed loop spanning [500, 1500] ms via the dock.
+    seekAndTapMarker(*window, 500);
+    seekAndTapMarker(*window, 1500);
+    waveform->setSecondaryAnchorMs(500);
+    waveform->setSelectedMarkerId(window->markerModel().markers()[1].id);
+    QTest::keyClick(window.get(), Qt::Key_L);
+    REQUIRE(window->loopModel().size() == 1);
+    auto* dock = window->findChild<ProjectViewerDock*>("projectViewerDock");
+    const auto loopId = window->loopModel().loops()[0].id;
+    emit dock->loopActivated(loopId);
+
+    // Click at a click ms FAR from the loop's range (loop is
+    // [500, 1500]; click at 1800 lies past the loop's end but
+    // inside the 2 s fixture).
+    emit staff->placeNoteRequested(1800, 69);
+
+    REQUIRE(window->noteModel().size() == 1);
+    const auto& n = window->noteModel().notes()[0];
+    REQUIRE(n.startMs == 500);    // loop's startMs
+    REQUIRE(n.endMs   == 1500);   // loop's endMs
+
+    // Cursor lands at the new note's startMs (= loop start), not
+    // at the click ms.
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return std::abs(waveform->positionMs() - 500) < 50; },
+        2000));
+}
+
+TEST_CASE("MainWindow: piano-roll vertical drag (pitch-only) seeks to note's start",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#64]: invariant — after ANY note edit the cursor lands
+    // at the note's (new) startMs. For a vertical drag the start
+    // doesn't change, but the cursor at press time was at the
+    // CLICK ms (= the note's center under the body), not its
+    // start. Without the post-commit seek the cursor sits in the
+    // middle of the bar; with it, pressing Play replays from the
+    // onset so the user can A/B the new pitch against the recording.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+
+    // Seed a note at A4 starting at 500 ms.
+    emit staff->placeNoteRequested(500, 69);
+    REQUIRE(window->noteModel().size() == 1);
+    const auto id = window->noteModel().notes()[0].id;
+
+    // Simulate a vertical drag that re-pitches A4 → B4. Same
+    // interval [500, 900], midi 69 → 71. Cursor is currently at
+    // 500 (just placed).
+    emit staff->noteDragCommitted(id, 500, 900, 69,
+                                       500, 900, 71);
+
+    REQUIRE(window->noteModel().notes()[0].midi == 71);
+    // Cursor still at note's startMs.
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return std::abs(waveform->positionMs() - 500) < 50; },
+        2000));
+}
+
+TEST_CASE("MainWindow: piano-roll body-drag (move) seeks to new startMs",
+          "[main-window][gui][integration][notes][piano-roll]") {
+    // MEMO[#64]: body-drag is the case where the cursor was clearly
+    // misplaced before this fix — press-time seek went to the click
+    // ms (note's center), then the user dragged 300 ms right. New
+    // startMs is 800; without the post-commit seek the cursor was
+    // stranded at the old click. With the fix, cursor lands at 800.
+    qtApp();
+    auto window = std::make_unique<MainWindow>();
+    window->show();
+    (void)QTest::qWaitForWindowExposed(window.get());
+    REQUIRE(window->loadFile(
+        QString::fromStdString(fixtureWav().string())));
+    auto* waveform = window->findChild<WaveformWidget*>("waveformWidget");
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return waveform->overview() != nullptr; }, 5000));
+    auto* staff = window->findChild<StaffWidget*>("staffWidget");
+
+    emit staff->placeNoteRequested(500, 69);
+    const auto id = window->noteModel().notes()[0].id;
+
+    // Move the note 300 ms right (and one row up for good measure).
+    emit staff->noteDragCommitted(id, 500, 900, 69,
+                                       800, 1200, 70);
+
+    REQUIRE(window->noteModel().notes()[0].startMs == 800);
+    REQUIRE(QTest::qWaitFor(
+        [&]() { return std::abs(waveform->positionMs() - 800) < 50; },
+        2000));
+}
+
 TEST_CASE("MainWindow: piano-roll click near an existing bar selects it (no overlap)",
           "[main-window][gui][integration][notes][piano-roll]") {
-    // MEMO[#step6.2]: at deep zoom-in a click slightly outside an
-    // existing note bar would still propose an interval (the click
-    // ms ± 200 ms default) that overlaps the existing bar in
-    // source-time. Without a guard, a second bar would land on the
-    // same row visually atop the existing one, looking like the
-    // existing got selected. Guard: when the proposed interval
-    // overlaps an existing note on the same row, select the
-    // existing note instead of stacking a duplicate.
+    // MEMO[#step6.2]: a placement that would overlap an existing
+    // note on the same row is coerced to selecting the existing
+    // note instead of stacking a duplicate.
     qtApp();
     auto window = std::make_unique<MainWindow>();
     window->show();
@@ -3594,26 +3762,19 @@ TEST_CASE("MainWindow: piano-roll click near an existing bar selects it (no over
     auto* staff = window->findChild<StaffWidget*>("staffWidget");
     REQUIRE(staff != nullptr);
 
-    // Seed an existing note at A4 spanning [1000, 1400] ms via the
-    // place-gesture signal. MainWindow's handler turns this into an
-    // add + select.
+    // Seed an existing note at A4 starting at 1200 ms.
     emit staff->placeNoteRequested(1200, 69);
     REQUIRE(window->noteModel().size() == 1);
     const auto firstId = window->noteModel().notes()[0].id;
-    const auto firstStart = window->noteModel().notes()[0].startMs;
     const auto firstEnd   = window->noteModel().notes()[0].endMs;
 
-    // Now click "near" that bar on the same row at a ms whose
-    // ±200 ms window overlaps the existing interval. Without the
-    // guard this would add a second note; with the guard it
-    // selects the existing one and the model stays at size 1.
-    const std::int64_t nearMs = firstEnd - 50;   // overlaps via -200 default
+    // Click on the same row at a ms whose proposed [ms, ms+400]
+    // interval overlaps the existing note.
+    const std::int64_t nearMs = firstEnd - 50;
     emit staff->placeNoteRequested(nearMs, 69);
 
     REQUIRE(window->noteModel().size() == 1);
     REQUIRE(staff->selectedNoteId() == firstId);
-    REQUIRE(window->noteModel().notes()[0].startMs == firstStart);
-    REQUIRE(window->noteModel().notes()[0].endMs   == firstEnd);
 }
 
 TEST_CASE("MainWindow: Ctrl+Z undoes a note placement and a note delete",

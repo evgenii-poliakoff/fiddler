@@ -152,10 +152,14 @@ The loop appears as a translucent band across the waveform and the staff, and as
 
 ### Move or resize a loop
 
-- *Move.* Drag the body of the loop band on the waveform. Both edges shift together — the loop's duration is preserved. Snap-to-nearest-anchor lets the loop land precisely on a barline / marker.
-- *Resize.* Drag either edge on the waveform. Only that edge moves; the partner edge stays put. Snap applies.
+- *Move.* Drag the body of the loop band on the waveform. Both edges shift together — the loop's duration is preserved.
+- *Resize.* Drag either edge on the waveform. Only that edge moves; the partner edge stays put.
 
-Loop editing lives on the waveform; the staff displays the band for visual context but stays a pure note editor — clicks inside a loop band on the staff place a note rather than moving the loop.
+Both gestures snap to nearby barlines, markers, and other loop edges within a few pixels, so loops line up cleanly with the landmarks you've placed.
+
+![A loop edge snapping to a barline mid-drag.](img/manual-loop-edge-snap.png)
+
+Loop editing lives on the waveform; the staff displays the band for visual context but stays a pure note editor — clicks inside a loop band on the staff place a note rather than moving the loop. You can also edit a loop's exact Start, End, and Name in the dock's property page in milliseconds.
 
 ### Arm and play
 
@@ -165,14 +169,6 @@ A loop is *armed* when its row in the dock has a play-arrow glyph and the **Arme
 - Or click the loop's row to select it, then check **Armed** on the property page to arm it without seeking.
 
 While a loop is armed, the recording wraps from the loop's end back to its start each time playback reaches the end. **Stop** disarms; pressing **Play** with no loop armed plays through normally.
-
-### Adjust a loop's edges
-
-Drag either edge of a loop band to fine-tune its boundaries. Loop edges *snap* to nearby barlines and markers when you drag within a few pixels of one, so you can pin an edge to a known anchor without typing a position.
-
-![A loop edge snapping to a barline mid-drag.](img/manual-loop-edge-snap.png)
-
-You can also edit the loop's start and end positions in the dock's property page, in milliseconds.
 
 ### Pre-roll
 
@@ -194,9 +190,9 @@ A *note* is a region of the recording over which you perceived a single pitch �
 
 ### Place a note by clicking the staff
 
-Click a cell on the chromatic grid to place a note. The grid is the area to the right of the piano keyboard; click on the row whose pitch you want and at the horizontal position where the note begins, and a bar appears straight away. The click also seeks the playback cursor to that position — so the gesture *places* and *navigates* in one move, the same way DAW piano rolls work.
+Click a cell on the chromatic grid to place a note. The grid is the area to the right of the piano keyboard; click on the row whose pitch you want and at the horizontal position where the note begins, and a bar appears straight away. The click position is the new note's start — the bar grows rightward by a 400 ms default duration, the same convention every DAW piano roll follows. The click also seeks the playback cursor to the note's start, so pressing **Play** immediately replays the note from its onset.
 
-The new note's interval is the currently *armed* loop when one is armed; otherwise it spans the click position ± 200 ms. Either way it lands selected, so you can fine-tune Start, End, or Pitch from the property page in the dock without re-finding the bar.
+When a loop is *armed* (see §7), the new note's interval is the loop's range instead of the default span. This makes click-to-place a chord-building gesture inside the armed region: each click on a different row adds another note over the same interval. The cursor lands at the loop's start regardless of where you clicked, so Play replays the whole loop.
 
 The piano keyboard column itself is **not** clickable — it labels the rows and is reserved for a future preview-tone gesture. Clicks land only on the grid.
 
@@ -210,6 +206,8 @@ Direct-manipulation gestures on the staff, the same vocabulary every DAW piano r
 - *Draw.* Press on an empty grid cell and drag horizontally to draw a new note of arbitrary length. The press position is the start, the release position is the end, and the row is the pitch. A plain click — no drag — still places a default-span note as before.
 
 Drags that would put a bar on top of another note on the *same row* are rejected; the model rolls back to the pre-drag state. **Ctrl+Z** undoes the last drag.
+
+After every gesture — click-to-place, drag-move, drag-resize, drag-create — the playback cursor lands at the note's new start. Pressing **Play** immediately replays the note from its onset; especially useful when you've changed the pitch and want to A/B the new pitch against the recording.
 
 ### Edit a note from the property page
 
