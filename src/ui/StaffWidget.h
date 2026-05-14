@@ -78,6 +78,13 @@ public:
 protected:
     void paintEvent(QPaintEvent* event) override;
     [[nodiscard]] bool hasContent() const noexcept override;
+    // Step 6.3 reference-tone gestures: track hover row + tap key,
+    // emit the corresponding signals. mouseMoveEvent and leaveEvent
+    // call into the base via QWidget::* so the existing drag /
+    // zoom-anchor / selection plumbing keeps working.
+    void mouseMoveEvent(QMouseEvent* event)   override;
+    void leaveEvent   (QEvent*      event)    override;
+    void keyPressEvent(QKeyEvent*   event)    override;
     // Additive hook the base calls inside the plain-seek branch
     // (after seekRequested + emptySpaceClicked fire). The piano
     // roll uses this to emit placeNoteRequested(ms, midi) — that
@@ -118,12 +125,38 @@ protected:
     // when notes are dragged), they just don't catch clicks.
     [[nodiscard]] bool artifactsClickable() const override { return false; }
 
+    // Piano keyboard click (step 6.3) — emits keyboardKeyPressed
+    // with the midi value of the key under the press, kicks off a
+    // visual flash on the pressed key. Routed through this
+    // override so the base's mousePressEvent stays surface-agnostic.
+    void onLeftMarginPress(int xWidget, int yWidget) override;
+
 signals:
     // Fired when the user clicks an empty cell on the chromatic
     // grid. `ms` is the click's source-time; `midi` is the row's
     // MIDI value. MainWindow turns this into a noteModel_->add()
     // call plus undo push, and selects the new note.
     void placeNoteRequested(std::int64_t ms, int midi);
+
+    // Reference-tone gestures (issue #step6.3). MainWindow routes
+    // these into audio::ToneSynth.
+    //
+    // - Clicking a piano key in the keyboard column → fires a
+    //   short pulse at that pitch so the user can A/B against the
+    //   recording. Always-on regardless of the hover-tone mode.
+    void keyboardKeyPressed(int midi);
+    // - Moving the mouse over the chromatic grid produces a row
+    //   change: this signal fires ONCE per row crossing (de-duped
+    //   by the widget). MainWindow dispatches based on the dock's
+    //   hover-tone mode (Off / Continuous / On tap).
+    void hoverPitchChanged(int midi);
+    // - Mouse leaves the staff (or focus elsewhere): MainWindow
+    //   stops any continuous tone in flight.
+    void hoverPitchEnded();
+    // - User pressed T while hovering: fires a pulse at the
+    //   current hovered pitch. MainWindow honours this only when
+    //   the hover-tone mode is "On tap".
+    void hoverTapRequested(int midi);
 
 private:
     // paintEvent's work is split into one helper per visual concern.
@@ -154,6 +187,23 @@ private:
     [[nodiscard]] int gridBottomY() const noexcept;
 
     std::int64_t durationMs_ = 0;
+
+    // ---- Reference-tone state (step 6.3) -----------------------
+    //
+    // Last midi row the mouse was over the chromatic grid, used to
+    // de-duplicate hoverPitchChanged signals so the synth doesn't
+    // restart on every sub-row mouse pixel. -1 means "not hovering
+    // any row" — the next move into a row fires the signal.
+    int                       lastHoverMidi_   = -1;
+    // Last midi key the user clicked on the piano keyboard, with a
+    // QTimer-driven flash so the user sees what they hit. The flash
+    // duration is short (~150 ms). nullopt means no flash active.
+    std::optional<int>        pressedKeyMidi_;
+    // Hit-test the piano keyboard column. Returns the midi value of
+    // the key under (x, y), or nullopt if the click isn't on a key
+    // (e.g. outside the grid range, or out-of-row).
+    [[nodiscard]] std::optional<int>
+        hitKeyboardKey(int xWidget, int yWidget) const noexcept;
 };
 
 } // namespace fiddler::ui

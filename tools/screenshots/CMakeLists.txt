@@ -29,8 +29,12 @@ target_include_directories(fiddler-screenshots PRIVATE
 # Mirrors the test target's pattern (see tests/CMakeLists.txt).
 target_sources(fiddler-screenshots PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Envelope.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Oscillator.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Player.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/ToneSynth.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Voice.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp

@@ -14,11 +14,20 @@ add_executable(fiddler
     ui/WaveformWidget.h
     audio/Decoder.cpp
     audio/Decoder.h
-    audio/RingBuffer.h
+    audio/Envelope.cpp
+    audio/Envelope.h
+    audio/Oscillator.cpp
+    audio/Oscillator.h
     audio/Player.cpp
     audio/Player.h
+    audio/RingBuffer.h
+    audio/SoundSource.h
     audio/Stretcher.cpp
     audio/Stretcher.h
+    audio/ToneSynth.cpp
+    audio/ToneSynth.h
+    audio/Voice.cpp
+    audio/Voice.h
     audio/WaveformOverview.cpp
     audio/WaveformOverview.h
     score/BarlineModel.cpp

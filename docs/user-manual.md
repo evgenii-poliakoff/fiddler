@@ -194,7 +194,7 @@ Click a cell on the chromatic grid to place a note. The grid is the area to the 
 
 When a loop is *armed* (see §7), the new note's interval is the loop's range instead of the default span. This makes click-to-place a chord-building gesture inside the armed region: each click on a different row adds another note over the same interval. The cursor lands at the loop's start regardless of where you clicked, so Play replays the whole loop.
 
-The piano keyboard column itself is **not** clickable — it labels the rows and is reserved for a future preview-tone gesture. Clicks land only on the grid.
+The piano keyboard column on the left **is** clickable — clicking a key plays a brief reference tone at that pitch so you can A/B against the recording. The key flashes amber for ~150 ms. See *§8.2 Reference tone* below for the full ear-match workflow.
 
 ### Drag a note
 
@@ -232,7 +232,20 @@ Click a bar on the staff to select it. The dock's property page shows the note's
 
 Notes are the only artifact that carries a pitch. **Delete** removes the selected note exactly like it removes the other artifact kinds; **Ctrl+Z** brings it back with its original interval and pitch.
 
-> *What's next.* Click-to-place is the foundation gesture. The follow-up step adds an optional reference-tone synth on the keyboard column so you can audition a pitch against the recording before committing the note.
+### Reference tone — ear-match while you transcribe
+
+Fiddler plays a synthesized tone at any pitch on the staff so you can compare it against the recording by ear — the way Transcribe! and every transcription-focused app does it. Three gestures, escalating in commitment:
+
+- *Click a piano key.* Click any key in the keyboard column on the left of the staff to fire a short reference pulse at that pitch (~300 ms, with a smooth attack and release). The key flashes amber so you see what you hit. Always available — no mode to enable.
+- *Hover the chromatic grid.* In the dock's *Reference tone* controls (see §9) you can set **Hover tone** to one of three modes:
+  - **Off** — hover is silent. Click-to-place a note runs as usual.
+  - **Continuous** — hover plays a steady tone at the row under the cursor; the tone retunes smoothly as you move between rows. The recording keeps playing, so you hear both at once — best for unison-matching and beat detection.
+  - **On tap** — hover is silent; pressing **T** while hovering fires a pulse at the current row. The recording stays clean for listening; you ear-check only at moments of your choosing.
+- *Waveform.* The same dock controls let you choose between **Triangle** (default — closer to fiddle harmonic spectrum) and **Sine** (pure, less colored).
+
+The synth runs as its own audio stream so tones mix with the playback at the OS level — no fighting the recording's volume. Your preferences persist across sessions.
+
+> *What's next.* Step 6 finishes with the bidirectional playback cursor: the active note bar highlights as playback crosses it, and the optional onset-tone pulse plays a brief note in time with the recording so you hear your transcription alongside what's there.
 
 ## 9. The project viewer dock
 
@@ -243,6 +256,7 @@ The dock on the right of the window lists every marker and loop in the recording
 - *Tree.* Markers and Loops as two collapsible categories. Click a row to select; double-click a row to jump and play. Notes are not listed — they are selected and edited via the staff (piano roll), since pitch + interval already identifies each note on the grid.
 - *Property page.* Shows the fields of the currently-selected artifact, headed by a caption — "Marker properties:", "Loop properties:", or "Note properties:". Markers expose Name and Position; loops expose Name, Start, End, and the Armed checkbox; notes expose Pitch, Start, End, and Duration (no per-note name — notes are anonymous, matching MuseScore / MusicXML conventions). All fields commit live on Enter / Tab / focus-loss.
 - *Note button.* Below the property page — labelled **New Note …** when nothing is pending and **Add Note** while a draft is open. Hidden while you're editing an existing note (the property page does the writing). See *§8 Notes* for the workflow.
+- *Reference tone.* Two combos: **Hover tone** (Off / Continuous / On tap) gates how mouse motion over the chromatic grid plays a reference tone, and **Waveform** (Sine / Triangle) picks the tone shape. Both persist across sessions. Clicking a piano key in the keyboard column always plays, regardless of the Hover tone mode. See *§8 Notes — Reference tone* for the full workflow.
 - *Pre-roll countdown.* When the pre-roll is enabled, the countdown ring appears at the bottom of the dock and animates during each pre-roll silence.
 
 Press **F4** to hide or show the dock. The dock's visibility persists across sessions, so a hidden dock stays hidden until you press **F4** again.

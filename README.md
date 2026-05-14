@@ -15,14 +15,16 @@ The [**user manual**](docs/user-manual.md) walks through opening audio,
 slowing it down, marking phrases, building practice loops, and using
 the pre-roll countdown. Start there if you're new to Fiddler.
 
-**Status:** step 5.5 part B done — open audio, play with pitch-
-preserving tempo control 25–100 %, see and seek through a
-synchronised waveform, place barlines and named markers on a staff
-by tapping along to the recording, navigate / rename / re-position
-markers from a right-side project viewer dock, and create practice
-loops from any pair of anchors. **Drag** markers and loop
-boundaries to fine-tune positions on either the waveform or the
-staff (loop edges snap to nearby barlines / markers as you drag).
+**Status:** step 6.3 done — open audio, play with pitch-preserving
+tempo control 25–100 %, see and seek through a synchronised
+waveform, place barlines and named markers on a staff by tapping
+along to the recording, build practice loops from a drag on the
+waveform (or from any two anchors), drag-move / resize / drag-create
+loops and notes on the chromatic piano roll, snap edges to nearby
+barlines / markers / loop edges, edit any artifact from the
+right-side project viewer dock, and audition pitches with a
+built-in reference-tone synth (click a piano key, or hover-tone in
+Continuous / On-tap mode) for ear-matching against the recording.
 Toggle the **Pre-roll** checkbox in the transport row to switch
 between passive listening (no silence) and practice mode, where
 every Play press inserts a ready-set-go countdown of the chosen
@@ -38,7 +40,11 @@ ms before audio starts.
 - ✅ **Step 5** — Empty staff widget + user-placed barlines + tradition-named time-signature picker. Tap `B` to place at the playback position; `Ctrl+Z` undoes; `Del` removes.
 - ✅ **Step 5.5 (part A)** — Markers + project viewer dock. Tap `M` to drop a named cue point at the playback position; the dock on the right lists all markers, lets you rename / re-position them, and double-clicking a row jumps the player there and starts playback.
 - ✅ **Step 5.5 (part B)** — Practice loops. Click any artifact to mark a primary anchor, Ctrl+click any second artifact to add a secondary, press `L` to create a loop spanning them. Loops appear under a "Loops" category in the dock with a property page (Name / Start / End / Pause / Armed). Double-clicking a loop arms + jumps + plays; the Arm checkbox arms in place; pressing the main Play button while a loop is armed seeks to the loop's start if you're outside it.
-- 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
+- ✅ **Step 6.1** — `NoteModel` + chromatic piano-roll rendering on the staff. Notes are stored as (start_ms, end_ms, midi) intervals; the staff renders horizontal bars on per-semitone rows over the violin range (G3 – E7).
+- ✅ **Step 6.2** — Click-to-place + drag gestures for notes. Click a row to place a note starting at the click (default 400 ms); drag the body to move; drag an edge to resize; drag on empty grid to draw with explicit length. Same-row overlap guard prevents accidental duplicates.
+- ✅ **Step 6.2.2** — Loop gestures on the waveform. Drag the body of a loop band to translate; drag on empty waveform to draw a new loop. Snap-to-anchor on barlines / markers / other loop edges.
+- ✅ **Step 6.3** — Reference-tone synthesizer. Click a piano key on the staff to fire a pulse; hover-tone in Continuous (tone follows mouse) or On-tap (T fires a pulse) mode. Sine + Triangle waveforms; runs as its own audio stream alongside the recording. The layered architecture (`Voice` → `SoundSource` → `Oscillator`) is ready for expressive playback expansion: ornaments, vibrato, real fiddle samples.
+- 🔜 **Step 6.4** — Bidirectional playback cursor. Current note highlights as playback crosses it; optional onset-tone pulse mixes the transcription against the audio.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 
 See [`docs/architecture.md`](docs/architecture.md) for stack-choice rationale.

@@ -1305,7 +1305,27 @@ Steps 0–2 are complete. Steps 3–7 are planned but not implemented.
 - ✅ **Step 5** — Empty staff widget; user-placed barlines mapped to audio timestamps. `score::BarlineModel` is the shared data layer (descriptive `TimeSignature`, no uniformity enforcement — supports crooked tunes); `ui::StaffWidget` and `ui::WaveformWidget` both observe it. Tap-to-place is the primary gesture (`B`); `Ctrl+Z` undoes the last placement; `Del` removes the selected (auto-selected on tap) bar. Tradition-named time-signature picker; `QPainter` rather than `QGraphicsView` — see "Score widgets" above for the deferred features.
 - ✅ **Step 5.5 (part A)** — Markers + project viewer dock. `score::MarkerModel` is the second project-artifact model (stable IDs, auto-named, repositionable, free-text rename). `ui::ProjectViewerDock` is the right-side `QDockWidget` that hosts the marker list and a property editor; double-click on a marker row "jump and plays". Tap-to-place is `M`; `Ctrl+Z` is now combined across barlines + markers; `Del` removes whichever is selected (mutually-exclusive selection).
 - ✅ **Step 5.5 (part B)** — Practice loops. `score::LoopModel` is the third project-artifact model (paired `start_ms` + `end_ms`, stable IDs). Two-anchor creation gesture: click first anchor, Ctrl+click second (any combination of barlines + markers, on any of the three surfaces — waveform, staff, dock), press `L` to create. Loops appear under a "Loops" category in the dock with a property page; double-click arms + jumps + plays, the Arm checkbox arms in place. Pressing Play with an armed loop seeks to startMs if the cursor is outside the loop. Wrap-around lives in the 50 ms GUI poll (jitter inaudible at practice tempos); Stop disarms. Pause-between-repeats and pre-roll-on-Play share a global `prerollMs` setting on the transport row (#16) — practice-mode countdown gives the player ready-set-go time on every loop-start gesture.
-- 🔜 **Step 6** — Bidirectional cursor between audio and staff; reference-tone synthesiser (sine/triangle) triggered by placing a note.
+- ✅ **Step 6.1** — `score::NoteModel` as the fourth project-artifact model: notes stored as (start_ms, end_ms, midi) intervals with stable IDs. Pitch is *perceived* MIDI, not notation step+alter (those derive later at render/export). Naturals only in 6.1; accidentals shipped in the piano-roll redesign of 6.2.
+- ✅ **Step 6.2** — Chromatic piano-roll on the staff. Every semitone gets its own row (G3..E7, the violin range); a piano keyboard column on the left labels C notes per octave. Click anywhere on the grid to place a note (click is the new note's start, 400 ms default duration); drag the body to move; drag an edge to resize; drag on empty grid to draw with explicit length. After every note gesture the playback cursor lands at the note's startMs (so "place + Play" replays from onset). Same-row overlap guard prevents accidental duplicates. Loop bands paint on both waveform and staff but are interactive ONLY on the waveform — keeps the piano roll a pure note editor.
+- ✅ **Step 6.2.2** — Loop gestures on the waveform. Drag the body to translate the whole band; drag-on-empty-waveform to draw a new loop. Snap-to-anchor includes barlines, markers, and other loop edges. The two-anchor `L` creation gesture stays as the keyboard-driven fallback.
+- ✅ **Step 6.3** — Reference-tone synthesizer. Architecture:
+  ```
+  ToneSynth                  ← public face, own PortAudio stream
+  └── Voice                  ← single reference voice today;
+                                VoicePool (future) for chord playback
+      ├── SoundSource        ← polymorphism point
+      │   ├── Oscillator     ← sine + triangle (this step)
+      │   └── Sampler        ← real fiddle samples (future)
+      └── Envelope           ← attack/sustain/release;
+                                articulation-driven (future)
+
+  Future inserts (no public-API change):
+      ├── Modulator          ← vibrato / tremolo LFO inside Voice
+      └── Articulator        ← translates ornament/accent hints
+                                to envelope shape + vibrato params
+  ```
+  Click a piano key on the staff to fire a 300 ms pulse; hover-tone modes (Off / Continuous / On-tap) gate how mouse motion over the chromatic grid plays a reference tone. Triangle is the default waveform (closer to fiddle harmonic spectrum). The synth runs as its own PortAudio stream so the tone mixes with the recording at the OS audio router — no fighting with playback volume. Voice / SoundSource / Envelope are designed for the future expressive playback path: chord polyphony (`scheduleNote` + `VoicePool`), ornaments (`Articulator`), real fiddle samples (`Sampler` subclass swapping in at the `SoundSource` slot). Public `ToneSynth` API stays narrow today (`playContinuous` / `stop` / `playPulse`) and grows additively.
+- 🔜 **Step 6.4** — Bidirectional playback cursor. The current note (whose interval contains `positionMs_`) paints with a brighter ring; click-on-note seeks to the note's startMs (already shipped in 6.2); optional onset-tone pulse plays a brief reference at each note's startMs as playback crosses it.
 - 🔜 **Step 7** — MusicXML and ABC notation export.
 
 ## How we work
