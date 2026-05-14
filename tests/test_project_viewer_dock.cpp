@@ -14,6 +14,7 @@
 #include "ui/ProjectViewerDock.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -1286,4 +1287,78 @@ TEST_CASE("ProjectViewerDock: selecting a note clears marker / loop selection",
     REQUIRE_FALSE(dock.selectedMarkerId().has_value());
     REQUIRE(markerSpy.count() == 1);
     REQUIRE(noteSpy.count()   == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reference-tone dock controls (issue #step6.3)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ProjectViewerDock: reference-tone combos default to OnTap + Triangle",
+          "[project-viewer-dock][gui][reference-tone]") {
+    qtApp();
+    ProjectViewerDock dock;
+    REQUIRE(dock.hoverToneMode() == ProjectViewerDock::OnTap);
+    REQUIRE(dock.toneWaveform()  == fiddler::audio::Waveform::Triangle);
+
+    auto* hoverCombo = dock.findChild<QComboBox*>("hoverToneCombo");
+    auto* wfCombo    = dock.findChild<QComboBox*>("toneWaveformCombo");
+    REQUIRE(hoverCombo != nullptr);
+    REQUIRE(wfCombo    != nullptr);
+    REQUIRE(hoverCombo->currentIndex() ==
+            static_cast<int>(ProjectViewerDock::OnTap));
+    REQUIRE(wfCombo->currentIndex() ==
+            static_cast<int>(fiddler::audio::Waveform::Triangle));
+}
+
+TEST_CASE("ProjectViewerDock: changing the hover-tone combo emits the new mode",
+          "[project-viewer-dock][gui][reference-tone]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto* hoverCombo = dock.findChild<QComboBox*>("hoverToneCombo");
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::hoverToneModeChanged);
+    hoverCombo->setCurrentIndex(
+        static_cast<int>(ProjectViewerDock::Continuous));
+
+    REQUIRE(spy.count() == 1);
+    REQUIRE(spy.takeFirst().at(0).toInt() ==
+            static_cast<int>(ProjectViewerDock::Continuous));
+    REQUIRE(dock.hoverToneMode() == ProjectViewerDock::Continuous);
+}
+
+TEST_CASE("ProjectViewerDock: changing the waveform combo emits the new value",
+          "[project-viewer-dock][gui][reference-tone]") {
+    qtApp();
+    ProjectViewerDock dock;
+    auto* wfCombo = dock.findChild<QComboBox*>("toneWaveformCombo");
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::toneWaveformChanged);
+    wfCombo->setCurrentIndex(
+        static_cast<int>(fiddler::audio::Waveform::Sine));
+
+    REQUIRE(spy.count() == 1);
+    REQUIRE(spy.takeFirst().at(0).toInt() ==
+            static_cast<int>(fiddler::audio::Waveform::Sine));
+    REQUIRE(dock.toneWaveform() == fiddler::audio::Waveform::Sine);
+}
+
+TEST_CASE("ProjectViewerDock: programmatic setHoverToneMode updates combo "
+          "WITHOUT re-emitting (no QSettings double-write)",
+          "[project-viewer-dock][gui][reference-tone]") {
+    // MainWindow's restoreLayout calls setHoverToneMode after loading
+    // QSettings. The combo update would otherwise emit
+    // hoverToneModeChanged, which the slot persists back to
+    // QSettings — feedback loop. The setter blocks the combo's
+    // signal so persistence stays a one-way flow.
+    qtApp();
+    ProjectViewerDock dock;
+
+    QSignalSpy spy(&dock, &ProjectViewerDock::hoverToneModeChanged);
+    dock.setHoverToneMode(ProjectViewerDock::Continuous);
+
+    REQUIRE(spy.count() == 0);   // no echo
+    REQUIRE(dock.hoverToneMode() == ProjectViewerDock::Continuous);
+    auto* hoverCombo = dock.findChild<QComboBox*>("hoverToneCombo");
+    REQUIRE(hoverCombo->currentIndex() ==
+            static_cast<int>(ProjectViewerDock::Continuous));
 }

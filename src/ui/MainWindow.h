@@ -26,7 +26,7 @@ class QScrollBar;
 class QShortcut;
 class QTimer;
 
-namespace fiddler::audio { class Player; }
+namespace fiddler::audio { class Player; class ToneSynth; }
 namespace fiddler::score {
 class BarlineModel;
 class LoopModel;
@@ -429,6 +429,19 @@ private slots:
                                     std::int64_t endMs,
                                     int          midi);
 
+    // Reference-tone routing (issue #step6.3). The staff emits four
+    // signals: keyboard-key clicks always fire a pulse (regardless
+    // of mode); hover-pitch transitions feed playContinuous in
+    // Continuous mode; hoverPitchEnded stops a continuous tone;
+    // hoverTapRequested fires a pulse in OnTap mode.
+    void onStaffKeyboardKeyPressed(int midi);
+    void onStaffHoverPitchChanged (int midi);
+    void onStaffHoverPitchEnded();
+    void onStaffHoverTapRequested (int midi);
+    // Dock combos changed — persist to QSettings.
+    void onHoverToneModeChanged(int mode);
+    void onToneWaveformChanged (int waveform);
+
     // Loop drag commits (issue #62). Either widget can drive these:
     // the `via` string tags the source widget for the log line, the
     // model write is the same regardless.
@@ -500,6 +513,12 @@ private:
     // Owned audio engine. Forward-declared so Player.h's PortAudio /
     // FFmpeg fwd-decls don't ripple into Qt-only TUs.
     std::unique_ptr<audio::Player> player_;
+    // Reference-tone synth (step 6.3). Lives alongside the player —
+    // its own PortAudio output so tones mix into the OS audio
+    // routing while the recording continues to play. Opened lazily
+    // on the first gesture so unit tests that don't trigger a tone
+    // never hit PortAudio.
+    std::unique_ptr<audio::ToneSynth> toneSynth_;
 
     QAction*        openAction_     = nullptr;
     QAction*        saveAction_     = nullptr;

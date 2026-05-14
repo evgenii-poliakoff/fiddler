@@ -449,6 +449,15 @@ protected:
     [[nodiscard]] virtual bool armsLoopCreate(int /*x*/,
                                               int /*y*/) const { return false; }
 
+    // Hook called by mousePressEvent when the click lands in the
+    // left-margin region (`x < leftMarginPx()`). StaffWidget (step
+    // 6.3) overrides this to hit-test the piano keyboard column
+    // and emit `keyboardKeyPressed` for a reference-tone pulse.
+    // Default = no-op (waveform has no left margin so this is
+    // never reached there).
+    virtual void onLeftMarginPress(int /*xWidget*/,
+                                   int /*yWidget*/) {}
+
     // Should this widget treat markers / barlines / loop edges /
     // loop bodies as interactive (click-to-select, drag-to-move)?
     // WaveformWidget keeps the default (true) — the waveform is

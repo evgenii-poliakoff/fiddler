@@ -8,10 +8,13 @@
 
 #include <QFont>
 #include <QFontMetrics>
+#include <QKeyEvent>
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPen>
 #include <QString>
+#include <QTimer>
 
 #include <algorithm>
 #include <climits>
@@ -220,6 +223,20 @@ void StaffWidget::paintGridBackground(QPainter& painter) const {
             painter.drawLine(gridLeft, rowTop, gridRight - 1, rowTop);
         }
     }
+    // Step 6.3 — hover-row tint. A faint amber overlay on the row
+    // under the cursor so the user sees which pitch the hover tone
+    // would play (in Continuous mode) or what T will fire (in
+    // On-tap mode). No-op when the mouse isn't on a row.
+    if (lastHoverMidi_ >= 0) {
+        const int yCenter = rowYForMidi(lastHoverMidi_);
+        if (yCenter != INT_MIN) {
+            const int rowTop = yCenter - kSemitoneRowHeightPx / 2;
+            const QColor hoverCol(255, 195, 90, 50);
+            painter.fillRect(
+                QRect(gridLeft, rowTop, gridW, kSemitoneRowHeightPx),
+                hoverCol);
+        }
+    }
 }
 
 void StaffWidget::paintPianoKeyboard(QPainter& painter) const {
@@ -276,6 +293,20 @@ void StaffWidget::paintPianoKeyboard(QPainter& painter) const {
                     yCenter + labelFm.ascent() / 2 - 1,
                     label);
             }
+        }
+    }
+
+    // Step 6.3 — pressed-key flash. When the user clicks a key we
+    // briefly highlight it (~150 ms) so they see what they hit. The
+    // flash overlays the key's row with a warm amber tint.
+    if (pressedKeyMidi_.has_value()) {
+        const int yCenter = rowYForMidi(*pressedKeyMidi_);
+        if (yCenter != INT_MIN) {
+            const int rowTop = yCenter - kSemitoneRowHeightPx / 2;
+            const QColor flashCol(255, 195, 90, 200);
+            painter.fillRect(
+                QRect(kbLeft, rowTop, kbRight - kbLeft, kSemitoneRowHeightPx),
+                flashCol);
         }
     }
 
@@ -642,6 +673,83 @@ int StaffWidget::pixelToMidi(int yWidget) const {
 int StaffWidget::chromaticRowAt(int xWidget, int yWidget) const {
     if (xWidget < leftMarginPx()) return -1;
     return midiForRowY(yWidget);
+}
+
+std::optional<int>
+StaffWidget::hitKeyboardKey(int xWidget, int yWidget) const noexcept {
+    // The keyboard column occupies x in [0, leftMarginPx). Rows are
+    // chromatic, same y-mapping as the grid. We delegate to
+    // midiForRowY which is unaware of x — its only job is "map y
+    // to a row." A press in the column at a valid row → that midi.
+    if (xWidget < 0 || xWidget >= leftMarginPx()) return std::nullopt;
+    const int midi = midiForRowY(yWidget);
+    if (midi < 0) return std::nullopt;
+    return midi;
+}
+
+void StaffWidget::onLeftMarginPress(int xWidget, int yWidget) {
+    const auto midi = hitKeyboardKey(xWidget, yWidget);
+    if (!midi) return;
+    FLOG_DEBUG("ui.staff",
+               "keyboard-key-pressed midi={}", *midi);
+    pressedKeyMidi_ = *midi;
+    update();
+    // Schedule the flash to clear after ~150 ms — short enough not
+    // to delay the next click, long enough for the user to see what
+    // they hit.
+    QTimer::singleShot(150, this, [this]() {
+        pressedKeyMidi_.reset();
+        update();
+    });
+    emit keyboardKeyPressed(*midi);
+}
+
+void StaffWidget::mouseMoveEvent(QMouseEvent* event) {
+    // De-dupe the hover-pitch signal by midi: only emit when the
+    // row under the cursor actually changes. Sub-pixel mouse moves
+    // inside the same row fire many mouseMove events but we want
+    // exactly one hoverPitchChanged per crossing.
+    int newMidi = -1;
+    if (event->pos().x() >= leftMarginPx()) {
+        newMidi = midiForRowY(event->pos().y());
+    }
+    if (newMidi != lastHoverMidi_) {
+        lastHoverMidi_ = newMidi;
+        if (newMidi >= 0) {
+            FLOG_TRACE("ui.staff",
+                       "hover-pitch-changed midi={}", newMidi);
+            emit hoverPitchChanged(newMidi);
+        } else {
+            FLOG_TRACE("ui.staff", "hover-pitch-ended");
+            emit hoverPitchEnded();
+        }
+        update();    // repaint the hover-row tint
+    }
+    ScoreOverlayBase::mouseMoveEvent(event);
+}
+
+void StaffWidget::leaveEvent(QEvent* event) {
+    if (lastHoverMidi_ >= 0) {
+        lastHoverMidi_ = -1;
+        FLOG_TRACE("ui.staff", "hover-pitch-ended via=leave");
+        emit hoverPitchEnded();
+        update();
+    }
+    ScoreOverlayBase::leaveEvent(event);
+}
+
+void StaffWidget::keyPressEvent(QKeyEvent* event) {
+    // T = "tone" — fire a pulse at the current hover row. MainWindow
+    // gates the dispatch by the dock's hover-tone mode (only
+    // "On tap" actually plays; the other two modes ignore it).
+    if (event->key() == Qt::Key_T && lastHoverMidi_ >= 0) {
+        FLOG_DEBUG("ui.staff",
+                   "hover-tap-requested midi={}", lastHoverMidi_);
+        emit hoverTapRequested(lastHoverMidi_);
+        event->accept();
+        return;
+    }
+    ScoreOverlayBase::keyPressEvent(event);
 }
 
 // MEMO[#step6.2]: extends the base's plain-seek branch — when the

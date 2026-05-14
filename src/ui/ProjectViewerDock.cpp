@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QFocusEvent>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -337,6 +338,58 @@ void ProjectViewerDock::buildUi() {
             });
     layout->addWidget(addNoteButton_);
 
+    // ---- Reference-tone controls (issue #step6.3) ----------------------
+    // Two combo boxes laid out side-by-side with their labels:
+    //   "Hover tone:"    [Off | Continuous | On tap]
+    //   "Waveform:"      [Sine | Triangle]
+    // The "Hover tone" mode gates how mouse motion over the chromatic
+    // grid plays a reference tone; clicks on the piano keyboard column
+    // ALWAYS play (regardless of mode). Waveform is global.
+    {
+        auto* refToneForm = new QFormLayout();
+        refToneForm->setContentsMargins(4, 4, 4, 4);
+
+        hoverToneCombo_ = new QComboBox(root);
+        hoverToneCombo_->setObjectName("hoverToneCombo");
+        hoverToneCombo_->addItem(tr("Off"),         /*userData=*/0);
+        hoverToneCombo_->addItem(tr("Continuous"),  /*userData=*/1);
+        hoverToneCombo_->addItem(tr("On tap"),      /*userData=*/2);
+        hoverToneCombo_->setCurrentIndex(static_cast<int>(hoverToneMode_));
+        connect(hoverToneCombo_,
+                QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int idx) {
+                    const auto mode = static_cast<HoverToneMode>(idx);
+                    if (mode == hoverToneMode_) return;
+                    hoverToneMode_ = mode;
+                    FLOG_DEBUG("ui.dock",
+                               "hover-tone-mode-changed mode={}",
+                               static_cast<int>(mode));
+                    emit hoverToneModeChanged(static_cast<int>(mode));
+                });
+        refToneForm->addRow(tr("Hover tone:"), hoverToneCombo_);
+
+        toneWaveformCombo_ = new QComboBox(root);
+        toneWaveformCombo_->setObjectName("toneWaveformCombo");
+        toneWaveformCombo_->addItem(tr("Sine"),     /*userData=*/0);
+        toneWaveformCombo_->addItem(tr("Triangle"), /*userData=*/1);
+        toneWaveformCombo_->setCurrentIndex(
+            static_cast<int>(toneWaveform_));
+        connect(toneWaveformCombo_,
+                QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int idx) {
+                    const auto wf = static_cast<audio::Waveform>(idx);
+                    if (wf == toneWaveform_) return;
+                    toneWaveform_ = wf;
+                    FLOG_DEBUG("ui.dock",
+                               "tone-waveform-changed waveform={}",
+                               static_cast<int>(wf));
+                    emit toneWaveformChanged(static_cast<int>(wf));
+                });
+        refToneForm->addRow(tr("Waveform:"), toneWaveformCombo_);
+
+        layout->addLayout(refToneForm);
+    }
+
     // ---- Global pre-roll countdown -------------------------------------
     // MEMO: the countdown widget used to live inside the loop
     // property page when pre-roll was a per-loop setting. After
@@ -592,6 +645,27 @@ void ProjectViewerDock::setPrerollEnabled(bool enabled) {
         // confusing.
         if (!enabled) loopCountdown_->cancel();
         loopCountdown_->setVisible(enabled);
+    }
+}
+
+void ProjectViewerDock::setHoverToneMode(HoverToneMode mode) {
+    if (mode == hoverToneMode_) return;
+    hoverToneMode_ = mode;
+    if (hoverToneCombo_) {
+        // Block the combo's signal so this programmatic update
+        // doesn't re-fire hoverToneModeChanged — MainWindow's
+        // QSettings persistence would then double-write.
+        const QSignalBlocker block(hoverToneCombo_);
+        hoverToneCombo_->setCurrentIndex(static_cast<int>(mode));
+    }
+}
+
+void ProjectViewerDock::setToneWaveform(audio::Waveform waveform) {
+    if (waveform == toneWaveform_) return;
+    toneWaveform_ = waveform;
+    if (toneWaveformCombo_) {
+        const QSignalBlocker block(toneWaveformCombo_);
+        toneWaveformCombo_->setCurrentIndex(static_cast<int>(waveform));
     }
 }
 

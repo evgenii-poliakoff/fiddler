@@ -5,7 +5,9 @@
 #include <variant>
 
 #include "audio/Decoder.h"
+#include "audio/Oscillator.h"
 #include "audio/Player.h"
+#include "audio/ToneSynth.h"
 #include "audio/WaveformOverview.h"
 #include "score/BarlineModel.h"
 #include "score/LoopModel.h"
@@ -552,6 +554,17 @@ void MainWindow::buildCentralWidget() {
             this, &MainWindow::onStaffNoteDragCommitted);
     connect(staff_, &StaffWidget::noteCreateCommitted,
             this, &MainWindow::onStaffNoteCreateCommitted);
+    // Reference-tone gestures (issue #step6.3). The synth is opened
+    // lazily on the first audible gesture so unit tests that never
+    // trigger one don't try to acquire a PortAudio device.
+    connect(staff_, &StaffWidget::keyboardKeyPressed,
+            this, &MainWindow::onStaffKeyboardKeyPressed);
+    connect(staff_, &StaffWidget::hoverPitchChanged,
+            this, &MainWindow::onStaffHoverPitchChanged);
+    connect(staff_, &StaffWidget::hoverPitchEnded,
+            this, &MainWindow::onStaffHoverPitchEnded);
+    connect(staff_, &StaffWidget::hoverTapRequested,
+            this, &MainWindow::onStaffHoverTapRequested);
     connect(staff_, &ScoreOverlayBase::viewportChanged,
             this, &MainWindow::onViewportChanged);
     connect(staff_, &ScoreOverlayBase::userScrolled,
@@ -706,6 +719,17 @@ void MainWindow::buildCentralWidget() {
     connect(projectViewerDock_,
             &ProjectViewerDock::loopAnchorClearRequested,
             this, &MainWindow::onDockLoopAnchorClearRequested);
+
+    // Reference-tone dock combos (issue #step6.3). Persisted in
+    // QSettings so the user's chosen mode + waveform stick across
+    // sessions; restoreLayout pushes the persisted values back into
+    // the dock on startup.
+    connect(projectViewerDock_,
+            &ProjectViewerDock::hoverToneModeChanged,
+            this, &MainWindow::onHoverToneModeChanged);
+    connect(projectViewerDock_,
+            &ProjectViewerDock::toneWaveformChanged,
+            this, &MainWindow::onToneWaveformChanged);
 
     // Property-page edits — captured here (rather than in the dock)
     // so the pre-edit snapshot can land in the undo history before
@@ -2423,6 +2447,86 @@ void MainWindow::onDockNoteCommitNewRequested(std::int64_t startMs,
                id, startMs, endMs, midi, noteModel_->size());
 }
 
+// ---- Reference-tone routing (issue #step6.3) ---------------------------
+
+namespace {
+// Lazy-init helper. Opens the ToneSynth's PortAudio stream on the
+// first audible gesture so unit tests that never trigger one don't
+// touch the device. Idempotent: subsequent calls re-use the same
+// open synth. Returns the synth pointer (always non-null after
+// this returns; open() may fail silently — toneSynth_ stays valid,
+// just renders into nothing).
+audio::ToneSynth&
+ensureSynth(std::unique_ptr<audio::ToneSynth>& slot) {
+    if (!slot) {
+        slot = std::make_unique<audio::ToneSynth>();
+        slot->open();
+    }
+    return *slot;
+}
+} // namespace
+
+void MainWindow::onStaffKeyboardKeyPressed(int midi) {
+    // Click on a piano key — always plays, regardless of the dock's
+    // hover-tone mode (the keyboard column is the dedicated
+    // reference-tone surface).
+    auto& synth = ensureSynth(toneSynth_);
+    const double freqHz = score::midiToFrequencyHz(midi);
+    const auto wf = projectViewerDock_
+        ? projectViewerDock_->toneWaveform()
+        : audio::Waveform::Triangle;
+    synth.playPulse(freqHz, std::chrono::milliseconds(300), wf);
+    FLOG_DEBUG("ui.tone",
+               "keyboard-click midi={} freq={:.2f}", midi, freqHz);
+}
+
+void MainWindow::onStaffHoverPitchChanged(int midi) {
+    // Only Continuous mode tracks hover with a live tone. Off and
+    // OnTap don't open the synth here — that keeps idle hover from
+    // burning a PortAudio stream the user didn't ask for.
+    if (!projectViewerDock_) return;
+    if (projectViewerDock_->hoverToneMode()
+        != ProjectViewerDock::Continuous) return;
+    auto& synth = ensureSynth(toneSynth_);
+    synth.playContinuous(score::midiToFrequencyHz(midi),
+                         projectViewerDock_->toneWaveform());
+}
+
+void MainWindow::onStaffHoverPitchEnded() {
+    // Stop a continuous tone — harmless in other modes (the synth's
+    // referenceVoice_ is idle there). Only call if the synth was
+    // actually opened (lazy init).
+    if (toneSynth_) toneSynth_->stop();
+}
+
+void MainWindow::onStaffHoverTapRequested(int midi) {
+    // T key — only OnTap mode treats this as a pulse trigger. Off
+    // and Continuous ignore the key. (Off is silent by user choice;
+    // Continuous already plays a steady tone, so a pulse on top
+    // would be confusing.)
+    if (!projectViewerDock_) return;
+    if (projectViewerDock_->hoverToneMode()
+        != ProjectViewerDock::OnTap) return;
+    auto& synth = ensureSynth(toneSynth_);
+    synth.playPulse(score::midiToFrequencyHz(midi),
+                    std::chrono::milliseconds(300),
+                    projectViewerDock_->toneWaveform());
+    FLOG_DEBUG("ui.tone",
+               "hover-tap midi={} mode=OnTap", midi);
+}
+
+void MainWindow::onHoverToneModeChanged(int mode) {
+    QSettings settings;
+    settings.setValue("mainwindow/hoverToneMode", mode);
+    // If user switched FROM Continuous → silence any tone in flight.
+    if (toneSynth_) toneSynth_->stop();
+}
+
+void MainWindow::onToneWaveformChanged(int waveform) {
+    QSettings settings;
+    settings.setValue("mainwindow/toneWaveform", waveform);
+}
+
 void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
     // Step 6.2 piano-roll click-to-place. The interval defaults to
     // the armed loop's range if one is armed (chord-building in a
@@ -3051,6 +3155,25 @@ void MainWindow::restoreLayout() {
         // sync paths (checkbox state, spinbox enable, dock
         // visibility) used by the user-driven toggle.
         setPrerollEnabled(saved);
+    }
+    // Reference-tone preferences (#step6.3). Read both with sane
+    // defaults so a first-run session lands on a useful config:
+    // OnTap mode (T fires a pulse — the unobtrusive default) and
+    // Triangle waveform (closer to fiddle harmonic spectrum).
+    if (projectViewerDock_) {
+        const int modeInt = settings.value(
+            "mainwindow/hoverToneMode",
+            static_cast<int>(ProjectViewerDock::OnTap)).toInt();
+        const int wfInt = settings.value(
+            "mainwindow/toneWaveform",
+            static_cast<int>(audio::Waveform::Triangle)).toInt();
+        // Clamp into valid ranges defensively.
+        const auto mode = static_cast<ProjectViewerDock::HoverToneMode>(
+            std::clamp(modeInt, 0, 2));
+        const auto wf = static_cast<audio::Waveform>(
+            std::clamp(wfInt, 0, 1));
+        projectViewerDock_->setHoverToneMode(mode);
+        projectViewerDock_->setToneWaveform(wf);
     }
 }
 

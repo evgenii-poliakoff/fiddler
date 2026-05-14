@@ -42,6 +42,8 @@
 
 #pragma once
 
+#include "audio/Oscillator.h"   // for audio::Waveform (step 6.3 reference tone)
+
 #include <QDockWidget>
 
 #include <cstdint>
@@ -49,6 +51,7 @@
 #include <optional>
 
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -149,6 +152,35 @@ public slots:
     void setPrerollEnabled(bool enabled);
     [[nodiscard]] bool prerollEnabled() const noexcept { return prerollEnabled_; }
 
+public:
+    // ---- Reference tone (issue #step6.3) -----------------------
+    //
+    // Hover-tone mode controls whether moving the mouse over the
+    // staff plays a reference tone, and how. Off = silent (clicks
+    // on the piano keyboard still play). Continuous = tone follows
+    // the hovered row. OnTap = silent on hover, T fires a pulse.
+    //
+    // MEMO: plain enum (not enum class) so MOC accepts Q_ENUM here.
+    // Enumerators are scoped to the class either way
+    // (ProjectViewerDock::OnTap) since they live inside the class
+    // body — no global pollution.
+    enum HoverToneMode { Off = 0, Continuous = 1, OnTap = 2 };
+    Q_ENUM(HoverToneMode)
+
+    [[nodiscard]] HoverToneMode hoverToneMode() const noexcept {
+        return hoverToneMode_;
+    }
+    [[nodiscard]] audio::Waveform toneWaveform() const noexcept {
+        return toneWaveform_;
+    }
+
+public slots:
+    // MainWindow pushes the persisted values back into the dock at
+    // startup (after loading QSettings). Drives the combo widgets
+    // and emits hoverToneModeChanged for downstream wiring.
+    void setHoverToneMode(HoverToneMode mode);
+    void setToneWaveform(audio::Waveform waveform);
+
 signals:
     // Selection changed in the dock — by tree click, by programmatic
     // set, or as a side effect of mutual exclusion. MainWindow
@@ -202,6 +234,19 @@ signals:
     // from loopActivated so MainWindow can disambiguate the gestures
     // in the event log.
     void loopArmToggleRequested(std::int64_t id, bool armed);
+
+    // Reference-tone dock controls (issue #step6.3) — user changed
+    // the hover-tone mode or the waveform via the combos. MainWindow
+    // persists the new value in QSettings + dispatches incoming
+    // hover signals from StaffWidget accordingly.
+    //
+    // MEMO: signal parameters are `int` (not the typed enums) so
+    // they're MOC-friendly. Receivers cast to HoverToneMode /
+    // audio::Waveform respectively; the int values are the enum
+    // ordinals, kept stable as long as the enum definitions stay
+    // in their declared order.
+    void hoverToneModeChanged(int mode);
+    void toneWaveformChanged(int waveform);
 
     // Property-page edits. The dock reads the new value off the
     // QSpinBox / QLineEdit and asks MainWindow to apply it; MainWindow
@@ -355,6 +400,13 @@ private:
     // "Add Note" button — sits below the property stack, always
     // visible, enabled only when a NoteModel is attached.
     QPushButton*     addNoteButton_     = nullptr;
+
+    // Reference-tone controls (issue #step6.3). Live below the
+    // Add-Note button, above the countdown widget.
+    QComboBox*       hoverToneCombo_    = nullptr;
+    QComboBox*       toneWaveformCombo_ = nullptr;
+    HoverToneMode    hoverToneMode_     = HoverToneMode::OnTap;
+    audio::Waveform  toneWaveform_      = audio::Waveform::Triangle;
 
     // Property-page stack. Page indices live in the .cpp.
     QStackedWidget*  propertyStack_     = nullptr;

@@ -537,15 +537,16 @@ void ScoreOverlayBase::mousePressEvent(QMouseEvent* event) {
     }
     setFocus();
     const int x = event->pos().x();
-    // MEMO[#step6.2]: ignore clicks in the leftMarginPx() region
-    // (the piano-keyboard column on the staff). The keyboard is a
-    // visual / future-tone-preview surface, not a click target for
-    // seek or placement.
+    // MEMO[#step6.2 / #step6.3]: clicks in the leftMarginPx() region
+    // (the piano-keyboard column on the staff) DON'T touch the
+    // time axis. The default behavior is to ignore them; StaffWidget
+    // overrides onLeftMarginPress to fire a reference-tone pulse on
+    // the clicked key.
     if (x < leftMarginPx()) {
+        onLeftMarginPress(x, event->pos().y());
         FLOG_TRACE("ui.score",
-                   "overlay mouse-press widget={} x={} ignored "
-                   "reason=left-margin (kbWidth={})",
-                   objectName().toStdString(), x, leftMarginPx());
+                   "overlay mouse-press widget={} x={} routed=left-margin",
+                   objectName().toStdString(), x);
         event->accept();
         return;
     }

@@ -1505,3 +1505,151 @@ TEST_CASE("StaffWidget: resize past partner edge clamps to partner − 1",
     REQUIRE(args.at(4).toLongLong() == 2000);                 // start untouched
     REQUIRE(args.at(5).toLongLong() == 2001);                 // end clamped
 }
+
+// ---------------------------------------------------------------------------
+// Reference-tone gestures (issue #step6.3)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("StaffWidget: click on the piano keyboard emits keyboardKeyPressed",
+          "[staff-widget][gui][reference-tone]") {
+    // Clicking inside the keyboard column at a chromatic row's y
+    // fires keyboardKeyPressed(midi). MainWindow turns this into a
+    // ToneSynth pulse. The signal is always-on (no dock mode gate).
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    QSignalSpy keySpy (&w, &StaffWidget::keyboardKeyPressed);
+    QSignalSpy seekSpy(&w, &StaffWidget::seekRequested);
+
+    // x inside the keyboard column, y on the A4 row.
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(kKeyboardWidth / 2, rowYForMidiTest(69)));
+
+    REQUIRE(keySpy.count() == 1);
+    REQUIRE(keySpy.takeFirst().at(0).toInt() == 69);  // A4
+    // Keyboard click does NOT seek — the keyboard column is for
+    // pitch reference, not time navigation.
+    REQUIRE(seekSpy.count() == 0);
+}
+
+TEST_CASE("StaffWidget: click in the keyboard top margin emits nothing",
+          "[staff-widget][gui][reference-tone]") {
+    // Above the grid (in the tune-type banner row) the keyboard
+    // has no key — hitKeyboardKey returns nullopt and no signal
+    // fires.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+
+    QSignalSpy keySpy(&w, &StaffWidget::keyboardKeyPressed);
+
+    QTest::mouseClick(&w, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(kKeyboardWidth / 2, 4));   // y < grid top
+
+    REQUIRE(keySpy.count() == 0);
+}
+
+TEST_CASE("StaffWidget: hovering rows emits hoverPitchChanged on each transition",
+          "[staff-widget][gui][reference-tone]") {
+    // De-duplicated by midi — moving the mouse within the SAME row
+    // fires the signal once; moving to a different row fires again.
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    w.setMouseTracking(true);
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    QSignalSpy hoverSpy(&w, &StaffWidget::hoverPitchChanged);
+
+    // First hover: midi 69 (A4).
+    QMouseEvent move1(QEvent::MouseMove,
+                      QPointF{xForMsTest(2000),
+                              static_cast<qreal>(rowYForMidiTest(69))},
+                      Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &move1);
+    REQUIRE(hoverSpy.count() == 1);
+    REQUIRE(hoverSpy.takeFirst().at(0).toInt() == 69);
+
+    // Same row, different x — should NOT re-fire (deduped by midi).
+    QMouseEvent move1b(QEvent::MouseMove,
+                       QPointF{xForMsTest(2500),
+                               static_cast<qreal>(rowYForMidiTest(69))},
+                       Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &move1b);
+    REQUIRE(hoverSpy.count() == 0);
+
+    // Move to a different row.
+    QMouseEvent move2(QEvent::MouseMove,
+                      QPointF{xForMsTest(2500),
+                              static_cast<qreal>(rowYForMidiTest(72))},
+                      Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &move2);
+    REQUIRE(hoverSpy.count() == 1);
+    REQUIRE(hoverSpy.takeFirst().at(0).toInt() == 72);
+}
+
+TEST_CASE("StaffWidget: leaving the staff emits hoverPitchEnded",
+          "[staff-widget][gui][reference-tone]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    w.setMouseTracking(true);
+    w.show();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    QSignalSpy endedSpy(&w, &StaffWidget::hoverPitchEnded);
+
+    // First establish a hover.
+    QMouseEvent move(QEvent::MouseMove,
+                     QPointF{xForMsTest(2000),
+                             static_cast<qreal>(rowYForMidiTest(69))},
+                     Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &move);
+
+    // Now leave.
+    QEvent leave(QEvent::Leave);
+    QApplication::sendEvent(&w, &leave);
+    REQUIRE(endedSpy.count() == 1);
+}
+
+TEST_CASE("StaffWidget: T while hovering emits hoverTapRequested",
+          "[staff-widget][gui][reference-tone]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    w.setMouseTracking(true);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    QSignalSpy tapSpy(&w, &StaffWidget::hoverTapRequested);
+
+    // Hover G4 (midi 67).
+    QMouseEvent move(QEvent::MouseMove,
+                     QPointF{xForMsTest(2000),
+                             static_cast<qreal>(rowYForMidiTest(67))},
+                     Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&w, &move);
+
+    QTest::keyClick(&w, Qt::Key_T);
+    REQUIRE(tapSpy.count() == 1);
+    REQUIRE(tapSpy.takeFirst().at(0).toInt() == 67);
+}
+
+TEST_CASE("StaffWidget: T without a hover row is a no-op",
+          "[staff-widget][gui][reference-tone]") {
+    qtApp();
+    StaffWidget w;
+    setUpWidget(w, makeModel(), /*durationMs=*/4000, /*widthPx=*/800);
+    w.show();
+    w.setFocus();
+    (void)QTest::qWaitForWindowExposed(&w);
+
+    QSignalSpy tapSpy(&w, &StaffWidget::hoverTapRequested);
+
+    // No prior mouseMove → lastHoverMidi_ stays -1.
+    QTest::keyClick(&w, Qt::Key_T);
+    REQUIRE(tapSpy.count() == 0);
+}
