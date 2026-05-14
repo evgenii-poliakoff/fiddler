@@ -2426,8 +2426,13 @@ void MainWindow::onDockNoteCommitNewRequested(std::int64_t startMs,
 void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
     // Step 6.2 piano-roll click-to-place. The interval defaults to
     // the armed loop's range if one is armed (chord-building in a
-    // region), otherwise [ms − 200, ms + 200] centred on the click.
-    constexpr std::int64_t kDefaultHalfDurationMs = 200;
+    // region), otherwise [ms, ms + 400] — note grows rightward
+    // from the click position, matching the DAW piano-roll
+    // convention (Logic / Ableton / FL / Capo). Issue #64 fix:
+    // click position is the note's startMs, not its centre, so
+    // the press-time seek lands the playback cursor at the new
+    // note's beginning.
+    constexpr std::int64_t kDefaultDurationMs = 400;
     std::int64_t startMs;
     std::int64_t endMs;
     const char*  source;
@@ -2439,14 +2444,29 @@ void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
             endMs   = l.endMs;
             source  = "armed-loop";
         } else {
-            startMs = std::max<std::int64_t>(0, ms - kDefaultHalfDurationMs);
-            endMs   = startMs + kDefaultHalfDurationMs * 2;
+            startMs = ms;
+            endMs   = startMs + kDefaultDurationMs;
             source  = "loop-stale";
         }
     } else {
-        startMs = std::max<std::int64_t>(0, ms - kDefaultHalfDurationMs);
-        endMs   = startMs + kDefaultHalfDurationMs * 2;
+        startMs = ms;
+        endMs   = startMs + kDefaultDurationMs;
         source  = "staff-click";
+    }
+    // Clamp endMs to file duration so a click near the end doesn't
+    // produce a note that overshoots the recording.
+    if (noteModel_) {
+        // NoteModel doesn't carry a duration limit; use the staff's
+        // durationMs as the hard ceiling (it mirrors the audio file).
+        const std::int64_t dur = staff_ ? staff_->durationMs()
+                                        : std::int64_t{0};
+        if (dur > 0 && endMs > dur) endMs = dur;
+        if (endMs <= startMs) {
+            // Click effectively at the file's end — back off so the
+            // 1-ms invariant holds. Better here than rejecting the
+            // gesture outright.
+            startMs = std::max<std::int64_t>(0, endMs - 1);
+        }
     }
     // MEMO[#step6.2]: avoid the "phantom snap" trap. The hit-test in
     // StaffWidget is pixel-exact, so a click slightly outside an
@@ -2478,6 +2498,14 @@ void MainWindow::onStaffPlaceNoteRequested(std::int64_t ms, int midi) {
     // Select the new note so the dock's property page shows it and
     // the user can refine pitch / interval via Apply Changes.
     if (staff_) staff_->setSelectedNoteId(id);
+    // Issue #64: ensure the playback cursor lands at the new note's
+    // startMs so the user can press Play and hear the note from its
+    // onset. The press-time seek already lands at startMs in the
+    // free-mode case (click position IS startMs after the #64 fix);
+    // this re-seek covers the armed-loop case where the click x is
+    // independent of the loop's range. Always firing keeps the rule
+    // uniform: "after creating a note, cursor is at its startMs."
+    onSeek(static_cast<int>(startMs));
     FLOG_DEBUG("ui.score",
                "place-note id={} ms={} midi={} via={} start={} end={} size={}",
                id, ms, midi, source, startMs, endMs, noteModel_->size());
@@ -2539,6 +2567,13 @@ void MainWindow::onStaffNoteDragCommitted(std::int64_t id,
     if (pitchChanged) {
         noteModel_->setPitch(id, toMidi);
     }
+    // Issue #64 invariant: after any note edit, the playback cursor
+    // lands at the note's startMs. Lets the user immediately press
+    // Play to verify the result — especially useful for vertical
+    // (pitch-only) drags where the user wants to A/B the new pitch
+    // against the recording. NoteResizeEnd doesn't change startMs,
+    // so this re-seek is a no-op in that case.
+    onSeek(static_cast<int>(toStartMs));
     FLOG_DEBUG("ui.score",
                "note-drag id={} from=[{}..{}]@{} to=[{}..{}]@{}",
                id, fromStartMs, fromEndMs, fromMidi,
