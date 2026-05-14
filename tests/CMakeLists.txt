@@ -18,6 +18,7 @@ add_executable(fiddler_tests
     test_ringbuffer.cpp
     test_staff_widget.cpp
     test_stretcher.cpp
+    test_tone_synth.cpp
     test_waveform_overview.cpp
     test_waveform_widget.cpp
     qt_test_app.cpp
@@ -62,8 +63,12 @@ target_link_libraries(fiddler_tests PRIVATE
 # target.
 target_sources(fiddler_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/audio/Decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Envelope.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Oscillator.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Player.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/Stretcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/ToneSynth.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/Voice.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/WaveformOverview.cpp
     ${CMAKE_SOURCE_DIR}/src/score/BarlineModel.cpp
     ${CMAKE_SOURCE_DIR}/src/score/LoopModel.cpp
